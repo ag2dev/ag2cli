@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="description" content="A focused conversation workspace for ag2cli." />
+    <title>ag2cli · Workspace</title>
+    <script>
+      // Apply the stored theme before first paint to avoid a light flash.
+      ;(function () {
+        try {
+          var mode = localStorage.getItem("ag2cli.web.theme") || "light"
+          var dark = mode === "dark" || (mode === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches)
+          document.documentElement.classList.toggle("dark", dark)
+        } catch (error) {
+          /* restricted storage keeps the light default */
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

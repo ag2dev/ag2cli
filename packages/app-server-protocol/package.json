@@ -1,0 +1,24 @@
+{
+  "name": "@ag2cli/app-server-protocol",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "module": "src/index.ts",
+  "description": "AG2CLI App Server JSON-RPC 2.0 wire contract: types, Zod validation, and generated JSON Schema for non-TypeScript clients.",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema.js": "./src/schema.ts",
+    "./*.js": "./src/*.ts"
+  },
+  "dependencies": {
+    "zod": "3.25.76",
+    "zod-to-json-schema": "3.25.2"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:schema": "bun run scripts/build-schema.ts"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

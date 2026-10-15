@@ -1,0 +1,15 @@
+{
+  "plugins": ["typescript"],
+  "rules": {
+    "no-unused-vars": "off",
+    "no-control-regex": "off",
+    "no-useless-escape": "off",
+    "no-shadow": "off",
+    "no-underscore-dangle": "off",
+    "preserve-caught-error": "off",
+    "no-irregular-whitespace": "off",
+    "no-unmodified-loop-condition": "off",
+    "no-unreachable": "off",
+    "no-extraneous-class": "off"
+  }
+}

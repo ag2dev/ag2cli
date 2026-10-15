@@ -1,0 +1,10 @@
+{
+  "sourceRoots": ["apps/cli/src", "packages/core/src", "packages/runtime/src", "packages/protocol/src", "packages/client/src"],
+  "coverageFile": "apps/cli/coverage/lcov.info",
+  "thresholds": {
+    "lines": 70.68,
+    "functions": 81.42
+  },
+  "sourceExclusions": [],
+  "exemptions": []
+}

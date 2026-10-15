@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+dist/
+../../native/**/target/
+# The no-space import fixture is deliberately unformatted: its syntax
+# (`import{x}from"..."`) is the violation the boundary gate must catch.
+tests/architecture/tui-boundaries/negative/tui-type-edge__no-space-import/

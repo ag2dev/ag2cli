@@ -1,0 +1,25 @@
+.references
+.claude
+.openclaude
+
+# Workspace-generated files
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.husky/_/
+native/**/target/
+!native/**/Cargo.lock
+.env
+*.log
+
+# Local AG2CLI runtime state
+.ag2cli/
+.ag2cli-mcp.json
+.ag2cli-mcp-approved.json
+
+# Local working notes and throwaway artifacts (never versioned)
+temp/
+
+# Agentic Tools
+.impeccable/

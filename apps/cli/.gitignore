@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.log
+
+# Temporary files left by tests.
+_tmp_*

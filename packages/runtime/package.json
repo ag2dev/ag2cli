@@ -1,0 +1,22 @@
+{
+  "name": "@ag2cli/runtime",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "module": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./*.js": "./src/*.ts"
+  },
+  "dependencies": {
+    "@ag2cli/core": "workspace:*",
+    "@ag2cli/protocol": "workspace:*",
+    "zod": "3.25.76"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

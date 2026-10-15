@@ -1,0 +1,49 @@
+{
+  "name": "ag2cli",
+  "version": "0.7.0",
+  "description": "A personal, modular agent CLI with durable sessions and multi-client protocol adapters",
+  "type": "module",
+  "module": "src/public/index.ts",
+  "exports": {
+    ".": "./src/public/index.ts",
+    "./sdk": "./src/public/sdk.ts",
+    "./server": "./src/public/server.ts",
+    "./acp": "./src/public/acp.ts",
+    "./telemetry": "./src/public/telemetry.ts"
+  },
+  "bin": {
+    "ag2cli": "src/entrypoints/agent.ts",
+    "agent": "src/entrypoints/agent.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/public/index.ts",
+    "start": "bun run src/entrypoints/agent.ts",
+    "agent": "bun run src/entrypoints/agent.ts",
+    "server": "bun run src/entrypoints/server.ts",
+    "acp": "bun run src/entrypoints/acp.ts",
+    "tui": "bun run src/entrypoints/tui.ts",
+    "release:build": "bun run ../../scripts/release/build-artifact.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "bun-types": "^1.3.14",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@ag2cli/app-server-client": "workspace:*",
+    "@ag2cli/app-server-protocol": "workspace:*",
+    "@ag2cli/client": "workspace:*",
+    "@ag2cli/core": "workspace:*",
+    "@ag2cli/protocol": "workspace:*",
+    "@ag2cli/runtime": "workspace:*",
+    "@agentclientprotocol/sdk": "^1.4.0",
+    "@anthropic-ai/sdk": "0.94.0",
+    "@vscode/ripgrep": "^1.18.0",
+    "ink": "8.0.0",
+    "jsonc-parser": "3.3.1",
+    "openai": "^6.48.0",
+    "react": "19.3.0",
+    "zod": "3.25.76"
+  }
+}
