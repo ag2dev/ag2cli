@@ -6,38 +6,20 @@
 
 AG2CLI is a coding agent CLI harness: interactive TUI, headless runs, or a long-running server. Built by AG2DEV.
 
-## Build and install
+## Run from source
 
-Build a standalone executable from source. Bun is needed to build; the resulting CLI does not require Bun to run. The release archive includes `ag2cli` and its `rg` helper, which should stay side by side.
+The public repository currently contains source only. Prebuilt CLI binaries, release build commands, and an installation flow are not available yet. Download and installation instructions will be added when formal releases begin.
 
-Requirements: Git, Bun 1.3.14 or newer, and macOS / Linux / Windows WSL2 on x64 / arm64.
-
-If Bun is not installed, install the repository's pinned version:
-
-```sh
-curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14"
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
-```
-
-These exports make Bun available in the current terminal. Add them to your shell startup configuration if you want them in new terminals.
+For now, install Bun 1.3.14 or newer to run the CLI from this checkout:
 
 ```sh
 git clone https://github.com/ag2dev/ag2cli.git
 cd ag2cli
 bun install
-release_dir="$(mktemp -d)"
-# Build into a fresh directory, then install both files from the archive.
-AG2CLI_RELEASE_OUTDIR="$release_dir" bun run build:cli
-mkdir -p "$HOME/.local/bin"
-tar -xzf "$release_dir"/ag2cli-*.tar.gz -C "$release_dir"
-install -m 755 "$release_dir/ag2cli" "$release_dir/rg" "$HOME/.local/bin/"
-rm -rf "$release_dir"
-export PATH="$HOME/.local/bin:$PATH"
-ag2cli --version
+bun run --cwd apps/cli start
 ```
 
-Add the `PATH` export to your shell startup configuration to keep it in new terminals. The executable and `rg` helper must remain in the same directory.
+The command examples below describe CLI behavior and assume an `ag2cli` executable is available on `PATH`.
 
 ## Configure a model provider
 

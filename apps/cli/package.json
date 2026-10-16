@@ -22,7 +22,6 @@
     "server": "bun run src/entrypoints/server.ts",
     "acp": "bun run src/entrypoints/acp.ts",
     "tui": "bun run src/entrypoints/tui.ts",
-    "release:build": "bun run ../../scripts/release/build-artifact.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

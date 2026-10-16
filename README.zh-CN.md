@@ -6,38 +6,20 @@
 
 AG2CLI 是面向软件开发的 Coding Agent CLI Harness，提供交互式 TUI、单次 Headless 运行和长期运行的服务端。由 AG2DEV 构建。
 
-## 从源码构建并安装
+## 从源码运行
 
-使用 Bun 从源码构建独立可执行文件。构建需要 Bun；构建完成后运行 CLI 不需要安装 Bun。发布压缩包包含 `ag2cli` 和配套的 `rg`，安装时请将它们放在同一目录。
+公开仓库当前只包含源码，暂不提供预构建 CLI、发布构建命令或安装流程。正式发布后会在此补充下载和安装说明。
 
-需要 Git、Bun 1.3.14 或更高版本，以及运行于 x64 / arm64 的 macOS / Linux / Windows WSL2。
-
-如果尚未安装 Bun，先安装项目指定的版本：
-
-```sh
-curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.14"
-export BUN_INSTALL="$HOME/.bun"
-export PATH="$BUN_INSTALL/bin:$PATH"
-```
-
-这两条 `export` 让当前终端找到 Bun；若希望新终端也生效，可将它们加入 shell 启动配置。
+目前可安装 Bun 1.3.14 或更高版本，然后从此 checkout 运行 CLI：
 
 ```sh
 git clone https://github.com/ag2dev/ag2cli.git
 cd ag2cli
 bun install
-release_dir="$(mktemp -d)"
-# 构建到新目录，再从压缩包中安装两个文件。
-bun run build:cli --outdir "$release_dir"
-mkdir -p "$HOME/.local/bin"
-tar -xzf "$release_dir"/ag2cli-*.tar.gz -C "$release_dir"
-install -m 755 "$release_dir/ag2cli" "$release_dir/rg" "$HOME/.local/bin/"
-rm -rf "$release_dir"
-export PATH="$HOME/.local/bin:$PATH"
-ag2cli --version
+bun run --cwd apps/cli start
 ```
 
-将 `PATH` 配置写入 shell 启动配置后，新终端也能找到命令。
+下方命令示例用于说明 CLI 的行为，运行时需要 `PATH` 中已有 `ag2cli` 可执行文件。
 
 ## 配置模型服务
 

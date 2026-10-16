@@ -13,7 +13,6 @@
   "scripts": {
     "typecheck:packages": "bun run --cwd packages/core typecheck && bun run --cwd packages/runtime typecheck && bun run --cwd packages/protocol typecheck && bun run --cwd packages/client typecheck && bun run --cwd packages/app-server-protocol typecheck && bun run --cwd packages/app-server-client typecheck",
     "typecheck": "bun run typecheck:packages && bun run --cwd apps/cli typecheck && bun run --cwd apps/web typecheck",
-    "build:cli": "bun run --cwd apps/cli release:build",
     "build:web": "bun run --cwd apps/web build",
     "tui": "bun run --cwd apps/cli tui",
     "start": "bun run --cwd apps/cli start",
