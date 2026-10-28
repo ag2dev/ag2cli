@@ -5,6 +5,7 @@ import { replaySession } from "@ag2cli/core/session/session-snapshot.js"
 import type { ApprovalBroker, ApprovalDecision } from "../../ports/approval-broker.js"
 import { isResolvableApprovalBroker } from "../../ports/approval-broker.js"
 import type { EventStore } from "../../ports/event-store.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { commitSessionEvents, SessionAuthority } from "./session-authority.js"
 import { SessionRevisionConflictError } from "./revision-conflict.js"
 
@@ -31,8 +32,9 @@ export interface ApprovalResolutionInput {
   readonly turn: number
   readonly toolUseId: string
   readonly preparedEventId: string
-  readonly expectedScopeRevision: number
-  readonly expectedPolicyRevision: number
+  /** CAS guards; absent means the caller holds no revision belief to enforce. */
+  readonly expectedScopeRevision?: number
+  readonly expectedPolicyRevision?: number
   readonly decision: ApprovalDecision
 }
 
@@ -95,7 +97,7 @@ export interface ApprovalResolutionServiceDependencies {
   }
   /** Local broker used only to wake an executor after the event is durable. */
   readonly broker?: ApprovalBroker
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 const MAX_CAS_RETRIES = 8
@@ -109,7 +111,7 @@ const MAX_CAS_RETRIES = 8
  * durable canonical decision instead of creating a competing event.
  */
 export class ApprovalResolutionService implements ApprovalResolutionResolver, ApprovalResolutionWriter {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
   private readonly authority: SessionAuthority
 
   constructor(private readonly deps: ApprovalResolutionServiceDependencies) {
@@ -128,17 +130,7 @@ export class ApprovalResolutionService implements ApprovalResolutionResolver, Ap
   }
 
   private enqueue(input: ResolutionAttemptInput, source: "remote" | "executor"): Promise<ApprovalResolutionOutcome> {
-    const key = approvalResourceKey(input)
-    const previous = this.pending.get(key) ?? Promise.resolve()
-    const current = previous.then(() => this.resolveNow(input, source))
-    const tracked = current.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(key, tracked)
-    return current.finally(() => {
-      if (this.pending.get(key) === tracked) this.pending.delete(key)
-    })
+    return this.lane.run(approvalResourceKey(input), () => this.resolveNow(input, source))
   }
 
   private async resolveNow(input: ResolutionAttemptInput, source: "remote" | "executor"): Promise<ApprovalResolutionOutcome> {
@@ -178,6 +170,10 @@ export class ApprovalResolutionService implements ApprovalResolutionResolver, Ap
           )
         }
         if (source === "remote") this.wakeBroker(input, existing.payload.decision)
+        // A replayed resolution may be the only fan-out that ever ran: the
+        // first attempt can die after its durable append but before publish,
+        // so the replay must still notify. Delivery is at-least-once.
+        await this.deps.onEventsAppended?.([existing], true)
         return {
           status: "replayed",
           decision: existing.payload.decision,
@@ -201,12 +197,16 @@ export class ApprovalResolutionService implements ApprovalResolutionResolver, Ap
       const snapshot = replaySession(events)
       const preparedScopeRevision = prepared.payload.scopeRevision ?? requested.payload.scopeRevision ?? 0
       const preparedPolicyRevision = prepared.payload.policyRevision ?? requested.payload.policyRevision ?? 0
-      if (preparedScopeRevision !== input.expectedScopeRevision || preparedPolicyRevision !== input.expectedPolicyRevision) {
+      if (
+        (input.expectedScopeRevision !== undefined && preparedScopeRevision !== input.expectedScopeRevision) ||
+        (input.expectedPolicyRevision !== undefined && preparedPolicyRevision !== input.expectedPolicyRevision)
+      ) {
         throw staleApproval("Tool approval preparation has expired")
       }
 
       const securityChanged =
-        snapshot.scopeRevision !== input.expectedScopeRevision || snapshot.policyRevision !== input.expectedPolicyRevision
+        (input.expectedScopeRevision !== undefined && snapshot.scopeRevision !== input.expectedScopeRevision) ||
+        (input.expectedPolicyRevision !== undefined && snapshot.policyRevision !== input.expectedPolicyRevision)
       if (source === "remote" && securityChanged) throw staleApproval("Session security revision has changed")
 
       // A pending request invalidated by a security change must converge to a

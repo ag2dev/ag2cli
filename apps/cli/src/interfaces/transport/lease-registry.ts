@@ -223,9 +223,8 @@ export class InMemoryLeaseRegistry implements LeaseRegistry {
   }
 
   private toHolder(owner: LeaseOwner): AppServerInteractionHolder {
+    // Connection/device identity stays server-internal; the wire exposes only public client fields.
     return {
-      connectionId: owner.connectionId,
-      deviceId: owner.deviceId,
       clientId: owner.client.clientId,
       clientKind: owner.client.clientKind,
       name: owner.client.name,

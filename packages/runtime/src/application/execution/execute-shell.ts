@@ -5,6 +5,7 @@ import { DEFAULT_SESSION_PERMISSION_MODE } from "@ag2cli/core/session/session-se
 import type { ApprovalBroker, DenialReason } from "../../ports/approval-broker.js"
 import { approvalDecisionOf } from "../../ports/approval-broker.js"
 import type { EventStore } from "../../ports/event-store.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { hasModelBashAuthority, type ToolExecutor } from "../../ports/tool-executor.js"
 import { toolIdempotencyKey } from "../../ports/tool-executor.js"
 import { safeTraceSink, traceAttributesFromToolMetadata, type TraceSink } from "../../ports/trace-sink.js"
@@ -134,7 +135,7 @@ export interface ExecuteShellDependencies {
   /** Builds the spawn fence stamped into the shell execution context. */
   readonly preSpawnGateFor: PolicySerialDeps["preSpawnGateFor"]
   readonly traceSink?: TraceSink
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
   readonly onTransientEvent?: (event: TransientStreamEvent) => void
   readonly executionReservation?: SessionExecutionReservation
   readonly reservationOwnerId?: string
@@ -142,7 +143,7 @@ export interface ExecuteShellDependencies {
 
 /** Execute one server shell command without entering the model loop. */
 export class ExecuteShellUseCase {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
   private readonly transientPublisher: TransientEventPublisher
   private readonly traceSink: TraceSink
   private readonly authority: SessionAuthority
@@ -153,9 +154,8 @@ export class ExecuteShellUseCase {
     this.authority = deps.authority ?? new SessionAuthority(deps.eventStore)
   }
 
-  async execute(input: ExecuteShellRequest): Promise<ExecuteShellResult> {
-    const previous = this.pending.get(input.sessionId)
-    const operation = (previous ?? Promise.resolve()).then(async () => {
+  execute(input: ExecuteShellRequest): Promise<ExecuteShellResult> {
+    return this.lane.run(input.sessionId, async () => {
       if (this.deps.executionReservation === undefined) return this.executeNow(input)
       const events = await this.deps.eventStore.read(input.sessionId)
       const idempotency = resolveCommandIdempotency(EXECUTE_SHELL_FAMILY, events, {
@@ -186,16 +186,6 @@ export class ExecuteShellUseCase {
         await lease.release(input.signal?.aborted ? "aborted" : "released").catch(() => {})
       }
     })
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(input.sessionId, tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(input.sessionId) === tracked) this.pending.delete(input.sessionId)
-    }
   }
 
   private async executeNow(input: ExecuteShellRequest): Promise<ExecuteShellResult> {
@@ -995,7 +985,10 @@ export class ExecuteShellUseCase {
                         },
                       },
                     })
-                  : { content: "Bash executor is not injected; the command was not started", isError: true }
+                  : {
+                      content: "Bash executor is not injected; the command was not started",
+                      isError: true,
+                    }
     currentEvents = await this.deps.eventStore.read(input.sessionId)
     currentState = reduceCanonicalSession(currentEvents)
     const parent = currentState.activeHead
@@ -1128,6 +1121,11 @@ function validateInput(input: ExecuteShellRequest): void {
 
 function shellToolUseId(commandId: string): string {
   return `shell:${commandId}`
+}
+
+/** Shell task output is served only through paged task logs, never the transcript. */
+export function isShellToolUseId(toolUseId: string): boolean {
+  return toolUseId.startsWith("shell:")
 }
 
 function shellInputId(commandId: string): string {

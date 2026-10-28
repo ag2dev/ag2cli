@@ -124,6 +124,13 @@ export const COMMAND_IDEMPOTENCY_FAMILY_CATALOG: readonly CommandIdempotencyCata
     reason: "Approval resolution is fenced by sessionId+runId+turn+toolUseId, not client commandId.",
   },
   {
+    commandFamily: "resolve_ask",
+    owner: "session/interaction-state",
+    coverage: "excluded-by-design",
+    identity: "resource-key",
+    reason: "Ask resolution is fenced by sessionId+runId+turn+toolUseId, not client commandId.",
+  },
+  {
     commandFamily: "session.cancel / cancel_task",
     owner: "execution/run-agent + task/task-registry",
     coverage: "excluded-by-design",

@@ -87,6 +87,8 @@ export function isConversationEvent(event: AgentEvent): boolean {
     case "ToolCallPrepared":
     case "ToolApprovalRequested":
     case "ToolApprovalResolved":
+    case "AskUserRequested":
+    case "AskUserResolved":
     case "ToolCallExecutionStarted":
     case "RunCompleted":
     case "RunFailed":

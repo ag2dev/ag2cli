@@ -153,7 +153,7 @@ function quoteGitPath(path: string): string {
     .replaceAll("\r", "\\015")}"`
 }
 
-async function runGit(
+export async function runGit(
   cwd: string,
   args: readonly string[],
   signal?: AbortSignal,

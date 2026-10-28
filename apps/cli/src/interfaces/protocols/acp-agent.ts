@@ -2,15 +2,10 @@ import * as acp from "@agentclientprotocol/sdk"
 import { createHash } from "node:crypto"
 import { resolve } from "node:path"
 import { type JsonValue } from "@ag2cli/app-server-protocol/types.js"
-import { asRecord, assertJsonValue, parseNonEmptyString, parseNonNegativeInteger } from "@ag2cli/app-server-protocol/validation.js"
+import { asRecord, parseNonEmptyString } from "@ag2cli/app-server-protocol/validation.js"
 import type { AppServerRpcClient } from "@ag2cli/app-server-client/client.js"
 import { randomUUID } from "node:crypto"
-import {
-  createAcpAppServerSessionClient,
-  type AcpAppServerEvent,
-  type AcpAppServerSessionClient,
-  type AcpAppServerSessionMessage,
-} from "./acp-app-server-client.js"
+import { createAcpAppServerSessionClient, type AcpAppServerEvent, type AcpAppServerSessionClient } from "./acp-app-server-client.js"
 
 export interface AcpPlanAgentOptions {
   /** Public App Server JSON-RPC client; no runtime object crosses this edge. */
@@ -90,8 +85,18 @@ function createAcpAgent(
     const prompt = extractPrompt(params.prompt)
     const commandId = randomUUID()
     const controller = new AbortController()
+    let inputId: string | undefined
+    let runId: string | undefined
+    // The ACP edge cancels whatever the turn currently owns: the queued
+    // input before a run admits it, the run itself once it started.
     const cancel = () => {
-      void appServer.cancel(params.sessionId, commandId).catch(() => undefined)
+      const target =
+        runId !== undefined
+          ? appServer.cancelRun(params.sessionId, runId)
+          : inputId !== undefined
+            ? appServer.cancelInput(params.sessionId, inputId)
+            : undefined
+      void target?.catch(() => undefined)
     }
     const abort = () => {
       if (!controller.signal.aborted) controller.abort(signal.reason)
@@ -101,14 +106,17 @@ function createAcpAgent(
     controller.signal.addEventListener("abort", cancel, { once: true })
     state.abortController = controller
     let terminalEvent: AcpAppServerEvent | undefined
+    // Deliberately hand-rolled: a failed send rejects the turn's terminal
+    // and rethrows into the chain, so later queued sends short-circuit into
+    // the same failure — fail-fast inside one invocation rather than
+    // per-entry isolation, and this adapter stays on the public contract.
     let updateChain = Promise.resolve()
     let unsubscribe = (): void => {}
     try {
       const before = await appServer.snapshot(params.sessionId, controller.signal)
-      const seenRevisions = new Set<number>()
-      let planEmitted = false
-      let runTextEmitted = false
-      let runId: string | undefined
+      // Multiple public events may share one revision; identity dedup is by eventId.
+      const seenEventIds = new Set<string>()
+      const introducedToolCallIds = new Set<string>()
       let resolveTerminal!: (event: AcpAppServerEvent) => void
       let rejectTerminal!: (error: unknown) => void
       const terminalPromise = new Promise<AcpAppServerEvent>((resolvePromise, rejectPromise) => {
@@ -116,19 +124,19 @@ function createAcpAgent(
         rejectTerminal = rejectPromise
       })
 
-      const queueMessage = (message: AcpAppServerSessionMessage): void => {
-        if (message.type === "operation_failed") {
-          if (message.commandId === commandId) rejectTerminal(new Error(message.message))
-          return
-        }
-        const event = message.event
-        if (event.revision <= before.lastRevision || seenRevisions.has(event.revision)) return
-        seenRevisions.add(event.revision)
+      const queueEvent = (event: AcpAppServerEvent): void => {
+        if (event.revision <= before.asOfRevision || seenEventIds.has(event.eventId)) return
+        seenEventIds.add(event.eventId)
+        if (isInputEvent(event) && commandIdForEvent(event) !== commandId) return
         if (options.mode === "run") {
           const startedRunId = runStartedForCommand(event, commandId)
           if (startedRunId !== undefined) runId = startedRunId
-          if (!belongsToRun(event, runId)) return
+          if (!isInputEvent(event) && !belongsToRun(event, runId)) return
         } else if (!isPlanEvent(event)) {
+          return
+        }
+        if (event.type === "input.failed") {
+          rejectTerminal(new Error(inputFailureMessage(event)))
           return
         }
         updateChain = updateChain
@@ -139,12 +147,7 @@ function createAcpAgent(
               appServer,
               event,
               signal: controller.signal,
-              onPlan: () => {
-                planEmitted = true
-              },
-              onRunText: () => {
-                runTextEmitted = true
-              },
+              introducedToolCallIds,
             }),
           )
           .then(() => {
@@ -159,38 +162,24 @@ function createAcpAgent(
           })
       }
 
-      unsubscribe = appServer.subscribe(params.sessionId, queueMessage)
-      for (const event of await appServer.attach(params.sessionId, before.lastRevision, controller.signal))
-        queueMessage({ type: "event", event })
+      unsubscribe = appServer.subscribe(params.sessionId, queueEvent)
+      for (const event of await appServer.attach(params.sessionId, before.asOfRevision, controller.signal)) queueEvent(event)
 
       if (options.mode === "plan") {
         const plan = await appServer.plan(params.sessionId, commandId, prompt.goal, prompt.context, state.workspace, controller.signal)
         await updateChain
-        if (!planEmitted) {
-          await sendPlan(client, params.sessionId, plan)
-          await sendText(client, params.sessionId, renderPlan(plan))
-        }
+        await sendPlan(client, params.sessionId, plan)
+        await sendText(client, params.sessionId, renderPlan(plan))
         return { stopReason: "end_turn" as const }
       }
 
-      const submitted = await appServer.submit(params.sessionId, commandId, prompt.goal, prompt.context, state.workspace, controller.signal)
-      runId = submitted.runId ?? runId
-      if (submitted.result !== undefined) {
-        await updateChain
-        if (!runTextEmitted) await sendText(client, params.sessionId, renderRun(submitted.result))
-        const status = runStatus(submitted.result)
-        if (status === "cancelled") return { stopReason: "cancelled" as const }
-        if (status === "failed") return { stopReason: "refusal" as const }
-        return { stopReason: "end_turn" as const }
-      }
+      inputId = (await appServer.submit(params.sessionId, commandId, prompt.goal, prompt.context, controller.signal)).inputId
 
       const completed = await terminalPromise
       await updateChain
-      if (!runTextEmitted && completed.type === "RunCompleted") {
-        await sendText(client, params.sessionId, payloadString(completed, "finalText"))
-      }
-      if (completed.type === "RunFailed") return { stopReason: "refusal" as const }
-      if (completed.type === "RunCancelled") return { stopReason: "cancelled" as const }
+      const status = runStatusForEvent(completed)
+      if (status === "failed") return { stopReason: "refusal" as const }
+      if (status === "cancelled") return { stopReason: "cancelled" as const }
       return { stopReason: "end_turn" as const }
     } catch (error) {
       const cancelled = controller.signal.aborted || signal.aborted
@@ -240,33 +229,61 @@ function extractPrompt(blocks: readonly acp.ContentBlock[]): { goal: string; con
 }
 
 function isPlanEvent(event: AcpAppServerEvent): boolean {
-  return event.type === "PlanCreated" || event.type === "PlanGenerationFailed" || event.type === "PlanGenerationCancelled"
+  return event.type === "plan.updated"
+}
+
+function isInputEvent(event: AcpAppServerEvent): boolean {
+  return event.type === "input.accepted" || event.type === "input.updated" || event.type === "input.failed"
+}
+
+function commandIdForEvent(event: AcpAppServerEvent): string | undefined {
+  if (event.type === "input.failed") return optionalString(event.payload.commandId)
+  const input = asRecord(event.payload.input, `${event.type}.input`)
+  return input === undefined ? undefined : optionalString(input.commandId)
+}
+
+function inputFailureMessage(event: AcpAppServerEvent): string {
+  const failure = asRecord(event.payload.failure, "input.failed.failure")
+  const message = failure === undefined ? undefined : optionalString(failure.message)
+  return message ?? "Input failed"
 }
 
 function runStartedForCommand(event: AcpAppServerEvent, commandId: string): string | undefined {
-  if (event.type !== "RunStarted") return undefined
-  return payloadString(event, "commandId") === commandId ? payloadString(event, "runId") : undefined
+  if (event.type !== "input.updated") return undefined
+  const input = asRecord(event.payload.input, "input.updated.input")
+  if (input === undefined || optionalString(input.commandId) !== commandId) return undefined
+  return optionalString(input.runId)
+}
+
+function runIdForEvent(event: AcpAppServerEvent): string | undefined {
+  switch (event.type) {
+    case "run.updated":
+      return optionalString(asRecord(event.payload.run, "run.updated.run")?.runId)
+    case "message.upserted":
+      return optionalString(asRecord(event.payload.message, "message.upserted.message")?.runId)
+    case "tool_call.upserted":
+      return optionalString(asRecord(event.payload.toolCall, "tool_call.upserted.toolCall")?.runId)
+    case "interaction.requested":
+      return optionalString(asRecord(event.payload.interaction, "interaction.requested.interaction")?.runId)
+    default:
+      return undefined
+  }
 }
 
 function belongsToRun(event: AcpAppServerEvent, runId: string | undefined): boolean {
-  if (event.type === "RunStarted") return runId !== undefined
-  if (runId === undefined) return false
-  return (
-    [
-      "ModelResponseCommitted",
-      "ToolCallRequested",
-      "ToolApprovalRequested",
-      "ToolApprovalResolved",
-      "ToolResultCommitted",
-      "RunCompleted",
-      "RunFailed",
-      "RunCancelled",
-    ].includes(event.type) && payloadString(event, "runId") === runId
-  )
+  const eventRunId = runIdForEvent(event)
+  return runId !== undefined && eventRunId === runId
 }
 
 function isTerminalEvent(event: AcpAppServerEvent): boolean {
-  return event.type === "RunCompleted" || event.type === "RunFailed" || event.type === "RunCancelled"
+  const status = runStatusForEvent(event)
+  return status === "completed" || status === "failed" || status === "cancelled"
+}
+
+function runStatusForEvent(event: AcpAppServerEvent): "completed" | "failed" | "cancelled" | undefined {
+  if (event.type !== "run.updated") return undefined
+  const status = optionalString(asRecord(event.payload.run, "run.updated.run")?.status)
+  return status === "completed" || status === "failed" || status === "cancelled" ? status : undefined
 }
 
 async function sendText(client: acp.AgentContext, sessionId: string, text: string, messageId: string = randomUUID()): Promise<void> {
@@ -305,79 +322,89 @@ function renderPlan(plan: JsonValue): string {
   return JSON.stringify(plan)
 }
 
-function renderRun(result: JsonValue): string {
-  const record = asRecord(result, "ACP run result")
-  return typeof record.finalText === "string" ? record.finalText : ""
-}
-
-function runStatus(result: JsonValue): "completed" | "failed" | "cancelled" | undefined {
-  const record = asRecord(result, "ACP run result")
-  return record.status === "completed" || record.status === "failed" || record.status === "cancelled" ? record.status : undefined
-}
-
 async function sendAgentEvent(input: {
   readonly client: acp.AgentContext
   readonly sessionId: string
   readonly appServer: AcpAppServerSessionClient
   readonly event: AcpAppServerEvent
   readonly signal: AbortSignal
-  readonly onPlan: () => void
-  readonly onRunText: () => void
+  readonly introducedToolCallIds: Set<string>
 }): Promise<void> {
-  const { client, sessionId, appServer, event, signal } = input
+  const { client, sessionId, appServer, event, signal, introducedToolCallIds } = input
   switch (event.type) {
-    case "PlanCreated":
-      input.onPlan()
-      await sendPlan(client, sessionId, assertJsonValue(event.payload, "PlanCreated.payload"))
-      await sendText(client, sessionId, renderPlan(assertJsonValue(event.payload, "PlanCreated.payload")), event.eventId)
+    case "plan.updated": {
+      // The public event carries a summary only; the full plan rides the
+      // session.plan result, so this is a progress line, not the plan itself.
+      const plan = asRecord(event.payload.plan, "plan.updated.plan")
+      const status = optionalString(plan.status) ?? "unknown"
+      const completed = typeof plan.completedSteps === "number" ? plan.completedSteps : 0
+      const total = typeof plan.totalSteps === "number" ? plan.totalSteps : 0
+      await sendText(client, sessionId, `Plan ${status}: ${completed}/${total} steps`, event.eventId)
       return
-    case "PlanGenerationFailed":
-      await sendText(client, sessionId, `Plan generation failed: ${payloadString(event, "message")}`, event.eventId)
-      return
-    case "PlanGenerationCancelled":
-      await sendText(
-        client,
-        sessionId,
-        `Plan generation cancelled: ${payloadOptionalString(event, "reason") ?? "User cancelled"}`,
-        event.eventId,
-      )
-      return
-    case "ModelResponseCommitted": {
-      const text = responseText(event)
-      if (text.length > 0) {
-        input.onRunText()
+    }
+    case "message.upserted": {
+      const message = asRecord(event.payload.message, "message.upserted.message")
+      if (optionalString(message.role) !== "assistant") return
+      const text = contentText(message.content)
+      // The public projection flattens non-text model content into placeholder
+      // text; a tool-use turn must not surface as an ACP agent message.
+      if (text.length > 0 && !UNSUPPORTED_CONTENT_PLACEHOLDER.test(text)) {
         await sendText(client, sessionId, text, event.eventId)
       }
       return
     }
-    case "ToolCallRequested":
+    case "tool_call.upserted": {
+      const toolCall = asRecord(event.payload.toolCall, "tool_call.upserted.toolCall")
+      const toolCallId = parseNonEmptyString(toolCall.toolCallId, "tool_call.upserted.toolCall.toolCallId")
+      const name = parseNonEmptyString(toolCall.toolName, "tool_call.upserted.toolCall.toolName")
+      const status = optionalString(toolCall.status)
+      if (status === "completed" || status === "failed" || status === "denied") {
+        const summary = optionalString(toolCall.resultSummary) ?? ""
+        await client.notify(acp.methods.client.session.update, {
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: status === "completed" ? "completed" : "failed",
+            rawOutput: summary,
+            content: [{ type: "content", content: { type: "text", text: summary } }],
+          },
+        })
+        return
+      }
+      // Public upserts repeat the same tool call across non-terminal statuses;
+      // ACP clients read tool_call as creation, so introduce each call once.
+      if (introducedToolCallIds.has(toolCallId)) return
+      introducedToolCallIds.add(toolCallId)
       await client.notify(acp.methods.client.session.update, {
         sessionId,
         update: {
           sessionUpdate: "tool_call",
-          toolCallId: payloadString(event, "toolUseId"),
-          title: payloadString(event, "name"),
-          name: payloadString(event, "name"),
+          toolCallId,
+          title: optionalString(toolCall.title) ?? name,
+          name,
           status: "in_progress",
-          rawInput: assertJsonValue(event.payload.input, "ToolCallRequested.input"),
+          rawInput: {},
         },
       })
       return
-    case "ToolApprovalRequested": {
-      const toolUseId = payloadString(event, "toolUseId")
-      // A guardian-owned ask is answered by the guardian review alone;
-      // offering it to the human would race the reviewer and the server
-      // fence rejects a user resolution anyway. The resolved event below
-      // renders the outcome.
-      if (payloadOptionalString(event, "ownedBy") === "guardian") return
+    }
+    case "interaction.requested": {
+      const interaction = asRecord(event.payload.interaction, "interaction.requested.interaction")
+      if (optionalString(interaction.kind) !== "tool_approval") return
+      const interactionId = parseNonEmptyString(interaction.interactionId, "interaction.requested.interaction.interactionId")
+      const toolCallId = parseNonEmptyString(interaction.toolCallId, "interaction.requested.interaction.toolCallId")
+      const title = parseNonEmptyString(interaction.title, "interaction.requested.interaction.title")
+      const subject = asRecord(interaction.subject, "interaction.requested.interaction.subject")
+      const toolName = optionalString(subject?.toolName) ?? title
       let decision: "approved" | "denied" = "denied"
       try {
         const permission = await client.request(acp.methods.client.session.requestPermission, {
           sessionId,
           toolCall: {
-            toolCallId: toolUseId,
-            title: payloadString(event, "name"),
-            name: payloadString(event, "name"),
+            toolCallId,
+            title,
+            name: toolName,
             status: "pending",
           },
           options: [
@@ -389,79 +416,52 @@ async function sendAgentEvent(input: {
       } catch {
         decision = "denied"
       }
-      await appServer.resolveApproval(
-        {
-          sessionId,
-          runId: payloadString(event, "runId"),
-          turn: payloadNumber(event, "turn"),
-          toolUseId,
-          preparedEventId: payloadOptionalString(event, "preparedEventId") ?? event.eventId,
-          expectedScopeRevision: payloadOptionalNumber(event, "scopeRevision") ?? 0,
-          expectedPolicyRevision: payloadOptionalNumber(event, "policyRevision") ?? 0,
-          decision,
-        },
-        signal,
-      )
+      try {
+        await appServer.resolveToolApproval(
+          {
+            sessionId,
+            interactionId,
+            expectedScopeRevision: typeof interaction.scopeRevision === "number" ? interaction.scopeRevision : 0,
+            expectedPolicyRevision: typeof interaction.policyRevision === "number" ? interaction.policyRevision : 0,
+            decision,
+          },
+          signal,
+        )
+      } catch {
+        // The interaction may already be resolved by another writer (a
+        // guardian or a racing client); the run's own events stay
+        // authoritative for the prompt outcome.
+      }
       return
     }
-    case "ToolApprovalResolved":
-      await client.notify(acp.methods.client.session.update, {
-        sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId: payloadString(event, "toolUseId"),
-          status: payloadString(event, "decision") === "approved" ? "in_progress" : "failed",
-        },
-      })
-      return
-    case "ToolResultCommitted": {
-      const result = asRecord(event.payload.result, "ToolResultCommitted.result")
-      const content = parseNonEmptyString(result.content, "ToolResultCommitted.result.content")
-      await client.notify(acp.methods.client.session.update, {
-        sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId: payloadString(event, "toolUseId"),
-          status: result.isError === true ? "failed" : "completed",
-          rawOutput: content,
-          content: [{ type: "content", content: { type: "text", text: content } }],
-        },
-      })
+    case "run.updated": {
+      const run = asRecord(event.payload.run, "run.updated.run")
+      const status = optionalString(run.status)
+      if (status === "failed") {
+        const failure = asRecord(run.failure, "run.updated.run.failure")
+        await sendText(client, sessionId, `Execution failed: ${optionalString(failure?.message) ?? "run failed"}`, event.eventId)
+      } else if (status === "cancelled") {
+        await sendText(client, sessionId, "Execution cancelled", event.eventId)
+      }
       return
     }
-    case "RunFailed":
-      await sendText(client, sessionId, `Execution failed: ${payloadString(event, "message")}`, event.eventId)
-      return
-    case "RunCancelled":
-      await sendText(client, sessionId, `Execution cancelled: ${payloadOptionalString(event, "reason") ?? "User cancelled"}`, event.eventId)
-      return
     default:
       return
   }
 }
 
-function responseText(event: AcpAppServerEvent): string {
-  if (!Array.isArray(event.payload.content)) return ""
-  return event.payload.content
+function contentText(value: unknown): string {
+  if (!Array.isArray(value)) return ""
+  return value
     .map((block, index) => {
-      const record = asRecord(block, `ModelResponseCommitted.content[${index}]`)
+      const record = asRecord(block, `message.content[${index}]`)
       return record.type === "text" && typeof record.text === "string" ? record.text : ""
     })
     .join("")
 }
 
-function payloadString(event: AcpAppServerEvent, key: string): string {
-  return parseNonEmptyString(event.payload[key], `${event.type}.payload.${key}`)
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined
 }
 
-function payloadOptionalString(event: AcpAppServerEvent, key: string): string | undefined {
-  return event.payload[key] === undefined ? undefined : parseNonEmptyString(event.payload[key], `${event.type}.payload.${key}`)
-}
-
-function payloadNumber(event: AcpAppServerEvent, key: string): number {
-  return parseNonNegativeInteger(event.payload[key], `${event.type}.payload.${key}`)
-}
-
-function payloadOptionalNumber(event: AcpAppServerEvent, key: string): number | undefined {
-  return event.payload[key] === undefined ? undefined : parseNonNegativeInteger(event.payload[key], `${event.type}.payload.${key}`)
-}
+const UNSUPPORTED_CONTENT_PLACEHOLDER = /^(?:unsupported content block: \w+)+$/

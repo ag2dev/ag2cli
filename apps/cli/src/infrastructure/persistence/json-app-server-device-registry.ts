@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { mkdir, readFile } from "node:fs/promises"
 import { join } from "node:path"
+import { OrderedLane } from "@ag2cli/runtime/concurrency/ordered-lane.js"
 import { replaceFileAtomically } from "./file-coordination.js"
 import {
   APP_SERVER_SCOPES,
@@ -48,7 +49,7 @@ export class JsonAppServerDeviceRegistry implements AppServerDeviceRegistry {
   private readonly now: () => Date
   private state?: StoredRegistry
   private loadPromise?: Promise<StoredRegistry>
-  private mutationChain: Promise<void> = Promise.resolve()
+  private readonly mutationLane = new OrderedLane<string>()
 
   constructor(
     private readonly applicationHome: string,
@@ -128,20 +129,13 @@ export class JsonAppServerDeviceRegistry implements AppServerDeviceRegistry {
     }
   }
 
-  private async mutate<T>(
-    mutation: (current: StoredRegistry) => Promise<{ readonly state: StoredRegistry; readonly result: T }>,
-  ): Promise<T> {
-    const run = this.mutationChain.then(async () => {
+  private mutate<T>(mutation: (current: StoredRegistry) => Promise<{ readonly state: StoredRegistry; readonly result: T }>): Promise<T> {
+    return this.mutationLane.run("mutations", async () => {
       const current = await this.load()
       const changed = await mutation(current)
       this.state = changed.state
       return changed.result
     })
-    this.mutationChain = run.then(
-      () => undefined,
-      () => undefined,
-    )
-    return run
   }
 
   private async persist(value: StoredRegistry): Promise<void> {

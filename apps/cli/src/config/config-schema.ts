@@ -4,10 +4,18 @@ import type { ObservabilityMode, TelemetryMode } from "@ag2cli/core/model/observ
 import type { Theme } from "./theme.js"
 
 const nonEmptyString = z.string().min(1)
+const providerDisplayName = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  // oxlint-disable-next-line no-control-regex -- display names must stay on one terminal row
+  .refine((value) => !/[\u0000-\u001f\u007f]/u.test(value), "Must be a single line of text")
 const positiveInteger = z.number().int().min(1).max(10_000_000)
 
 const providerConfigSchema = z
   .object({
+    displayName: providerDisplayName.optional(),
     protocol: z.enum(["anthropic", "openai"]).optional(),
     compatibility: z.enum(["auto", "generic", "openai", "deepseek", "qwen", "openrouter", "together", "zai", "llama.cpp"]).optional(),
     thinking: z.enum(["auto", "on", "off"]).optional(),

@@ -9,6 +9,8 @@ export interface SessionRecord {
   /** Optional user-provided label derived from the canonical event stream. */
   readonly title?: string
   readonly createdAt: string
+  /** Timestamp of the last applied canonical event; derived, never stored. */
+  readonly updatedAt: string
   readonly archived: boolean
   readonly archivedAt?: string
 }
@@ -39,6 +41,8 @@ export interface SessionCatalog {
   list(options?: SessionCatalogOptions): Promise<readonly SessionRecord[]>
   get(sessionId: SessionId, options?: SessionCatalogOptions): Promise<SessionRecord | undefined>
   create(sessionId: SessionId, workspace: string, options?: SessionCreateOptions): Promise<SessionRecord>
+  /** Set the display title once; an existing title is preserved. */
+  setTitleIfAbsent(sessionId: SessionId, title: string, options?: SessionCatalogOptions): Promise<SessionRecord>
   fork(sourceSessionId: SessionId, targetSessionId: SessionId, title?: string, options?: SessionCatalogOptions): Promise<SessionRecord>
   /** Materialize the source conversation at one authoritative logical cursor. */
   forkAtCursor(

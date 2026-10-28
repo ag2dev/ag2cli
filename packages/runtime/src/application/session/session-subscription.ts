@@ -35,6 +35,7 @@ interface DurableSubscription {
   readonly onOverflow?: (overflow: SessionSubscriptionOverflow) => void
   readonly maxQueueSize: number
   readonly queue: AgentEvent[]
+  receivedLive: boolean
   scheduled: boolean
   closed: boolean
 }
@@ -81,6 +82,7 @@ export class SessionSubscriptionHub {
       ...(options.onOverflow ? { onOverflow: options.onOverflow } : {}),
       maxQueueSize: boundedQueueSize(options.maxQueueSize ?? this.options.durableQueueSize ?? DEFAULT_DURABLE_QUEUE_SIZE),
       queue: [],
+      receivedLive: false,
       scheduled: false,
       closed: false,
     }
@@ -115,6 +117,27 @@ export class SessionSubscriptionHub {
       if (subscription.closed) continue
       const visible = events.filter((event) => event.sessionId === subscription.sessionId && event.revision > subscription.cursor)
       if (visible.length === 0) continue
+      // The first live batch may legitimately start above the subscription
+      // cursor: the attach barrier's history read already covers everything
+      // up to the barrier. Once live delivery has begun, a batch starting
+      // past cursor + 1 means an intermediate publish never reached this hub,
+      // so the subscriber must resync instead of silently skipping the hole.
+      const firstVisible = visible[0]
+      if (firstVisible !== undefined && subscription.receivedLive && firstVisible.revision > subscription.cursor + 1) {
+        this.closeDurable(subscription)
+        try {
+          subscription.onOverflow?.({
+            channel: "durable",
+            sessionId: subscription.sessionId,
+            cursor: subscription.cursor,
+            queued: subscription.queue.length,
+          })
+        } catch {
+          // Transport diagnostics must not affect the authoritative write.
+        }
+        continue
+      }
+      subscription.receivedLive = true
       if (subscription.queue.length + visible.length > subscription.maxQueueSize) {
         const overflow: SessionSubscriptionOverflow = {
           channel: "durable",

@@ -1,7 +1,9 @@
 import { existsSync } from "node:fs"
 import { isAbsolute, join, resolve } from "node:path"
-import { JsonlEventStore } from "../infrastructure/persistence/jsonl-event-store.js"
+import type { SessionId } from "@ag2cli/core/ids.js"
+import { JsonlEventStore, sessionTranscriptPath } from "../infrastructure/persistence/jsonl-event-store.js"
 import { JsonlSessionCatalog } from "../infrastructure/persistence/jsonl-session-catalog.js"
+import { FileSessionNotesStore } from "../infrastructure/persistence/file-session-notes-store.js"
 import { JsonSessionSnapshotStore } from "../infrastructure/persistence/json-session-snapshot-store.js"
 import { JsonlTraceSink } from "../infrastructure/observability/trace/jsonl-trace-sink.js"
 import { JsonlTelemetrySink } from "../infrastructure/observability/telemetry/jsonl-telemetry-sink.js"
@@ -14,8 +16,10 @@ import { safeTraceStore, type TraceStore } from "@ag2cli/runtime/ports/trace-sin
 import { createObservabilityPolicy, type ObservabilityPolicy } from "@ag2cli/runtime/ports/observability.js"
 import type { TelemetrySink } from "@ag2cli/runtime/ports/telemetry.js"
 import type { SessionSnapshotStore } from "@ag2cli/runtime/ports/session-snapshot-store.js"
+import type { SessionNotesStore } from "@ag2cli/runtime/ports/session-notes-store.js"
 import type { SessionExecutionReservation } from "@ag2cli/runtime/ports/session-execution-reservation.js"
-import type { CompactThresholds } from "@ag2cli/core/model/limits.js"
+import { thresholdsForContextWindow, type CompactThresholds } from "@ag2cli/core/model/limits.js"
+import { resolveAutoFloor } from "@ag2cli/runtime/application/context/compact-budgets.js"
 import { WorkspacePolicy } from "../capabilities/security/workspace.js"
 import { checkTrust, getWorkspaceIdentity, loadTrustStore } from "../capabilities/security/trust.js"
 import { scanMemoryRoots, type Memory, type MemoryRoot } from "../capabilities/memory/store.js"
@@ -28,6 +32,7 @@ import {
   type ProjectInstructionLoadResult,
 } from "../capabilities/workspace/instructions.js"
 import { loadRuntimeConfig, type RuntimeConfig } from "../config/runtime.js"
+import { resolveMainModelFacts } from "./model-facts.js"
 import { workspaceStorageDigest } from "../infrastructure/persistence/storage-resolver.js"
 
 /** Per-composition operation context. Shared by both assembly phases; never part of services state. */
@@ -62,6 +67,8 @@ export interface AgentServerServicesOptions extends AgentServerBuildContext {
   readonly sessionAuthority?: SessionAuthority
   /** Optional derived snapshot store; defaults to a JSON file beside events. */
   readonly snapshotStore?: SessionSnapshotStore
+  /** Session notes side-car store; defaults to a markdown file under the event root. */
+  readonly notesStore?: SessionNotesStore
   readonly traceSink?: TraceStore
   readonly traceRoot?: string
   readonly observability?: ObservabilityPolicy
@@ -71,12 +78,12 @@ export interface AgentServerServicesOptions extends AgentServerBuildContext {
   readonly childEventStoreFactory?: () => EventStore
   readonly memoryRoot?: string
   readonly skillRoot?: string
-  readonly compact?: { readonly enable?: boolean; readonly thresholds?: CompactThresholds }
+  readonly compact?: { readonly enable?: boolean; readonly thresholds?: Partial<CompactThresholds> }
   /** Opt-in hierarchical project instruction loading for interactive clients. */
   readonly loadProjectInstructions?: boolean
   /** Explicit capability sources fail closed instead of degrading silently. */
   readonly strictCapabilities?: boolean
-  /** Local durable execution guard; serve uses its existing Host coordination. */
+  /** Local durable execution guard; serve derives its own in-process reservation. */
   readonly executionReservation?: SessionExecutionReservation
   readonly reservationOwnerId?: string
 }
@@ -87,6 +94,11 @@ export interface AgentServerStorageServices {
   readonly authority: SessionAuthority
   readonly catalog: SessionCatalog
   readonly snapshotStore: SessionSnapshotStore
+  /** Durable transcript location shared by the notes side-car and boundary stamps. */
+  readonly eventRoot: string
+  readonly notesStore: SessionNotesStore
+  /** Absolute transcript path per session, stamped into compaction boundary blocks. */
+  readonly transcriptPath: (sessionId: SessionId) => string
   readonly traceSink: TraceStore
   readonly observability: ObservabilityPolicy
   readonly telemetrySink?: TelemetrySink
@@ -99,7 +111,22 @@ export interface AgentServerStorageServices {
 export interface AgentServerCapabilityServices {
   readonly strict: boolean
   readonly loadProjectInstructions: boolean
-  readonly compact: { readonly enable: boolean; readonly thresholds: CompactThresholds }
+  readonly compact: {
+    readonly enable: boolean
+    readonly thresholds: CompactThresholds
+    /**
+     * Main-model request-side output-token fact. Sessions that override the
+     * context window re-derive their thresholds from it instead of the
+     * conservative default reservation.
+     */
+    readonly maxOutputTokens: number
+    /**
+     * Pure per-window derivation for child agents: injected or configured
+     * compact fields express a decision about the main conversation window,
+     * so each child re-derives its pair from its own resolved model facts.
+     */
+    readonly thresholdsForModel: (modelId?: string) => CompactThresholds
+  }
   readonly globHidden: boolean
   readonly globNoIgnore: boolean
 }
@@ -190,6 +217,7 @@ export async function resolveAgentServerServices(options: AgentServerServicesOpt
       ])
 
   const eventRoot = options.eventRoot ?? config.paths.eventRoot
+  const notesStore = options.notesStore ?? new FileSessionNotesStore(eventRoot)
   const snapshotStore = options.snapshotStore ?? new JsonSessionSnapshotStore(eventRoot)
   const traceSink = safeTraceStore(options.traceSink ?? new JsonlTraceSink(options.traceRoot ?? join(eventRoot, "traces")))!
   const observability =
@@ -270,8 +298,11 @@ export async function resolveAgentServerServices(options: AgentServerServicesOpt
     storage: {
       eventStore,
       authority,
-      catalog: new JsonlSessionCatalog(eventStore, authority),
+      catalog: new JsonlSessionCatalog(eventStore, authority, undefined, notesStore),
       snapshotStore,
+      eventRoot,
+      notesStore,
+      transcriptPath: (id) => sessionTranscriptPath(eventRoot, id),
       traceSink,
       observability,
       ...(telemetry ? { telemetrySink: telemetry } : {}),
@@ -281,10 +312,7 @@ export async function resolveAgentServerServices(options: AgentServerServicesOpt
     capabilities: {
       strict: options.strictCapabilities === true,
       loadProjectInstructions: options.loadProjectInstructions === true,
-      compact: {
-        enable: options.compact?.enable ?? true,
-        thresholds: options.compact?.thresholds ?? config.compact,
-      },
+      compact: resolveCompactCapability(config, options.compact),
       globHidden: config.features.globHidden,
       globNoIgnore: config.features.globNoIgnore,
     },
@@ -317,6 +345,39 @@ export async function resolveAgentServerServices(options: AgentServerServicesOpt
     diagnostics: {
       skills: [...skillScan.diagnostics, ...skillTrustDiagnostics],
       instructions: projectInstructionScan.diagnostics,
+    },
+  }
+}
+
+/**
+ * Complete compaction thresholds per field: injected value wins, then the
+ * explicit config value, then derivation from the resolved main-model window
+ * facts (context window plus the request-side output-token fact). Illegal
+ * combinations — only reachable through explicit or injected fields, since
+ * pure derivation always yields blocking > auto and an auto above the floor —
+ * fail closed at resolution time.
+ */
+function resolveCompactCapability(
+  config: RuntimeConfig,
+  injected: { readonly enable?: boolean; readonly thresholds?: Partial<CompactThresholds> } | undefined,
+): AgentServerCapabilityServices["compact"] {
+  const resolved = resolveMainModelFacts(config).resolved
+  const derived = thresholdsForContextWindow(resolved.contextWindow.value, resolved.defaultMaxOutputTokens)
+  const autoCompactTokens = resolveAutoFloor(
+    injected?.thresholds?.autoCompactTokens ?? config.compact?.autoCompactTokens ?? derived.autoCompactTokens,
+  )
+  const blockingLimitTokens =
+    injected?.thresholds?.blockingLimitTokens ?? config.compact?.blockingLimitTokens ?? derived.blockingLimitTokens
+  if (blockingLimitTokens <= autoCompactTokens) {
+    throw new Error("compact blockingLimitTokens must be greater than autoCompactTokens")
+  }
+  return {
+    enable: injected?.enable ?? true,
+    thresholds: { autoCompactTokens, blockingLimitTokens },
+    maxOutputTokens: resolved.defaultMaxOutputTokens,
+    thresholdsForModel: (modelId?: string) => {
+      const facts = resolveMainModelFacts(config, modelId).resolved
+      return thresholdsForContextWindow(facts.contextWindow.value, facts.defaultMaxOutputTokens)
     },
   }
 }

@@ -4,7 +4,9 @@
  * assembly root and nothing under screen/ reaches other modules.
  */
 export type {
+  ScreenActivationOptions,
   ScreenCapabilities,
+  ScreenInputMode,
   ScreenPreparation,
   ScreenSignal,
   ScreenTerminalPort,

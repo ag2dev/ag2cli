@@ -18,7 +18,7 @@ export interface RewindSessionDependencies {
   readonly identity: RewindSessionIdentity
   readonly executionReservation?: SessionExecutionReservation
   readonly reservationOwnerId?: string
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 export interface ListCheckpointsInput {

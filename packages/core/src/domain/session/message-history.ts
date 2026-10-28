@@ -9,7 +9,25 @@ export function messagesFromSessionEvents(events: readonly AgentEvent[]): Messag
   return projectConversationMessages(events, messagesFromConversationEvents)
 }
 
-function messagesFromConversationEvents(events: readonly AgentEvent[]): Message[] {
+/**
+ * Fold one already-projected conversation view into the live transcript: a
+ * compaction event replaces the transcript with its rebuilt messages.
+ */
+export function messagesFromConversationEvents(events: readonly AgentEvent[]): Message[] {
+  return foldConversationEvents(events, false)
+}
+
+/**
+ * Fold the conversation corpus across compaction boundaries. History
+ * retrieval must see every pre-boundary segment, so a compaction event
+ * resets the pairing bookkeeping only — its rebuilt transcript never
+ * enters the corpus and no segment is dropped.
+ */
+export function foldConversationSegments(events: readonly AgentEvent[]): Message[] {
+  return foldConversationEvents(events, true)
+}
+
+function foldConversationEvents(events: readonly AgentEvent[], retainSegments: boolean): Message[] {
   const messages: Message[] = []
   const acceptedInputs = new Map<string, Extract<AgentEvent, { type: "InputAccepted" }>["payload"]>()
   // Tool ids the transcript's assistant messages actually carry. A
@@ -18,6 +36,13 @@ function messagesFromConversationEvents(events: readonly AgentEvent[]): Message[
   // block: providers reject a tool message with no preceding assistant
   // tool call, and the shell output belongs to the user side anyway.
   const assistantToolUses = new Set<string>()
+  // Tool ids carried by the latest assistant message: the only ids whose
+  // results are siblings of one another and must share one user row.
+  const currentTurnToolUses = new Set<string>()
+  // Tool ids whose result is already in the transcript. The reducer allows
+  // re-committing under a fresh attempt id, but a second row with the same
+  // tool_use_id would violate the providers' pairing rule.
+  const answeredToolUses = new Set<string>()
   const collectToolUses = (content: Message["message"]["content"]): void => {
     if (typeof content === "string") return
     for (const block of content) {
@@ -37,9 +62,10 @@ function messagesFromConversationEvents(events: readonly AgentEvent[]): Message[
     }
     if (event.type === "InputConsumed") {
       const accepted = acceptedInputs.get(event.payload.inputId)
-      // Host notifications wake the loop as user-side text: the model must
-      // see the delivery, not merely be re-driven.
-      if (accepted !== undefined && accepted.kind !== "steer") {
+      // Every consumed input — prompt, steer, host notification — wakes the
+      // loop as user-side text: the model must see the delivery, not merely
+      // be re-driven.
+      if (accepted !== undefined) {
         messages.push(userText(accepted.text))
         tailUserRow = {
           runId: event.payload.runId,
@@ -49,12 +75,37 @@ function messagesFromConversationEvents(events: readonly AgentEvent[]): Message[
       }
     }
     if (event.type === "ContextCompacted" || event.type === "SessionContextCompacted") {
-      messages.length = 0
-      messages.push(...event.payload.messages)
+      if (!retainSegments) {
+        messages.length = 0
+        messages.push(...event.payload.messages)
+      }
       // Pairing restarts from the compacted transcript: only the tool
-      // uses the summary itself carries can still answer results.
+      // uses the summary itself carries can still answer results, and
+      // results the summary already carries count as answered.
       assistantToolUses.clear()
-      for (const message of event.payload.messages) collectToolUses(message.message.content)
+      currentTurnToolUses.clear()
+      answeredToolUses.clear()
+      for (const message of event.payload.messages) {
+        collectToolUses(message.message.content)
+        const content = message.message.content
+        if (typeof content !== "string") {
+          for (const block of content) {
+            if (block.type === "tool_result") answeredToolUses.add(block.tool_use_id)
+          }
+        }
+      }
+      for (let i = event.payload.messages.length - 1; i >= 0; i--) {
+        const message = event.payload.messages[i]
+        if (message !== undefined && message.type === "assistant") {
+          const content = message.message.content
+          if (typeof content !== "string") {
+            for (const block of content) {
+              if (block.type === "tool_use") currentTurnToolUses.add(block.id)
+            }
+          }
+          break
+        }
+      }
       tailUserRow = null
     }
     if (event.type === "ModelResponseCommitted") {
@@ -65,19 +116,35 @@ function messagesFromConversationEvents(events: readonly AgentEvent[]): Message[
       }
       messages.push(assistant)
       collectToolUses(assistant.message.content)
+      // Each assistant message opens a fresh answer window: only its own
+      // tool uses may still be answered, each at most once.
+      const content = assistant.message.content
+      currentTurnToolUses.clear()
+      for (const block of content) {
+        if (block.type === "tool_use") currentTurnToolUses.add(block.id)
+      }
+      answeredToolUses.clear()
       tailUserRow = null
     }
     if (event.type === "ToolResultCommitted") {
       if (assistantToolUses.has(event.payload.toolUseId)) {
-        messages.push(
-          toolResultMessage([
-            {
-              tool_use_id: event.payload.toolUseId,
-              content: event.payload.result.content,
-              is_error: event.payload.result.isError,
-            },
-          ]),
-        )
+        if (!answeredToolUses.has(event.payload.toolUseId)) {
+          const block = {
+            tool_use_id: event.payload.toolUseId,
+            content: event.payload.result.content,
+            is_error: event.payload.result.isError,
+          }
+          // Sibling results of one assistant message must share its single
+          // answering user row: Anthropic requires every tool_use to be
+          // answered by tool_result blocks in the immediately next message.
+          const tail = currentTurnToolUses.has(event.payload.toolUseId) ? tailToolResultBlocks(messages[messages.length - 1]) : null
+          if (tail !== null) {
+            messages[messages.length - 1] = toolResultMessage([...tail, block])
+          } else {
+            messages.push(toolResultMessage([block]))
+          }
+          answeredToolUses.add(event.payload.toolUseId)
+        }
       } else if (tailUserRow !== null && tailUserRow.runId === event.payload.runId && tailUserRow.index === messages.length - 1) {
         // The `!` command echo is still the tail message: fold the
         // output into it so the model sees one user row — command and
@@ -100,6 +167,23 @@ export function formatMessagesForContext(messages: readonly Message[], maxCharac
   const joined = lines.join("\n")
   if (joined.length <= maxCharacters) return lines
   return [`…\n${joined.slice(-Math.max(1, maxCharacters - 2))}`]
+}
+
+/** The tail row's tool_result blocks, or null unless the tail is a user row made solely of results. */
+function tailToolResultBlocks(message: Message | undefined): { tool_use_id: string; content: string; is_error?: boolean }[] | null {
+  if (message === undefined || message.type !== "user") return null
+  const content = message.message.content
+  if (typeof content === "string" || content.length === 0) return null
+  const blocks: { tool_use_id: string; content: string; is_error?: boolean }[] = []
+  for (const block of content) {
+    if (block.type !== "tool_result") return null
+    blocks.push(
+      block.is_error === undefined
+        ? { tool_use_id: block.tool_use_id, content: block.content }
+        : { tool_use_id: block.tool_use_id, content: block.content, is_error: block.is_error },
+    )
+  }
+  return blocks
 }
 
 function toolResultMessage(

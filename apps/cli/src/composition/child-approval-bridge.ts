@@ -12,11 +12,31 @@
  * through a card-side settle.
  */
 import type { SessionId } from "@ag2cli/core/ids.js"
-import type { ApprovalBroker, ApprovalDecision, ApprovalOutcome } from "@ag2cli/runtime/ports/approval-broker.js"
+import type { ApprovalBroker, ApprovalOutcome } from "@ag2cli/runtime/ports/approval-broker.js"
 import type { AskUserAnswer, AskUserQuestion } from "@ag2cli/runtime/ports/ask-user.js"
 import type { AskUser } from "@ag2cli/runtime/ports/tool/contract.js"
 import type { ChildAskAttribution, ChildApprovalRunnerSurface } from "../capabilities/execution/child-agent-runner.js"
-import { askCardQuestions, askSettlementAnswers } from "./ask-user-bridge.js"
+
+/** One ask-card question row as the raise surface receives it (bridged child asks carry no interaction identity). */
+export interface TuiAskQuestion {
+  readonly question: string
+  readonly header?: string
+  readonly multiSelect?: boolean
+  readonly options: readonly { readonly label: string; readonly description?: string }[]
+}
+
+/**
+ * Tab label / answer header fallback for a question without a header:
+ * twelve code units, backed off one when the cut would split a
+ * surrogate pair, so tab labels and answer headers can never disagree.
+ */
+const askTabLabel = (question: string): string => {
+  const raw = question.slice(0, 12)
+  // A dangling HIGH surrogate at the end means the cut severed a pair
+  // (the low half landed outside); back off one so the label stays valid.
+  const last = raw.length === 0 ? 0 : raw.charCodeAt(raw.length - 1)
+  return last >= 0xd800 && last <= 0xdbff ? raw.slice(0, -1) : raw
+}
 
 /** Which parent/child a bridged question belongs to (defined by the runner). */
 export type { ChildAskAttribution }
@@ -37,10 +57,52 @@ export interface ChildUserAskCard {
   readonly version: number
   readonly kind: "ask"
   readonly attribution: ChildAskAttribution
-  readonly questions: ReturnType<typeof askCardQuestions>
+  readonly questions: readonly TuiAskQuestion[]
 }
 
 export type ChildApprovalCard = ChildApprovalAskCard | ChildUserAskCard
+
+/** Map runtime questions onto the ask-card question table (pure). */
+function askCardQuestions(questions: readonly AskUserQuestion[]): readonly TuiAskQuestion[] {
+  return questions.map((question) => ({
+    question: question.question,
+    ...(question.header === undefined ? {} : { header: question.header }),
+    ...(question.multiSelect === undefined ? {} : { multiSelect: question.multiSelect }),
+    options: question.options.map((option) => ({
+      label: option.label,
+      ...(option.description === undefined ? {} : { description: option.description }),
+    })),
+  }))
+}
+
+/** Per-question cancel answers (decline and modal-sweep settlements). */
+const declineAnswers = (questions: readonly AskUserQuestion[]): AskUserAnswer[] =>
+  questions.map((question) => ({
+    header: question.header ?? askTabLabel(question.question),
+    selected: [],
+    action: "cancel" as const,
+  }))
+
+/** The chat escape: discuss-instead-of-answer maps onto per-question
+ * chat actions, which the tool turns into clarification feedback. */
+const chatAnswers = (questions: readonly AskUserQuestion[]): AskUserAnswer[] =>
+  questions.map((question) => ({
+    header: question.header ?? askTabLabel(question.question),
+    selected: [],
+    action: "chat" as const,
+  }))
+
+/** Map a card settlement onto the runtime answer table (pure). */
+function askSettlementAnswers(questions: readonly AskUserQuestion[], settlement: ChildAskSettlement): AskUserAnswer[] {
+  return settlement.outcome === "answered"
+    ? questions.map((question, index) => ({
+        header: question.header ?? askTabLabel(question.question),
+        selected: [...(settlement.selected[index] ?? [])],
+      }))
+    : settlement.outcome === "chat"
+      ? chatAnswers(questions)
+      : declineAnswers(questions)
+}
 
 /** The parent card surface the bridge raises onto (wired by the TUI host). */
 export interface ChildApprovalSurface {
@@ -85,8 +147,8 @@ interface BridgeEntry {
 export interface ChildApprovalBridge {
   parkApproval(input: ParkChildApprovalInput): Promise<ApprovalOutcome>
   parkAsk(input: ParkChildAskInput): Promise<AskUserAnswer[]>
-  /** Card-side approval settle; false for stale or unknown tokens. */
-  settleApproval(token: string, decision: ApprovalDecision): boolean
+  /** Card-side approval settle (decision, reason, terminality); false for stale or unknown tokens. */
+  settleApproval(token: string, decision: ApprovalOutcome): boolean
   /** Card-side ask settle; false for stale or unknown tokens. */
   settleAsk(token: string, settlement: ChildAskSettlement): boolean
   /** Parent policy changed: settle that parent's waiting approvals terminal
@@ -135,7 +197,7 @@ export function createChildApprovalBridge(surface: ChildApprovalSurface): ChildA
   }
 
   const declineOf = (entry: BridgeEntry): AskUserAnswer[] =>
-    askSettlementAnswers(entry.questions ?? [], { requestId: entry.token, outcome: "declined", selected: [] })
+    askSettlementAnswers(entry.questions ?? [], { outcome: "declined", selected: [] })
 
   /**
    * Splice one entry out, settle its parked promise, and advance the head.
@@ -228,7 +290,6 @@ export function createChildApprovalBridge(surface: ChildApprovalSurface): ChildA
         (e) =>
           e.resolveAsk!(
             askSettlementAnswers(e.questions ?? [], {
-              requestId: token,
               outcome: settlement.outcome,
               selected: settlement.selected,
             }),

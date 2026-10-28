@@ -24,6 +24,10 @@ export interface AskUserAnswer {
   header: string
   /** Labels of the options selected by the user; multiple for multi-select. */
   selected: string[]
+  /** Optional free-text response for this question. */
+  freeText?: string
+  /** Internal stable position used only for partial chat context rows. */
+  questionIndex?: number
   /** `chat` asks the model to continue discussing; `cancel` records no answer. */
   action?: "chat" | "cancel"
 }
@@ -55,10 +59,14 @@ export const ASK_USER_QUESTION_PROMPT = [
 
 /** Format the answer result that the next model turn receives. */
 export function formatAskUserAnswerResult(questions: readonly AskUserQuestion[], answers: readonly AskUserAnswer[]): string {
+  const byIndex = answers.some((answer) => answer.questionIndex !== undefined)
+    ? new Map(answers.filter((answer) => answer.questionIndex !== undefined).map((answer) => [answer.questionIndex!, answer]))
+    : undefined
   const values = questions
     .map((question, index) => {
-      const answer = answers[index]
-      const value = answer?.selected.join(", ") ?? ""
+      const answer = byIndex?.get(index) ?? answers[index]
+      const parts = [...(answer?.selected ?? []), ...(answer?.freeText?.trim() ? [answer.freeText] : [])]
+      const value = parts.join(", ")
       return `"${question.question}"="${value}"`
     })
     .join(", ")
@@ -67,11 +75,15 @@ export function formatAskUserAnswerResult(questions: readonly AskUserQuestion[],
 
 /** OpenClaude-compatible feedback for the Chat about this action. */
 export function formatAskUserClarificationFeedback(questions: readonly AskUserQuestion[], answers: readonly AskUserAnswer[]): string {
+  const byIndex = answers.some((answer) => answer.questionIndex !== undefined)
+    ? new Map(answers.filter((answer) => answer.questionIndex !== undefined).map((answer) => [answer.questionIndex!, answer]))
+    : undefined
   const questionsWithAnswers = questions
     .map((question, index) => {
-      const answer = answers[index]
-      if (answer && answer.selected.length > 0) {
-        return `- "${question.question}"\n  Answer: ${answer.selected.join(", ")}`
+      const answer = byIndex?.get(index) ?? answers[index]
+      if (answer && (answer.selected.length > 0 || answer.freeText?.trim())) {
+        const parts = [...answer.selected, ...(answer.freeText?.trim() ? [answer.freeText] : [])]
+        return `- "${question.question}"\n  Answer: ${parts.join(", ")}`
       }
       return `- "${question.question}"\n  (No answer provided)`
     })

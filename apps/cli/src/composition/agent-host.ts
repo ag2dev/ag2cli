@@ -1,16 +1,19 @@
-import { createHash, randomUUID } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 import { mkdtemp, rm } from "node:fs/promises"
 import { join, resolve } from "node:path"
 import { tmpdir } from "node:os"
 import { JsonRpcAppServerClient, type AppServerClientOptions } from "@ag2cli/app-server-client/client.js"
 import {
   APP_SERVER_PROTOCOL_VERSION,
+  type AppServerCapabilities,
   type AppServerDeviceRegistry,
   type AppServerDescriptor,
   type AppServerScope,
   type JsonRpcNotification,
+  type ServerInitializeResult,
 } from "@ag2cli/app-server-protocol/types.js"
-import { AppServerRpcConnection } from "../interfaces/transport/app-server-rpc.js"
+import type { PublicPermissionModeValue } from "@ag2cli/app-server-protocol/dto/snapshot.js"
+import { AppServerRpcConnection, DEFAULT_SELECTABLE_MODES } from "../interfaces/transport/app-server-rpc.js"
 import { AppServerOperationRegistry } from "../interfaces/transport/app-server-operation-registry.js"
 import { AppServerPresenceRegistry } from "../interfaces/transport/app-server-presence.js"
 import { InProcessAppServerTransport } from "../interfaces/transport/in-process-app-server.js"
@@ -19,6 +22,7 @@ import { DEFAULT_EVENT_ROOT, loadRuntimeConfig, type RuntimeConfig } from "../co
 import { acquireDurableHostLease, type DurableHostLease } from "../infrastructure/persistence/durable-host-lease.js"
 import { JsonlSessionCatalog } from "../infrastructure/persistence/jsonl-session-catalog.js"
 import { WorkspaceUnavailableError, workspaceIdForRoot } from "../capabilities/security/workspace.js"
+import { WorkspaceInspector } from "../capabilities/workspace/inspection.js"
 import type { InProcessSessionServer } from "../interfaces/transport/in-process-session-server.js"
 import type { SessionId } from "@ag2cli/core/ids.js"
 import { createAgentServerHostIdentity, type AgentServerHostIdentity } from "./host-identity.js"
@@ -38,15 +42,14 @@ import {
   type LocalStorageMode,
 } from "../infrastructure/persistence/storage-resolver.js"
 import { JsonSessionExecutionReservation } from "../infrastructure/persistence/session-execution-reservation.js"
+import { InProcessSessionExecutionReservation } from "@ag2cli/runtime/application/session/in-process-session-execution-reservation.js"
 import { JsonServeWorkspaceRegistry } from "../infrastructure/persistence/serve-workspace-registry.js"
 import { ServeSessionCatalog } from "../infrastructure/persistence/serve-session-catalog.js"
 import { ServeSessionServer } from "./serve-session-server.js"
 import { resolveWorkspaceRuntimeConfig } from "./common-runtime.js"
 import { drainChildAgents, type ChildAgentRunner } from "../capabilities/execution/child-agent-runner.js"
-import { recoverOrphanedChildTasks } from "./child-task-settle.js"
-import { BackgroundTaskRegistry } from "@ag2cli/runtime/application/task/task-registry.js"
 import type { SessionCatalog } from "@ag2cli/runtime/ports/session-catalog.js"
-import type { SessionServer } from "@ag2cli/client/session-client.js"
+import type { SessionServer } from "@ag2cli/session-client/session-client.js"
 
 /** Internal lifecycle profile; durable storage and service coordination are separate concerns. */
 export type AgentServerHostProfile = "local-durable" | "serve-durable" | "ephemeral"
@@ -59,6 +62,8 @@ export interface BuildAgentServerHostOptions extends AgentServerCompositionOptio
   readonly workspaceRoots?: readonly string[]
   /** Override the protocol descriptor in integration tests or a packaged build. */
   readonly descriptor?: AppServerDescriptor
+  /** Stable public Host identity for serve; private in-process Hosts use an ephemeral ID. */
+  readonly hostId?: string
   /** Load an existing durable Session's workspace before composing its runtime. */
   readonly sessionId?: SessionId
   /** Per-runner budget for the close-time child drain before remaining children are cancelled. */
@@ -74,6 +79,7 @@ export const HOST_OPTION_KEYS = [
   "profile",
   "workspaceRoots",
   "descriptor",
+  "hostId",
   "sessionId",
   "childDrainBudgetMs",
 ] as const satisfies readonly (keyof BuildAgentServerHostOptions)[]
@@ -126,6 +132,7 @@ export const SERVE_WITHHELD_OPTION_KEYS = [
   "workspace",
   "sessionAuthority",
   "snapshotStore",
+  "notesStore",
   "traceSink",
   "telemetrySink",
   "childEventStoreFactory",
@@ -150,6 +157,8 @@ export function serveWorkspaceServicesOptions(
     readonly workspaceId: string
     readonly workspaceRoot: string
     readonly sessionAuthority?: import("@ag2cli/runtime/application/session/session-authority.js").SessionAuthority
+    readonly executionReservation?: import("@ag2cli/runtime/ports/session-execution-reservation.js").SessionExecutionReservation
+    readonly reservationOwnerId?: string
   },
 ): AgentServerServicesOptions {
   return {
@@ -166,10 +175,12 @@ export function serveWorkspaceServicesOptions(
     traceRoot: join(inputs.eventRoot, "traces"),
     telemetryRoot: join(inputs.eventRoot, "telemetry"),
     ...(inputs.sessionAuthority === undefined ? {} : { sessionAuthority: inputs.sessionAuthority }),
-    // Serve coordination is provided by Presence/Lease and the operation
-    // registry; a workspace runtime must not also acquire local reservations.
-    executionReservation: undefined,
-    reservationOwnerId: undefined,
+    // Presence/Lease and the operation registry coordinate interactive
+    // commands; the Host's shared in-process reservation serializes writer
+    // commands across every workspace runtime. Caller-injected local
+    // reservations stay withheld (SERVE_WITHHELD_OPTION_KEYS).
+    executionReservation: inputs.executionReservation,
+    reservationOwnerId: inputs.reservationOwnerId,
   }
 }
 
@@ -177,15 +188,9 @@ export interface AgentServerHostConnectionOptions {
   readonly grantedScopes?: readonly AppServerScope[]
   /** Host-scoped device registry used by App Server administration methods. */
   readonly deviceRegistry?: AppServerDeviceRegistry
-  readonly capabilities?: readonly string[]
+  readonly capabilities?: AppServerCapabilities
   readonly connectionId?: string
   readonly deviceId?: string
-  /** Device identity already authenticated by the physical transport. */
-  readonly authenticatedDeviceId?: string
-  /** Public key registered for the authenticated device, when proof is required. */
-  readonly authenticatedDevicePublicKey?: string
-  /** Host-owned verifier for the initialize challenge proof. */
-  readonly deviceProofVerifier?: import("../interfaces/transport/app-server-device-proof.js").AppServerDeviceProofVerifier
   readonly client?: AppServerClientOptions
   /** Override the notification sink when the connection is owned by a network transport. */
   readonly onNotification?: (notification: JsonRpcNotification) => void
@@ -194,6 +199,8 @@ export interface AgentServerHostConnectionOptions {
 export interface AgentServerHostConnection {
   readonly rpc: AppServerRpcConnection
   readonly client: JsonRpcAppServerClient
+  /** Private in-process initialization for TUI/ACP adapters; never used by network clients. */
+  initializeLocal(input: Parameters<AppServerRpcConnection["initializeLocal"]>[0]): Promise<ServerInitializeResult>
   close(): void
 }
 
@@ -251,6 +258,13 @@ export async function buildAgentServerHost(options: BuildAgentServerHostOptions)
     assertStoragePolicy({ ...options, profile })
     if (profile === "serve-durable") durableLease = await acquireDurableHostLease(durableEventRoot)
     const executionReservation = profile === "local-durable" ? new JsonSessionExecutionReservation(durableEventRoot) : undefined
+    // The durable Host lease already guarantees one owning serve process, so
+    // an in-process reservation gives serve the same single-writer discipline
+    // local-durable gets from the file reservation: writer commands such as a
+    // background shell task queue behind the active run instead of colliding
+    // with the canonical one-running-loop invariant.
+    const serveExecutionReservation = profile === "serve-durable" ? new InProcessSessionExecutionReservation() : undefined
+    const serveReservationOwnerId = serveExecutionReservation === undefined ? undefined : `serve-host-${randomUUID()}`
     const workspaceRegistry = profile === "serve-durable" ? new JsonServeWorkspaceRegistry(durableEventRoot) : undefined
     const serveCatalog = workspaceRegistry === undefined ? undefined : new ServeSessionCatalog(durableEventRoot, workspaceRegistry)
     if (workspaceRegistry !== undefined) {
@@ -315,12 +329,13 @@ export async function buildAgentServerHost(options: BuildAgentServerHostOptions)
             telemetryRoot: join(temporaryStorageRoot!, "telemetry"),
           }
         : {}),
-      // Serve coordination is provided by Presence/Lease and the
-      // operation registry. Never forward a caller-injected local
-      // execution reservation into the authoritative serve runtime. The
-      // ephemeral profile keeps a caller-injected reservation as-is.
+      // Serve coordinates interactive commands through Presence/Lease and
+      // the operation registry, while the host's own in-process reservation
+      // serializes writer commands. A caller-injected local file reservation
+      // is still never forwarded. The ephemeral profile keeps a
+      // caller-injected reservation as-is.
       ...(profile === "serve-durable"
-        ? { executionReservation: undefined, reservationOwnerId: undefined }
+        ? { executionReservation: serveExecutionReservation, reservationOwnerId: serveReservationOwnerId }
         : executionReservation === undefined
           ? {}
           : { executionReservation, reservationOwnerId: `pid-${process.pid}-${randomUUID()}` }),
@@ -338,7 +353,7 @@ export async function buildAgentServerHost(options: BuildAgentServerHostOptions)
     })
     server = await createAgentServerFromServices({ ...runtimeInputs, services })
     const authoritativeServer = server
-    const descriptor = options.descriptor ?? (await defaultDescriptor())
+    const descriptor = options.descriptor ?? (await defaultDescriptor(options.hostId))
     let closed = false
     const connections = new Set<AgentServerHostConnection>()
     if (profile === "serve-durable" && workspaceRegistry !== undefined && serveCatalog !== undefined) {
@@ -360,42 +375,12 @@ export async function buildAgentServerHost(options: BuildAgentServerHostOptions)
               workspaceId,
               workspaceRoot: registeredWorkspaceRoot,
               sessionAuthority: serveCatalog.authorityForWorkspace(workspaceId),
+              executionReservation: serveExecutionReservation,
+              reservationOwnerId: serveReservationOwnerId,
             }),
           ),
         })
         return runtime
-      })
-    }
-    // D-E1-8: a durable stream may hold an agent task whose owner died with
-    // the previous process. No run can exist before this build returns —
-    // spawns only reach a runner through server command routing — so every
-    // non-terminal agent task observed now is an orphan and lands one
-    // cancelled terminal. Ephemeral storage is process-private and fresh.
-    if (profile === "local-durable") {
-      const localCatalog = authoritativeServer.catalog
-      if (localCatalog !== undefined) {
-        await recoverOrphanedChildTasks({
-          sessions: async () => (await localCatalog.list()).map((record) => record.sessionId),
-          registryFor: async () => authoritativeServer.taskRegistry,
-          serialPoint: authoritativeServer.policySerialPoint,
-        })
-      }
-    } else if (profile === "serve-durable" && serveCatalog !== undefined) {
-      await recoverOrphanedChildTasks({
-        sessions: async () => (await serveCatalog.list()).map((record) => record.sessionId),
-        // The workspace runtimes that own the "child-task" section are born
-        // lazily after this pass, so recovery rides each registry's own
-        // per-session append chain; startup here is writer-exclusive anyway.
-        registryFor: async (sessionId) => {
-          const eventStore = await serveCatalog.eventStoreForSession(sessionId)
-          const authority = await serveCatalog.authorityForSession(sessionId)
-          if (eventStore === undefined || authority === undefined) return undefined
-          return new BackgroundTaskRegistry({
-            eventStore,
-            authority,
-            identity: { nextEventId: () => randomUUID(), now: () => new Date().toISOString() },
-          })
-        },
       })
     }
     const operationRegistry = profile === "serve-durable" ? new AppServerOperationRegistry() : undefined
@@ -411,12 +396,18 @@ export async function buildAgentServerHost(options: BuildAgentServerHostOptions)
       createConnection(connectionOptions = {}): AgentServerHostConnection {
         if (closed) throw new Error("Agent Server Host is closed")
         let transport: InProcessAppServerTransport | undefined
+        // "auto" is selectable only when a Guardian policy engine is wired:
+        // without one the Host cannot honor auto decisions, so advertising
+        // the mode would be a lie the CAS write would then reject.
+        const selectableModes: readonly PublicPermissionModeValue[] =
+          runtimeInputs.guardian === undefined ? DEFAULT_SELECTABLE_MODES : [...DEFAULT_SELECTABLE_MODES, "auto"]
         const rpc = new AppServerRpcConnection({
           sessionServer: serveSessionServer ?? authoritativeServer,
           catalog: serveCatalog ?? authoritativeServer.catalog,
           descriptor,
           profile: profile === "ephemeral" ? "ephemeral" : "durable",
           workspaceIdForRoot,
+          selectableModes,
           isWorkspaceUnavailableError: (error): error is WorkspaceUnavailableError => error instanceof WorkspaceUnavailableError,
           ...(profile === "serve-durable" || serverWorkspaceRoot === undefined ? {} : { workspaceRoot: serverWorkspaceRoot }),
           configurationFingerprint: identity.configurationFingerprint,
@@ -427,16 +418,12 @@ export async function buildAgentServerHost(options: BuildAgentServerHostOptions)
           ...(connectionOptions.capabilities === undefined ? {} : { capabilities: connectionOptions.capabilities }),
           ...(connectionOptions.connectionId === undefined ? {} : { connectionId: connectionOptions.connectionId }),
           ...(connectionOptions.deviceId === undefined ? {} : { deviceId: connectionOptions.deviceId }),
-          ...(connectionOptions.authenticatedDeviceId === undefined
-            ? {}
-            : { authenticatedDeviceId: connectionOptions.authenticatedDeviceId }),
-          ...(connectionOptions.authenticatedDevicePublicKey === undefined
-            ? {}
-            : { authenticatedDevicePublicKey: connectionOptions.authenticatedDevicePublicKey }),
-          ...(connectionOptions.deviceProofVerifier === undefined ? {} : { deviceProofVerifier: connectionOptions.deviceProofVerifier }),
           ...(operationRegistry === undefined ? {} : { operationRegistry }),
           ...(presenceRegistry === undefined ? {} : { presenceRegistry }),
           ...(workspaceRegistry === undefined ? {} : { workspaceRegistry }),
+          // Structural conformance with the transport-owned
+          // WorkspaceInspectionPort is asserted here at the wiring site.
+          workspaceInspection: new WorkspaceInspector(),
           readTransient: (sessionId: SessionId) =>
             serveSessionServer?.readTransient(sessionId) ?? authoritativeServer.readTransient(sessionId),
           onNotification: connectionOptions.onNotification ?? ((notification) => transport?.emit(notification)),
@@ -446,6 +433,7 @@ export async function buildAgentServerHost(options: BuildAgentServerHostOptions)
         const connection: AgentServerHostConnection = {
           rpc,
           client,
+          initializeLocal: (input) => rpc.initializeLocal(input),
           close: () => {
             if (!connections.delete(connection)) return
             client.close()
@@ -502,15 +490,12 @@ function assertStoragePolicy(options: BuildAgentServerHostOptions & { readonly p
     throw new Error(`ephemeral Host does not accept external ${explicitStorage[0]}; its storage must be managed by the Host`)
 }
 
-async function defaultDescriptor(): Promise<AppServerDescriptor> {
+async function defaultDescriptor(hostId?: string): Promise<AppServerDescriptor> {
   const version = await readAg2cliVersion()
-  const fingerprint = createHash("sha256")
-    .update(JSON.stringify({ name: "ag2cli", version, protocolVersion: APP_SERVER_PROTOCOL_VERSION }))
-    .digest("hex")
   return {
     name: "ag2cli",
     version,
-    fingerprint,
+    hostId: hostId ?? `ag2cli-host.v1.${randomBytes(32).toString("base64url")}`,
     protocolVersion: APP_SERVER_PROTOCOL_VERSION,
   }
 }

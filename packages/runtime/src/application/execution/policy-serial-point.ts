@@ -55,6 +55,11 @@ export function isStalePolicySpawnDenial(error: unknown): boolean {
  * duplicate whose earlier namesake is still queued simply serializes.
  * Release happens when the section settles (success or failure); the
  * per-session state is dropped once nothing is queued or running.
+ *
+ * Deliberately not an OrderedLane: holder-set reentry detection, the pending
+ * counter, and the activeSessionCount observability surface are richer than
+ * run-ordering, and marking a token held inside the queued step cannot be
+ * expressed without growing the shared primitive.
  */
 export class InProcessPolicySerialPoint implements PolicySerialPoint {
   private readonly sessions = new Map<string, { queue: Promise<unknown>; held: Set<string>; pending: number }>()

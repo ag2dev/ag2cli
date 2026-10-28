@@ -3,19 +3,20 @@
 import { buildServeRuntime } from "../composition/serve-runtime.js"
 import { pickModelClient } from "../composition/model-client.js"
 import {
-  createAppServerWebSocketAuthenticator,
   createAppServerWebSocketServer,
   type AppServerWebSocketServerOptions,
 } from "../interfaces/transport/app-server-websocket-server.js"
 import { createPendingApprovalBroker } from "@ag2cli/runtime/ports/approval-broker.js"
-import { loadRuntimeConfig } from "../config/runtime.js"
+import { createPendingAskBroker } from "@ag2cli/runtime/ports/ask-broker.js"
+import { DEFAULT_EVENT_ROOT, loadRuntimeConfig } from "../config/runtime.js"
 import { validateHeadlessServerSecurity } from "../capabilities/security/headless-server.js"
 import { cleanupScratchRoots } from "../capabilities/security/scratch.js"
 import { JsonAppServerDeviceRegistry } from "../infrastructure/persistence/json-app-server-device-registry.js"
 import { InMemoryAppServerPairingRegistry } from "../interfaces/transport/in-memory-app-server-pairing-registry.js"
 import { InMemoryAppServerDeviceProofService } from "../interfaces/transport/app-server-device-proof.js"
+import { JsonAppServerHostIdentity } from "../infrastructure/persistence/app-server-host-identity.js"
 
-import { resolve } from "node:path"
+import { join, resolve } from "node:path"
 
 interface ServerArgs {
   readonly configPath?: string
@@ -62,38 +63,40 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     requireAuth: config.server.requireAuth,
     tlsConfigured: tls !== undefined,
   })
+  if (config.applicationHome === undefined) throw new Error("App Server Host identity requires AG2CLI_HOME")
+  const identityRoot = join(config.applicationHome, "app-server")
+  const deviceRegistry = new JsonAppServerDeviceRegistry(identityRoot)
+  const serveRoot = config.paths.eventRoot === DEFAULT_EVENT_ROOT ? join(config.applicationHome, "serve") : resolve(config.paths.eventRoot)
+  const hostIdentity = await JsonAppServerHostIdentity.open(identityRoot, {
+    existingStatePaths: [deviceRegistry.path, join(serveRoot, "workspaces.json")],
+  })
   const client = await pickModelClient(config)
   // Remote HTTP clients must explicitly approve non-read-only tool calls.
   const host = await buildServeRuntime({
     client,
     approval: createPendingApprovalBroker(),
+    // Remote clients answer ask_user cards through session.resolveInteraction;
+    // there is no local interactive surface to receive them.
+    ask: createPendingAskBroker(),
     // This is the initial registry entry only; Session routing uses the
     // persisted workspaceId, never this process cwd.
     ...(launchCwd === undefined ? {} : { workspaceRoot: launchCwd }),
     workspaceRoots: serverArgs.workspaceRoots,
+    hostId: hostIdentity.hostId,
     // `!` is an explicit client-originated action. Keep model Bash governed by
     // the configured permission profile, but make the user-shell path
     // available to authenticated App Server clients.
     enableInteractiveShell: true,
     runtimeConfig: config,
   })
-  const deviceRegistry = config.applicationHome === undefined ? undefined : new JsonAppServerDeviceRegistry(config.applicationHome)
-  const pairingRegistry = deviceRegistry === undefined ? undefined : new InMemoryAppServerPairingRegistry(deviceRegistry)
-  const deviceProof = new InMemoryAppServerDeviceProofService({ serverFingerprint: host.descriptor.fingerprint })
-  const hasServerToken = bearerToken !== undefined && bearerToken.length > 0
-  const authenticate = createAppServerWebSocketAuthenticator({
-    ...(bearerToken === undefined ? {} : { serverToken: bearerToken }),
-    ...(deviceRegistry === undefined ? {} : { deviceRegistry }),
-    allowAnonymous: !config.server.requireAuth && !hasServerToken,
-  })
+  const pairingRegistry = new InMemoryAppServerPairingRegistry(deviceRegistry, hostIdentity.hostId)
+  const deviceProof = new InMemoryAppServerDeviceProofService()
   const createConnection: AppServerWebSocketServerOptions["createConnection"] = (onNotification, identity) =>
     host.createConnection({
       onNotification,
-      ...(deviceRegistry === undefined ? {} : { deviceRegistry }),
-      ...(identity?.deviceId === undefined ? {} : { authenticatedDeviceId: identity.deviceId }),
-      ...(identity?.devicePublicKey === undefined ? {} : { authenticatedDevicePublicKey: identity.devicePublicKey }),
-      ...(identity?.grantedScopes === undefined ? {} : { grantedScopes: identity.grantedScopes }),
-      deviceProofVerifier: deviceProof,
+      deviceRegistry,
+      ...(identity.deviceId === undefined ? {} : { deviceId: identity.deviceId }),
+      grantedScopes: identity.grantedScopes,
     })
   let server: ReturnType<typeof createAppServerWebSocketServer> | undefined
   const transportProtocol = tls === undefined ? "ws" : "wss"
@@ -102,10 +105,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     server = createAppServerWebSocketServer({
       port: config.server.port,
       hostname: config.server.host,
-      authenticate,
-      ...(pairingRegistry === undefined
-        ? {}
-        : { pairing: { registry: pairingRegistry, deviceProof, corsOrigins: config.server.corsOrigins } }),
+      hostIdentity,
+      deviceRegistry,
+      pairingRegistry,
+      deviceProof,
+      ...(bearerToken === undefined ? {} : { operatorToken: bearerToken }),
+      corsOrigins: config.server.corsOrigins,
       ...(tls === undefined
         ? {}
         : {
@@ -118,7 +123,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       createConnection,
     })
     const port = server.port
-    if (port === undefined) throw new Error("App Server TCP listener did not return a port")
+    if (!Number.isSafeInteger(port) || port <= 0) throw new Error("App Server TCP listener did not return a port")
   } catch (error) {
     pairingRegistry?.close()
     deviceProof.close()
@@ -128,10 +133,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   const port = server.port
-  if (port === undefined) throw new Error("App Server TCP listener did not return a port")
 
   console.log(
-    `ag2cli serve listening on ${transportProtocol}://${config.server.host}:${port}/app-server (health: ${healthProtocol}://${config.server.host}:${port}/health)`,
+    `ag2cli serve listening on ${transportProtocol}://${config.server.host}:${port}/app-server (Host ID: ${hostIdentity.hostId}; health: ${healthProtocol}://${config.server.host}:${port}/health)`,
   )
 
   let shutdownPromise: Promise<void> | undefined

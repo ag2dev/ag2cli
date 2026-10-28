@@ -165,7 +165,7 @@ export class ToolRegistry {
     return visible.map((tool) => ({
       name: tool.name,
       description: tool.description,
-      input_schema: toJSONSchema(tool.inputSchema, { target: "draft-7" }) as ToolInputSchema,
+      input_schema: objectRootedSchema(tool.name, toJSONSchema(tool.inputSchema, { target: "draft-7" })),
     }))
   }
 
@@ -251,4 +251,20 @@ export class ToolRegistry {
       ...(contextOverride.execution?.askUser === undefined ? {} : { askUser: contextOverride.execution.askUser }),
     })
   }
+}
+
+/**
+ * Provider parameter schemas must be rooted at `type: "object"`; OpenAI-compatible
+ * endpoints answer a missing root type with a 400. zod exports top-level unions
+ * as a bare `anyOf`, so the object root is added explicitly — semantics are
+ * unchanged because every union branch of a tool input is itself an object
+ * schema. Any other non-object root is a tool contract violation and fails
+ * loudly instead of reaching the provider.
+ */
+function objectRootedSchema(toolName: string, schema: Record<string, unknown>): ToolInputSchema {
+  if (schema.type === "object") return schema as ToolInputSchema
+  if (schema.anyOf === undefined && schema.oneOf === undefined) {
+    throw new Error(`tool ${toolName} input schema must be object-rooted or a union of object schemas`)
+  }
+  return { ...schema, type: "object" } as ToolInputSchema
 }

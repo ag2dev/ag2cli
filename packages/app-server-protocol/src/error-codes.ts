@@ -2,15 +2,43 @@
  * Stable, machine-readable App Server error codes shared by the RPC host,
  * `@ag2cli/app-server-client` and the Web client.
  *
- * Scope: this catalog currently only covers the interaction-lease, approval
- * and command-idempotency error families touched by the App Server
- * finalization work. Other existing error kinds (e.g. `session_not_found`,
- * `scope_denied`, `method_not_found`) remain locally defined at their call
- * sites until the phase that owns them migrates them here; this file is
- * additive, not a one-shot migration of every error code in the codebase.
+ * The catalog is closed: exactly these codes exist on the v1 wire. Values
+ * such as the legacy `approval_already_resolved` (renamed to
+ * `interaction_already_resolved`) are no longer part of the catalog type;
+ * call sites that still emit or compare legacy literals migrate with their
+ * method groups. Retryability and typed details live in `dto/errors.js`.
  */
 export const APP_SERVER_ERROR_CODES = [
-  // interaction lease (Phase 1)
+  // request validation and protocol framing
+  "invalid_params",
+  "invalid_result",
+  "method_not_found",
+  "protocol_version_mismatch",
+  "invalid_intent",
+  "scope_denied",
+  // session and run state
+  "session_not_found",
+  "run_not_active",
+  // CAS, reservations and idempotency
+  "revision_conflict",
+  "revision_ahead",
+  "policy_revision_conflict",
+  "reservation_conflict",
+  "command_idempotency_conflict",
+  // interactions and approvals
+  "interaction_already_resolved",
+  "stale_approval",
+  "interaction_expired",
+  "unsupported_event",
+  // capabilities
+  "capability_unavailable",
+  "capability_denied",
+  // workspace
+  "workspace_access_denied",
+  "workspace_unavailable",
+  "workspace_path_denied",
+  "workspace_changed",
+  // interaction leases
   "interaction_lease_required",
   "interaction_lease_scope_mismatch",
   "interaction_lease_held",
@@ -18,16 +46,9 @@ export const APP_SERVER_ERROR_CODES = [
   "interaction_scope_unclassified",
   "interaction_unavailable",
   "invalid_lease_ttl",
+  // connection and host
   "connection_not_registered",
-  // approval (Phase 4A)
-  "stale_approval",
-  "approval_already_resolved",
-  // command idempotency (Phase 2)
-  "command_idempotency_conflict",
-  "reservation_conflict",
-  "workspace_access_denied",
-  "workspace_unavailable",
-  "capability_denied",
+  "invalid_host_result",
 ] as const
 
 export type AppServerErrorCode = (typeof APP_SERVER_ERROR_CODES)[number]

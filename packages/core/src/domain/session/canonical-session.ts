@@ -15,6 +15,7 @@ export interface CanonicalInputState {
   status: CanonicalInputStatus
   readonly targetRunId?: RunId
   readonly consumedAt?: HistoryCursor
+  readonly consumedByRun?: RunId
 }
 
 export interface CanonicalAttemptState {
@@ -290,6 +291,8 @@ function applyCanonicalEvent(state: CanonicalSessionState, event: AgentEvent): v
     case "ToolCallPrepared":
     case "ToolApprovalRequested":
     case "ToolApprovalResolved":
+    case "AskUserRequested":
+    case "AskUserResolved":
     case "ToolCallExecutionStarted":
     case "BackgroundTaskCreated":
     case "BackgroundTaskStarted":
@@ -431,7 +434,11 @@ function applyInputCancellation(state: CanonicalSessionState, event: Extract<Age
     return
   }
   if (input.status === "consumed") {
-    rememberReceipt(state, "cancel", payload.commandId, "already-delivered", event.eventId)
+    // A consumed input stays cancellable while the run that consumed it is
+    // still live: the cancellation is honored as that run's stop. Only a
+    // run that already ended makes the delivery immutable.
+    const run = input.consumedByRun === undefined ? undefined : state.runs.get(String(input.consumedByRun))
+    rememberReceipt(state, "cancel", payload.commandId, run?.status === "running" ? "cancelled" : "already-delivered", event.eventId)
     return
   }
   if (input.status === "cancelled") {
@@ -465,7 +472,7 @@ function applyInputConsumed(state: CanonicalSessionState, event: Extract<AgentEv
   assertKnownCursor(state, event.payload.parent)
   if (!sameHistoryCursor(state.activeHead!, event.payload.parent)) throw new Error("input parent is not the active head")
   const consumedAt = cursorFor(event, event.payload.parent.branchId, `event:${event.eventId}`)
-  state.inputs.set(input.inputId, { ...input, status: "consumed", consumedAt })
+  state.inputs.set(input.inputId, { ...input, status: "consumed", consumedAt, consumedByRun: event.payload.runId })
   rememberReceipt(state, "input", input.commandId, "consumed", event.eventId)
   advanceHistory(state, event, event.payload.parent)
 }
@@ -585,6 +592,7 @@ function applyToolResultCommitted(state: CanonicalSessionState, event: Extract<A
   if (
     attempt.toolUseId !== payload.toolUseId ||
     attempt.runId !== payload.runId ||
+    attempt.turn !== payload.turn ||
     attempt.executionGeneration !== payload.executionGeneration ||
     attempt.branchId !== payload.branchId ||
     attempt.requestFingerprint !== payload.requestFingerprint

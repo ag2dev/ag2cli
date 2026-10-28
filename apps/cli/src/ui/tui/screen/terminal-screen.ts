@@ -10,11 +10,16 @@
  *   TTY streams, a real TERM and provable alternate-screen support are
  *   all required, and without them prepare() refuses while not one byte
  *   is written and raw mode is never entered.
- * - Activation order: raw mode → input modes → alternate screen. Frames
- *   only exist on the alternate buffer; the primary screen and its
- *   scrollback stay byte-identical for the whole session. Signal
- *   handlers bind only at activation, so merely constructing or probing
- *   the screen never replaces the host's default signal behavior.
+ * - Activation order (raw, the default): raw mode → input modes →
+ *   alternate screen. Canonical activation swaps the raw-mode step for
+ *   an explicit kernel-canonical re-establishment — the line discipline
+ *   then echoes type-ahead itself while the event loop is busy — and
+ *   `engageRawInput()` completes the transition once the app owns
+ *   input. Frames only exist on the alternate buffer; the primary
+ *   screen and its scrollback stay byte-identical for the whole
+ *   session. Signal handlers bind only at activation, so merely
+ *   constructing or probing the screen never replaces the host's
+ *   default signal behavior.
  * - A signal or stdin end first fences new input and resize events, then
  *   asks the application owner to unmount Ink while the output FIFO is
  *   still usable. Physical restoration follows unmount: unlock
@@ -53,7 +58,7 @@ export interface ScreenCapabilities {
   readonly leaveAlternateScreen?: string
 }
 
-export type ScreenSignal = "SIGINT" | "SIGTERM" | "SIGHUP"
+export type ScreenSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT"
 export type ScreenTermination = ScreenSignal | "stdin-end"
 export type ScreenWriteCallback = (error?: Error | null) => void
 
@@ -63,6 +68,13 @@ export interface ScreenTerminalPort {
   flush(): Promise<void>
   onDrain(handler: () => void): () => void
   setRawMode(enabled: boolean): void
+  /**
+   * Returns the tty to the kernel's cooked line discipline with echo
+   * (the canonical activation shape); never enters raw mode. Restoring
+   * cooked flags explicitly matters because a raw-mode off switch only
+   * restores whatever snapshot the first raw transition took.
+   */
+  establishCanonicalInput(): void
   size(): TerminalSize
   onData(handler: (bytes: string) => void): () => void
   onResize(handler: (size: TerminalSize) => void): () => void
@@ -75,6 +87,17 @@ export interface ScreenTerminalPort {
 export interface TerminalScreenOptions {
   /** Enable wheel-only mouse tracking with SGR reports; no hover or drag mode. */
   readonly mouseTracking?: boolean
+}
+
+export type ScreenInputMode = "raw" | "canonical"
+
+export interface ScreenActivationOptions {
+  /**
+   * "raw" (default) enters raw mode at activation; "canonical" keeps
+   * the kernel line discipline active so it echoes type-ahead itself,
+   * deferring raw mode to engageRawInput().
+   */
+  readonly input?: ScreenInputMode
 }
 
 export type ScreenPreparation =
@@ -95,8 +118,19 @@ export interface TerminalScreen {
   /**
    * Raw mode → input modes → alternate screen. Idempotent while
    * active; throws on a torn-down screen (build a new one instead).
+   * `input: "canonical"` replaces the raw-mode step with an explicit
+   * kernel-canonical re-establishment so the line discipline echoes
+   * type-ahead; a later default activate() over that state self-heals
+   * by engaging raw input.
    */
-  activate(): void
+  activate(options?: ScreenActivationOptions): void
+  /**
+   * Late raw engagement over a canonical activation: raw mode plus the
+   * app's input modes. A silent no-op unless the screen is active and
+   * still canonical, so idle, fenced, and torn-down screens keep their
+   * state and their existing throws untouched.
+   */
+  engageRawInput(): void
   /**
    * Frame content toward the alternate buffer while active; a silent
    * no-op before activation and after teardown. `CSI 3J` is stripped
@@ -112,7 +146,8 @@ export interface TerminalScreen {
   /** Current lifecycle phase; the assembly root gates restarts on it. */
   phase(): ScreenPhase
   size(): TerminalSize
-  onInput(handler: (bytes: string) => void): void
+  /** Registered in order; the returned closure removes exactly this handler. */
+  onInput(handler: (bytes: string) => void): () => void
   onResize(handler: (size: TerminalSize) => void): void
   /**
    * Handlers run once per received signal after the shared teardown has
@@ -134,6 +169,11 @@ export interface TerminalScreen {
 
 /** Bracketed paste on and cursor hidden: the input modes this app enables. */
 const ENABLE_INPUT_MODES = "\x1b[?2004h\x1b[?25l"
+/**
+ * Cursor hide alone: canonical activation must not switch bracketed
+ * paste or mouse tracking on while the kernel still owns input echo.
+ */
+const HIDE_CURSOR = "\x1b[?25l"
 /** Wheel reports only: button presses, no hover or drag tracking. */
 const ENABLE_MOUSE_TRACKING = "\x1b[?1000h\x1b[?1006h"
 /** Paste off, cursor visible, attributes reset: restores the host state. */
@@ -151,6 +191,7 @@ const RESTORE_SYNC_OUTPUT = "\x1b[?2026l"
 const ENTER_ALTERNATE_SCREEN = "\x1b[?1049h"
 const LEAVE_ALTERNATE_SCREEN = "\x1b[?1049l"
 /** Scrollback erasure: must never reach the terminal. */
+// eslint-disable-next-line no-control-regex -- matching the sequence is how this boundary strips it
 const CLEAR_SCROLLBACK = /\x1b\[3J/g
 
 /**
@@ -200,6 +241,7 @@ export function createTerminalScreen(terminal: ScreenTerminalPort, options: Term
   let phase: ScreenPhase = "idle"
   let preparation: ScreenPreparation | undefined
   let probed: ScreenCapabilities | undefined
+  let inputMode: ScreenInputMode | undefined
   let signalsBound = false
   let shutdownFinished = false
   let backpressured = false
@@ -313,14 +355,14 @@ export function createTerminalScreen(terminal: ScreenTerminalPort, options: Term
     }
   }
 
-  const teardown = (options?: { readonly diagnostics?: string }): void => {
+  const teardown = (details?: { readonly diagnostics?: string }): void => {
     if (phase === "idle" || phase === "torn-down") {
       // The terminal was either never touched or is already restored to
       // the primary screen: a fatal diagnostic still belongs there, and
       // the write is safe precisely because this screen holds no state.
       // (A fault that already tore the screen down — a frame-write fault
       // followed by an input-pipeline fault — must not lose its message.)
-      if (options?.diagnostics !== undefined) emitDiagnostics(options.diagnostics)
+      if (details?.diagnostics !== undefined) emitDiagnostics(details.diagnostics)
       if (phase === "idle") detachTerminalListeners()
       return
     }
@@ -328,7 +370,7 @@ export function createTerminalScreen(terminal: ScreenTerminalPort, options: Term
     // only a fatal diagnostic needs to reach the primary screen.
     if (phase === "prepared") {
       phase = "torn-down"
-      if (options?.diagnostics !== undefined) emitDiagnostics(options.diagnostics)
+      if (details?.diagnostics !== undefined) emitDiagnostics(details.diagnostics)
       detachInputListeners()
       return
     }
@@ -355,7 +397,7 @@ export function createTerminalScreen(terminal: ScreenTerminalPort, options: Term
     attempt(() => write(restoreInputModes))
     attempt(() => write(probed?.leaveAlternateScreen ?? LEAVE_ALTERNATE_SCREEN))
     attempt(() => terminal.setRawMode(false))
-    const diagnostics = options?.diagnostics
+    const diagnostics = details?.diagnostics
     if (diagnostics !== undefined) attempt(() => emitDiagnostics(diagnostics))
     if (failed) throw firstFault
   }
@@ -403,7 +445,7 @@ export function createTerminalScreen(terminal: ScreenTerminalPort, options: Term
       }
       return preparation
     },
-    activate() {
+    activate(activation) {
       if (phase === "torn-down") {
         // A restart-after-teardown is a wiring bug, not a state to ride
         // out quietly: prepare() refuses the same case with a
@@ -411,16 +453,32 @@ export function createTerminalScreen(terminal: ScreenTerminalPort, options: Term
         // instead of surfacing it.
         throw new Error("this isolated screen was already torn down; build a new screen instead of activating it")
       }
-      if (phase === "active") return
+      if (phase === "active") {
+        if (inputMode === "canonical" && activation?.input !== "canonical") this.engageRawInput()
+        return
+      }
       if (phase === "shutdown-requested") throw new Error("this isolated screen is shutting down")
       if (preparation === undefined || !preparation.ok) {
         throw new Error("the isolated screen requires a successful capability probe before activation")
       }
       phase = "active"
       bindSignals()
+      if (activation?.input === "canonical") {
+        inputMode = "canonical"
+        terminal.establishCanonicalInput()
+        write(HIDE_CURSOR)
+      } else {
+        inputMode = "raw"
+        terminal.setRawMode(true)
+        write(enableInputModes)
+      }
+      write(preparation.capabilities.enterAlternateScreen ?? ENTER_ALTERNATE_SCREEN)
+    },
+    engageRawInput() {
+      if (phase !== "active" || inputMode === "raw") return
+      inputMode = "raw"
       terminal.setRawMode(true)
       write(enableInputModes)
-      write(preparation.capabilities.enterAlternateScreen ?? ENTER_ALTERNATE_SCREEN)
     },
     frame(content, callback) {
       if (phase !== "active" && phase !== "shutdown-requested") {
@@ -456,6 +514,10 @@ export function createTerminalScreen(terminal: ScreenTerminalPort, options: Term
     },
     onInput(handler) {
       inputHandlers.push(handler)
+      return () => {
+        const index = inputHandlers.indexOf(handler)
+        if (index >= 0) inputHandlers.splice(index, 1)
+      }
     },
     onResize(handler) {
       resizeHandlers.push(handler)

@@ -13,15 +13,26 @@ import { type LlmConfig, loadConfig } from "../../config/model-config.js"
 import { joinSystemPrompt } from "@ag2cli/runtime/ports/model/prompt.js"
 import { withModelRetry, withModelStreamRetry } from "./retry/controller.js"
 import { classifyModelResponse } from "./retry/failure.js"
+import { resolveModel } from "@ag2cli/model-catalog/resolve.js"
+import type { ModelOverrides } from "@ag2cli/model-catalog/types.js"
+import { resolveRequestMaxTokens } from "./request-cap.js"
+import { estimateRequestTokens } from "./compatibility/request.js"
 
 export class AnthropicModelClient implements ModelClient {
   readonly protocol = "anthropic" as const
   model: string
-  readonly contextWindow?: number
+  private readonly catalogOverrides: ModelOverrides
+  private readonly onModelMiss?: (miss: { protocol: "anthropic"; modelId: string }) => void
+  private readonly reportedMisses = new Set<string>()
   private client: Anthropic
 
-  constructor(config?: LlmConfig) {
+  constructor(config?: LlmConfig & { onModelMiss?: (miss: { protocol: "anthropic"; modelId: string }) => void }) {
     const cfg = config ?? loadConfig()
+    // Surface an unusable explicit endpoint at construction time instead of
+    // at the first request.
+    if (!URL.canParse(cfg.baseURL)) {
+      throw new Error(`Invalid Anthropic endpoint: ${cfg.baseURL}`)
+    }
     // Use only the explicit apiKey so a host auth token cannot change the authentication method.
     this.client = new Anthropic({
       baseURL: cfg.baseURL,
@@ -30,13 +41,47 @@ export class AnthropicModelClient implements ModelClient {
       maxRetries: 0,
     })
     this.model = cfg.model
-    this.contextWindow = cfg.contextWindow
+    this.onModelMiss = config?.onModelMiss
+    this.catalogOverrides = {
+      ...(cfg.contextWindow === undefined ? {} : { contextWindow: cfg.contextWindow }),
+      ...(cfg.maxTokens === undefined ? {} : { maxOutputTokens: cfg.maxTokens }),
+    }
   }
 
   setModel(model: string): void {
     const value = model.trim()
     if (!value) throw new Error("Model name must not be empty")
     this.model = value
+  }
+
+  /**
+   * The anthropic protocol normalizes every provider to the anthropic scope,
+   * so resolution needs only the model id plus constructor overrides.
+   */
+  private requestMaxTokens(input: CallModelInput): number {
+    const modelId = input.model ?? this.model
+    const resolvedFacts = resolveModel({
+      protocol: "anthropic",
+      modelId,
+      overrides: this.catalogOverrides,
+    })
+    if (!resolvedFacts.matched) this.reportModelMiss(modelId)
+    return resolveRequestMaxTokens(
+      {
+        ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens }),
+        estimatedInputTokens: estimateRequestTokens(input),
+      },
+      resolvedFacts,
+    )
+  }
+
+  /** Misses dedupe per instance on (protocol, modelId); the anthropic protocol normalizes away the provider scope. */
+  private reportModelMiss(modelId: string): void {
+    if (this.onModelMiss === undefined) return
+    const key = `anthropic:${modelId}`
+    if (this.reportedMisses.has(key)) return
+    this.reportedMisses.add(key)
+    this.onModelMiss({ protocol: "anthropic", modelId })
   }
 
   async call(input: CallModelInput): Promise<AssistantMessage> {
@@ -61,7 +106,7 @@ export class AnthropicModelClient implements ModelClient {
     const res = await this.client.messages.create(
       {
         model: input.model ?? this.model,
-        max_tokens: input.maxTokens ?? 1024,
+        max_tokens: this.requestMaxTokens(input),
         messages: apiMessages,
         // Keep tool definitions broadly typed in the protocol-independent layer and convert them to the provider shape at the SDK boundary.
         ...(input.tools && input.tools.length > 0 ? { tools: input.tools as Anthropic.Messages.ToolUnion[] } : {}),
@@ -120,7 +165,7 @@ export class AnthropicModelClient implements ModelClient {
     const stream = this.client.messages.stream(
       {
         model: input.model ?? this.model,
-        max_tokens: input.maxTokens ?? 1024,
+        max_tokens: this.requestMaxTokens(input),
         messages: apiMessages,
         ...(input.tools && input.tools.length > 0 ? { tools: input.tools as Anthropic.Messages.ToolUnion[] } : {}),
         ...(systemText ? { system: systemText } : {}),

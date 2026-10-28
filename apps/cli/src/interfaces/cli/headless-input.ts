@@ -32,7 +32,6 @@ export async function readTextStream(stream: ReadableStream<Uint8Array>, maxByte
 
 export interface HeadlessPromptInput {
   readonly goal: string
-  readonly promptFromStdin?: boolean
   readonly stdin: ReadableStream<Uint8Array>
   readonly stdinIsTTY?: boolean
   readonly signal?: AbortSignal
@@ -46,28 +45,61 @@ export interface HeadlessPrompt {
 /**
  * Resolve a one-shot prompt without coupling command parsing to stdin.
  *
- * A lone `-` means stdin is the complete prompt. When a positional goal is
- * present and stdin is piped, the goal remains the instruction and stdin is
- * attached as context. TTY stdin is never read implicitly.
+ * Piped stdin is attached as context next to the positional goal. TTY
+ * stdin is never read implicitly; the `-` streaming dispatch reads stdin
+ * line by line instead of going through here.
  */
 export async function readHeadlessPrompt(input: HeadlessPromptInput, maxBytes: number): Promise<HeadlessPrompt> {
-  const shouldReadStdin = input.promptFromStdin === true || input.stdinIsTTY === false
-  if (!shouldReadStdin) {
+  if (input.stdinIsTTY !== false) {
     const goal = input.goal.trim()
     if (!goal) throw new Error("A non-empty prompt is required")
     return { goal }
   }
 
   const stdin = await readTextStream(input.stdin, maxBytes, input.signal)
-  const trimmed = stdin.trim()
-  if (input.promptFromStdin === true) {
-    if (!trimmed) throw new Error("stdin did not contain a non-empty prompt")
-    return { goal: trimmed }
-  }
-
   const goal = input.goal.trim()
   if (!goal) throw new Error("A non-empty prompt is required")
+  const trimmed = stdin.trim()
   return trimmed.length > 0 ? { goal, context: [stdin] } : { goal }
+}
+
+/**
+ * Stream stdin as discrete input lines for `-` dispatch: each non-empty
+ * line is one mailbox input. The trailing chunk without a newline is still
+ * a line.
+ */
+export async function* readStdinLines(stream: ReadableStream<Uint8Array>, maxBytes: number, signal?: AbortSignal): AsyncGenerator<string> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let totalBytes = 0
+  let buffer = ""
+  const onAbort = (): void => {
+    void reader.cancel(signal?.reason).catch(() => {})
+  }
+  signal?.addEventListener("abort", onAbort, { once: true })
+  try {
+    while (true) {
+      throwIfAborted(signal)
+      const { done, value } = await reader.read()
+      if (done) break
+      totalBytes += value.byteLength
+      if (totalBytes > maxBytes) {
+        throw new Error(`stdin input exceeds the ${maxBytes}-byte limit`)
+      }
+      buffer += decoder.decode(value, { stream: true })
+      for (let newline = buffer.indexOf("\n"); newline >= 0; newline = buffer.indexOf("\n")) {
+        const line = buffer.slice(0, newline)
+        buffer = buffer.slice(newline + 1)
+        if (line.trim() !== "") yield line
+      }
+    }
+    throwIfAborted(signal)
+    buffer += decoder.decode()
+    if (buffer.trim() !== "") yield buffer
+  } finally {
+    signal?.removeEventListener("abort", onAbort)
+    reader.releaseLock()
+  }
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

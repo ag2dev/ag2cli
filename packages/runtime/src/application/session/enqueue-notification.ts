@@ -1,6 +1,7 @@
 import type { AgentEvent } from "@ag2cli/core/events/event.js"
 import type { SessionId } from "@ag2cli/core/ids.js"
 import type { EventStore } from "../../ports/event-store.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { appendSessionEventsIfRevision, SessionRevisionConflictError } from "./revision-conflict.js"
 import type { SessionAuthority } from "./session-authority.js"
 
@@ -21,7 +22,7 @@ export interface EnqueueSessionNotificationDependencies {
     nextEventId(): string
     now(): string
   }
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 const CAS_ATTEMPTS = 3
@@ -38,25 +39,13 @@ const CAS_ATTEMPTS = 3
  * state.
  */
 export class EnqueueSessionNotificationUseCase {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
 
   constructor(private readonly deps: EnqueueSessionNotificationDependencies) {}
 
   async execute(input: EnqueueSessionNotificationInput): Promise<EnqueueSessionNotificationResult> {
     if (input.text.trim().length === 0) throw new Error("notification text must not be empty")
-    const key = input.sessionId.toString()
-    const previous = this.pending.get(key)
-    const operation = (previous ?? Promise.resolve()).then(() => this.executeNow(input))
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(key, tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(key) === tracked) this.pending.delete(key)
-    }
+    return this.lane.run(input.sessionId.toString(), () => this.executeNow(input))
   }
 
   private async executeNow(input: EnqueueSessionNotificationInput): Promise<EnqueueSessionNotificationResult> {

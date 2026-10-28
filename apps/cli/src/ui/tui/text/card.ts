@@ -6,8 +6,8 @@
  *
  * Row-budget contract: when the granted rows cannot hold the full card
  * the renderer degrades along a fixed ladder — hints, breadcrumb, item
- * descriptions, body tail, tab row, items after the focused one, body,
- * every item but the focused one — and never truncates through the
+ * descriptions, body tail, items after the focused one, body, every
+ * item but the focused one — and never truncates through the
  * frame (an open-bottomed card is a bug). The focused survivor keeps
  * its true digit, and when items were dropped a muted "…N more" row
  * rides the tail whenever one row of budget remains. Below four
@@ -17,7 +17,7 @@
  */
 import type { TextRun } from "./theme.js"
 import { FRAME_FLOOR_COLUMNS, breadcrumbRow, frameBox, frameInnerWidth, hintRow, tabRow } from "./chrome.js"
-import { clipText, textWidth } from "./measure.js"
+import { clipText, textWidth, wrapVerbatim } from "./measure.js"
 import { sanitizeText } from "./sanitize.js"
 
 type RunLine = readonly TextRun[]
@@ -43,6 +43,7 @@ export interface CardView {
   /** Two or more labels render the tab row; a lone tab stays implicit. */
   readonly tabLabels?: readonly string[]
   readonly activeTabIndex?: number
+  readonly tabFocused?: boolean
   readonly body?: readonly RunLine[]
   readonly items?: readonly CardItemView[]
   /**
@@ -65,6 +66,89 @@ export interface RenderCardOptions {
 
 /** Full height a card may take: frame + body + one item window + hint. */
 export const CARD_ROW_CAP = 12
+
+/**
+ * The composed task frame as the card shell reads it: structural, so
+ * the text layer maps any frame that carries these fields without
+ * importing the kernel's types.
+ */
+export interface TaskCardSource {
+  readonly title: string
+  /** The engine's own steps; the card renders them as the breadcrumb. */
+  readonly steps: readonly string[]
+  /** The task-owned horizontal header, including its focus state. */
+  readonly tabs?: {
+    readonly labels: readonly string[]
+    readonly activeIndex: number
+    readonly focused: boolean
+  }
+  /** The current step's choosable rows; each row is one physical line. */
+  readonly rows: readonly { readonly label: string; readonly description?: string; readonly focused: boolean }[]
+  /** The current step's body lines (paged documents, tab annotations). */
+  readonly body: readonly string[]
+  readonly hints: readonly string[]
+  readonly dirty: boolean
+}
+
+/**
+ * Map one task frame onto the declarative card. Each row keeps one
+ * physical line — its annotation folds into the label run, so the
+ * renderer's description rung stays unfed and a full row window cannot
+ * double the card's height. The escape affordance leads the hint row:
+ * the joined hint line clips from the right at narrow widths, so esc
+ * must ride first to survive. A dirty frame confesses as a warning
+ * tail on the body.
+ */
+export function taskCardView(source: TaskCardSource, width: number): CardView {
+  const body: RunLine[] = source.body.flatMap((line): RunLine[] =>
+    wrapVerbatim(line, Math.max(1, frameInnerWidth(width))).map((part) => [{ text: part, token: "text" }]),
+  )
+  if (source.dirty) body.push([{ text: "unsaved changes", token: "warning" }])
+  const esc = source.hints.filter((hint) => hint.startsWith("esc"))
+  const hints = esc.length === 0 ? source.hints : [...esc, ...source.hints.filter((hint) => !hint.startsWith("esc"))]
+  const focusIndex = source.rows.findIndex((row) => row.focused)
+  return {
+    width,
+    title: source.title,
+    breadcrumb: source.steps,
+    ...(source.tabs === undefined ? {} : { tabLabels: source.tabs.labels }),
+    ...(source.tabs === undefined ? {} : { activeTabIndex: source.tabs.activeIndex }),
+    ...(source.tabs === undefined ? {} : { tabFocused: source.tabs.focused }),
+    markers: "none",
+    body,
+    items: source.rows.map((row) => ({
+      label: row.description === undefined ? row.label : `${row.label} — ${row.description}`,
+    })),
+    focusedIndex: focusIndex < 0 ? null : focusIndex,
+    hints,
+  }
+}
+
+/** The card's own row count under a granted budget — the one height derivation every consumer shares. */
+export function cardRowHeight(view: CardView, maxRows?: number): number {
+  return renderCardLines(view, maxRows === undefined ? {} : { maxRows }).length
+}
+
+/**
+ * The task surface's row count, shared by the coordinator's transcript
+ * viewport and the view's renderer. Side previews use the list pane's
+ * width and keep their sample outside the card body.
+ */
+export function taskSurfaceRowHeight(source: TaskCardSource, width: number, maxRows = CARD_ROW_CAP): number {
+  const split = source.title === "Theme" ? width >= 80 : source.title === "Prompt history" && width >= 100
+  const leftWidth = split ? Math.floor((width - 3) * 0.48) : width
+  const cardWidth = leftWidth
+  const cardSource = split ? { ...source, body: [] } : source
+  const cardRows = cardRowHeight(taskCardView(cardSource, cardWidth), maxRows)
+  if (!split) return cardRows
+
+  const rightWidth = width - leftWidth - 3
+  const previewRows =
+    source.title === "Theme"
+      ? 4 + source.body.length
+      : 2 + source.body.flatMap((line) => wrapVerbatim(line, Math.max(1, rightWidth))).length
+  return Math.min(Math.max(0, maxRows), Math.max(cardRows, previewRows))
+}
 
 const ITEM_FOCUS = "❯ "
 const ITEM_PAD = "  "
@@ -95,10 +179,10 @@ function itemLine(item: CardItemView, index: number, view: CardView): RunLine {
   const focused = view.focusedIndex === index
   const chosen = item.chosen === true
   const marker = markerSpec(view)
-  const runs: TextRun[] = [{ text: focused ? ITEM_FOCUS : ITEM_PAD, token: focused ? "accent" : "text" }]
+  const runs: TextRun[] = [{ text: focused ? ITEM_FOCUS : ITEM_PAD, token: focused ? "suggestion" : "text" }]
   if (typeof item.digit === "number") runs.push({ text: `${item.digit}. `, token: "muted" })
   if (marker !== null) {
-    runs.push({ text: chosen ? marker.on : marker.off, token: chosen ? "accent" : "muted" })
+    runs.push({ text: chosen ? marker.on : marker.off, token: chosen ? "suggestion" : "muted" })
   }
   const overlays = [...(focused ? (["focus"] as const) : []), ...(chosen ? (["selected"] as const) : [])]
   runs.push({
@@ -188,7 +272,7 @@ export function renderCardLines(view: CardView, options: RenderCardOptions = {})
   const interactive = normItems.length > 0
   let tab: RunLine | null =
     interactive && norm.tabLabels !== undefined && norm.tabLabels.length > 1
-      ? tabRow({ tabs: norm.tabLabels, activeIndex: norm.activeTabIndex ?? 0, width: inner })
+      ? tabRow({ tabs: norm.tabLabels, activeIndex: norm.activeTabIndex ?? 0, width: inner, focused: norm.tabFocused })
       : null
   let body: readonly RunLine[] = norm.body ?? []
   let items: readonly CardItemView[] = normItems
@@ -215,14 +299,19 @@ export function renderCardLines(view: CardView, options: RenderCardOptions = {})
   }
 
   const budget = Math.floor(maxRows) - 2
-  // Degradation ladder: each step drops the next-cheapest section until
-  // the content fits; the focused item is the last thing standing.
+  // The task-owned tab header stays visible while secondary content yields.
   const steps: readonly (() => boolean)[] = [
-    () => (hint !== null ? ((hint = null), true) : false),
-    () => (crumb !== null ? ((crumb = null), true) : false),
     () => (descriptions ? ((descriptions = false), true) : false),
-    () => (body.length > 1 ? ((body = body.slice(0, 1)), true) : false),
-    () => (tab !== null ? ((tab = null), true) : false),
+    () => (crumb !== null ? ((crumb = null), true) : false),
+    () => {
+      const overflow = rows.length - budget
+      if (overflow <= 0 || body.length <= 1) return false
+      const keep = Math.max(1, body.length - overflow)
+      if (keep === body.length) return false
+      body = body.slice(0, keep)
+      return true
+    },
+    () => (hint !== null ? ((hint = null), true) : false),
     () => {
       const keep = focusOrdinal + 1
       return items.length > keep ? ((items = items.slice(0, keep)), true) : false

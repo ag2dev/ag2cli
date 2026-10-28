@@ -24,6 +24,6 @@ export interface RunResult {
   readonly turns: number
   readonly finalText?: string
   readonly error?: string
-  /** Stable classification of the failure; set when the cause is a permission terminal. */
-  readonly failureCode?: "approval_required"
+  /** Stable classification of the failure; set when the cause is a terminal interaction outcome. */
+  readonly failureCode?: "approval_required" | "interaction_expired"
 }

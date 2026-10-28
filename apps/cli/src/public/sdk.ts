@@ -9,8 +9,8 @@ import type {
   CancelTaskCommandInput,
   ResolveApprovalCommandInput,
   SessionCommandResult,
-} from "@ag2cli/protocol/session-command.js"
-import type { SessionClient, SessionExecuteOptions, SessionTransport } from "@ag2cli/client/session-client.js"
+} from "@ag2cli/session-protocol/session-command.js"
+import type { SessionClient, SessionExecuteOptions, SessionTransport } from "@ag2cli/session-client/session-client.js"
 import {
   createPlanCommand,
   executeShellCommand,
@@ -27,8 +27,8 @@ import {
   getSnapshotCommand,
   readTraceCommand,
   readModelCallsCommand,
-} from "@ag2cli/protocol/session-command.js"
-import { createSessionClient } from "@ag2cli/client/session-client.js"
+} from "@ag2cli/session-protocol/session-command.js"
+import { createSessionClient } from "@ag2cli/session-client/session-client.js"
 import type { Plan } from "@ag2cli/core/plan/plan.js"
 import type { SessionSnapshot } from "@ag2cli/core/session/session-snapshot.js"
 import type { TraceRecord } from "@ag2cli/runtime/ports/trace-sink.js"
@@ -61,7 +61,7 @@ export type {
   ResolveApprovalCommandInput,
   SessionCommand,
   SessionCommandResult,
-} from "@ag2cli/protocol/session-command.js"
+} from "@ag2cli/session-protocol/session-command.js"
 export type {
   SessionClient,
   SessionEventListener,
@@ -69,7 +69,7 @@ export type {
   SessionExecuteOptions,
   SessionServer,
   SessionTransport,
-} from "@ag2cli/client/session-client.js"
+} from "@ag2cli/session-client/session-client.js"
 export type { SessionCatalog, SessionCatalogOptions, SessionRecord } from "@ag2cli/runtime/ports/session-catalog.js"
 export type { AgentProfile, AgentProfileResolver } from "@ag2cli/runtime/ports/agent-profile.js"
 export {
@@ -88,8 +88,8 @@ export {
   readEventsCommand,
   readTraceCommand,
   SESSION_PROTOCOL_VERSION,
-} from "@ag2cli/protocol/session-command.js"
-export type { SessionProtocolVersion } from "@ag2cli/protocol/session-command.js"
+} from "@ag2cli/session-protocol/session-command.js"
+export type { SessionProtocolVersion } from "@ag2cli/session-protocol/session-command.js"
 export type { AgentEvent, AgentEventType } from "@ag2cli/core/events/event.js"
 export type { EventTrace } from "@ag2cli/core/events/event.js"
 export type { TransientStreamEvent, TransientStreamEventType } from "@ag2cli/core/events/transient.js"
@@ -98,10 +98,10 @@ export type { SessionSnapshot, SessionStatus } from "@ag2cli/core/session/sessio
 export type { SessionGoal, SessionGoalStatus, SessionGoalUpdate } from "@ag2cli/core/session/session-goal.js"
 export type { RunResult, RunSnapshot, RunStatus } from "@ag2cli/core/execution/run.js"
 export type { BackgroundTaskType, BackgroundTaskStatus, TaskSnapshot } from "@ag2cli/core/task/task.js"
-export { SessionReplica } from "@ag2cli/client/session-replica.js"
-export type { SessionReplicaOptions } from "@ag2cli/client/session-replica.js"
-export { SharedSessionController } from "@ag2cli/client/shared-session.js"
-export type { SharedSessionControllerOptions } from "@ag2cli/client/shared-session.js"
+export { SessionReplica } from "@ag2cli/session-client/session-replica.js"
+export type { SessionReplicaOptions } from "@ag2cli/session-client/session-replica.js"
+export { SharedSessionController } from "@ag2cli/session-client/shared-session.js"
+export type { SharedSessionControllerOptions } from "@ag2cli/session-client/shared-session.js"
 export { connectElectronSession, connectMobileSession } from "../ui/platform/index.js"
 export type { TraceName, TracePhase, TraceRecord, TraceSink, TraceStore } from "@ag2cli/runtime/ports/trace-sink.js"
 export type {

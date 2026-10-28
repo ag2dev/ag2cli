@@ -1,6 +1,5 @@
 /** LLM connection settings (model, key, and protocol dialect). */
 
-import type { OpenAICompatibilityName, OpenAIReasoningEffort, OpenAIThinkingMode } from "@ag2cli/runtime/ports/model/compatibility.js"
 import { loadRuntimeConfig } from "./runtime.js"
 
 /** LLM connection settings. */
@@ -9,9 +8,6 @@ export interface LlmConfig {
   apiKey: string
   model: string
   contextWindow?: number
-  compatibility?: OpenAICompatibilityName
-  thinking?: OpenAIThinkingMode
-  reasoningEffort?: OpenAIReasoningEffort
   maxTokens?: number
 }
 
@@ -31,5 +27,11 @@ export function loadConfig(env: Readonly<Record<string, string | undefined>> = p
   // The SDK appends /v1/messages to baseURL, so baseURL must not include /v1.
   // Accept the raw URL from a curl example (.../v1) too by stripping a trailing /v1 automatically.
   const normalizedBaseURL = baseURL.replace(/\/v1\/?$/, "")
-  return { baseURL: normalizedBaseURL, apiKey, model, ...(provider.contextWindow ? { contextWindow: provider.contextWindow } : {}) }
+  return {
+    baseURL: normalizedBaseURL,
+    apiKey,
+    model,
+    ...(provider.contextWindow ? { contextWindow: provider.contextWindow } : {}),
+    ...(provider.maxTokens === undefined ? {} : { maxTokens: provider.maxTokens }),
+  }
 }

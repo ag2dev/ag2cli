@@ -70,13 +70,18 @@ ag2cli
 
 默认启动 TUI，也可以显式运行 `ag2cli tui`。
 
-```text
-workspace: /path/to/your/repository
-model: deepseek-flash
-type a message, @ to mention, / for commands
+首屏会同时绘制工作区标识、输入行与底部状态栏（示意，有节选）：
 
-❯ 概括这个仓库的用途和主要入口。
+```text
+  >_ AG2CLI
+     /path/to/your/repository
+
+› █
+
+deepseek-flash · ⏸ manual · idle
 ```
+
+在 `›` 输入行直接输入消息；`@` 提及与 `/` 命令在输入时补全。
 
 ## Headless 单次运行
 

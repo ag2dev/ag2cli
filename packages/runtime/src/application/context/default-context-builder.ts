@@ -4,7 +4,6 @@ import type { ApiToolDefinition } from "@ag2cli/core/tool-facts.js"
 import { selectMemories, type MemorySelector } from "../memory/retrieve.js"
 import type { Skill } from "../skills/types.js"
 import { skillCatalogSection } from "../skills/types.js"
-import type { SystemPrompt } from "@ag2cli/core/model/prompt.js"
 import { buildSystemPrompt } from "../prompt/system-prompt.js"
 import { assemblePrompt, escapePromptAttribute, type PromptContextFragment, type PromptSection } from "../prompt/assembly.js"
 
@@ -16,11 +15,12 @@ export interface RuntimeContextEnvironment {
 }
 
 export interface DefaultContextBuilderOptions {
-  readonly basePrompt?: SystemPrompt
+  /** Stable, semantically named system sections. */
+  readonly systemSections?: readonly PromptSection[]
   /** Explicit response language policy; absent means follow the user's language. */
   readonly responseLanguage?: string
-  /** Build model-facing prompt sections from the tools visible in this turn. */
-  readonly dynamicPrompt?: (tools: readonly ApiToolDefinition[]) => readonly string[]
+  /** Build turn-specific prompt sections from the tools visible in this turn. */
+  readonly dynamicPrompt?: (tools: readonly ApiToolDefinition[]) => readonly PromptSection[]
   /** Build a fresh runtime snapshot for every model turn from that turn's session facts. */
   readonly runtimeContextSource?: (environment: RuntimeContextEnvironment) => string | undefined
   readonly memories?: readonly Memory[]
@@ -36,13 +36,13 @@ export interface DefaultContextBuilderOptions {
 }
 
 /**
- * Small composition adapter for stable prompt assembly.
+ * Per-request adapter for system prompt and transient context assembly.
  *
  * It deliberately does not mutate messages. Compact is a separate concern and
  * can later replace the message list through the same ContextBuilder port.
  */
 export function defaultContextBuilder(options: DefaultContextBuilderOptions = {}): ContextBuilder {
-  const basePrompt = [...(options.basePrompt ?? [])]
+  const systemSections = [...(options.systemSections ?? [])]
   const memories = [...(options.memories ?? [])]
   const staticSkills = [...(options.skills ?? [])]
   const staticInstructions = [...(options.instructions ?? [])]
@@ -50,16 +50,15 @@ export function defaultContextBuilder(options: DefaultContextBuilderOptions = {}
   return {
     async build(input) {
       const skills = options.skillSource?.() ?? staticSkills
-      const systemSections: PromptSection[] = [
-        ...basePrompt.map((text, index) => ({ id: `base.${index}`, text })),
-        ...(options.dynamicPrompt?.(input.tools) ?? []).map((text, index) => ({ id: `dynamic.${index}`, text })),
-        ...buildSystemPrompt({ tools: input.tools }).map((text, index) => ({ id: `capabilities.tools.${index}`, text })),
-        ...(skills.length > 0 ? [{ id: "capabilities.skills", text: skillCatalogSection(skills) }] : []),
-        ...(input.agent?.instructions.trim() ? [{ id: "agent.profile", text: input.agent.instructions }] : []),
-        ...buildSystemPrompt({ responseLanguage: options.responseLanguage }).map((text, index) => ({
-          id: `policy.response-language.${index}`,
+      const promptSections: PromptSection[] = [
+        ...systemSections,
+        ...buildSystemPrompt({ responseLanguage: options.responseLanguage }).map((text) => ({
+          id: "policy.response-language",
           text,
         })),
+        ...(options.dynamicPrompt?.(input.tools) ?? []),
+        ...(skills.length > 0 ? [{ id: "capabilities.skills", text: skillCatalogSection(skills) }] : []),
+        ...(input.agent?.instructions.trim() ? [{ id: "agent.profile", text: input.agent.instructions }] : []),
       ]
       const instructions = options.instructionSource?.() ?? staticInstructions
       const contextFragments: PromptContextFragment[] = []
@@ -146,7 +145,7 @@ export function defaultContextBuilder(options: DefaultContextBuilderOptions = {}
           })
         }
       }
-      const assembly = assemblePrompt({ systemSections, contextFragments })
+      const assembly = assemblePrompt({ systemSections: promptSections, contextFragments })
       return {
         messages: [...input.messages],
         ...(assembly.contextMessages.length > 0 ? { contextMessages: assembly.contextMessages } : {}),

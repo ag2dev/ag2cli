@@ -1,5 +1,12 @@
 import type { JsonRpcNotification, JsonValue, ServerInitializeResult } from "@ag2cli/app-server-protocol/types.js"
 import { AppServerClientError, type AppServerCloseListener, type AppServerNotificationListener, type AppServerRpcClient } from "./client.js"
+import {
+  callProtocol,
+  type ProtocolCallOptions,
+  type ProtocolMethod,
+  type ProtocolMethodParams,
+  type ProtocolMethodResults,
+} from "./protocol-methods.js"
 
 export interface ConnectedAppServerClient {
   readonly client: AppServerRpcClient
@@ -82,6 +89,15 @@ export class ReconnectingAppServerClient implements AppServerRpcClient {
       return Promise.reject(new AppServerClientError("not_connected", "App Server is not connected"))
     }
     return active.client.request(method, params, options)
+  }
+
+  /** Typed, registry-validated call surface for every non-interaction protocol method. */
+  callProtocol<M extends ProtocolMethod>(
+    method: M,
+    params: ProtocolMethodParams[M],
+    options?: ProtocolCallOptions,
+  ): Promise<ProtocolMethodResults[M]> {
+    return callProtocol(this, method, params, options)
   }
 
   notify(method: string, params?: JsonValue): void {

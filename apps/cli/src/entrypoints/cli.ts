@@ -9,6 +9,7 @@
 import { AG2CLI_INVOCATION, routeUnifiedCliArgs, UNIFIED_CLI_HELP } from "../interfaces/cli/unified-cli.js"
 import { parseTuiProcessArgs, TUI_PROCESS_HELP } from "../interfaces/cli/tui-process-args.js"
 import { readAg2cliVersion } from "../public/version.js"
+import { startTuiStartupScreen } from "../composition/tui-startup-screen.js"
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const route = routeUnifiedCliArgs(argv)
@@ -31,8 +32,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         process.exitCode = 1
         return
       }
-      const { main: tuiMain } = await import("./tui.js")
-      await tuiMain(route.args)
+      const startupScreen = await startTuiStartupScreen({ mouseTracking: parsed.noMouse !== true })
+      try {
+        const { main: tuiMain } = await import("./tui.js")
+        await tuiMain(route.args, startupScreen)
+      } catch (error) {
+        await startupScreen?.restore()
+        throw error
+      }
       return
     }
     case "run":

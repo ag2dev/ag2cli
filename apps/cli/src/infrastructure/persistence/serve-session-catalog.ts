@@ -10,8 +10,10 @@ import {
 } from "@ag2cli/runtime/ports/session-catalog.js"
 import type { EventStore } from "@ag2cli/runtime/ports/event-store.js"
 import { SessionAuthority } from "@ag2cli/runtime/application/session/session-authority.js"
+import { OrderedLane } from "@ag2cli/runtime/concurrency/ordered-lane.js"
 import { JsonlSessionCatalog } from "./jsonl-session-catalog.js"
 import { JsonlEventStore } from "./jsonl-event-store.js"
+import { FileSessionNotesStore } from "./file-session-notes-store.js"
 import { emptySessionSnapshot, replaySession } from "@ag2cli/core/session/session-snapshot.js"
 import type { AgentEvent } from "@ag2cli/core/events/event.js"
 import { resolveServeStorage } from "./storage-resolver.js"
@@ -27,7 +29,7 @@ export class ServeSessionCatalog implements SessionCatalog {
   private readonly catalogs = new Map<string, JsonlSessionCatalog>()
   private readonly eventStores = new Map<string, JsonlEventStore>()
   private readonly authorities = new Map<string, SessionAuthority>()
-  private mutationChain: Promise<void> = Promise.resolve()
+  private readonly mutationLane = new OrderedLane<string>()
 
   constructor(
     private readonly serverRoot: string,
@@ -72,12 +74,20 @@ export class ServeSessionCatalog implements SessionCatalog {
     })
   }
 
+  async setTitleIfAbsent(id: SessionId, title: string, options?: SessionCatalogOptions): Promise<SessionRecord> {
+    return this.mutate(async () => {
+      const located = await this.locate(id, options)
+      if (located === undefined) throw new Error(`Session does not exist: ${id}`)
+      const record = await this.catalogFor(located.workspace).setTitleIfAbsent(id, title, { ...options, workspaceRoot: undefined })
+      return { ...record, workspaceId: located.workspace.workspaceId }
+    })
+  }
+
   async fork(source: SessionId, target: SessionId, title?: string, options?: SessionCatalogOptions): Promise<SessionRecord> {
     return this.mutate(async () => {
       const located = await this.locate(source, options)
       if (located === undefined) throw new Error(`Session does not exist: ${source}`)
-      if (await this.get(target)) throw new SessionIdConflictError(target)
-      const record = await this.catalogFor(located.workspace).fork(source, target, title, options)
+      const record = await this.forkInWorkspace(located, (catalog) => catalog.fork(source, target, title, options), target, options)
       return { ...record, workspaceId: located.workspace.workspaceId }
     })
   }
@@ -92,10 +102,35 @@ export class ServeSessionCatalog implements SessionCatalog {
     return this.mutate(async () => {
       const located = await this.locate(source, options)
       if (located === undefined) throw new Error(`Session does not exist: ${source}`)
-      if (await this.get(target)) throw new SessionIdConflictError(target)
-      const record = await this.catalogFor(located.workspace).forkAtCursor(source, target, cursor, title, options)
+      const record = await this.forkInWorkspace(
+        located,
+        (catalog) => catalog.forkAtCursor(source, target, cursor, title, options),
+        target,
+        options,
+      )
       return { ...record, workspaceId: located.workspace.workspaceId }
     })
+  }
+
+  /** Fork retries stay idempotent per (source, cursor, payload): a target
+   * occupied inside the source's workspace replays through the workspace
+   * catalog when the payload matches and is a conflict otherwise. A target
+   * occupied in another workspace can never be this fork's replay. */
+  private async forkInWorkspace(
+    located: { workspace: ServeWorkspaceRegistration; record: SessionRecord },
+    fork: (catalog: JsonlSessionCatalog) => Promise<SessionRecord>,
+    target: SessionId,
+    options?: SessionCatalogOptions,
+  ): Promise<SessionRecord> {
+    const occupied = await this.get(target, options)
+    if (occupied !== undefined && occupied.workspaceId !== located.workspace.workspaceId) throw new SessionIdConflictError(target)
+    if (occupied === undefined) return fork(this.catalogFor(located.workspace))
+    try {
+      return await fork(this.catalogFor(located.workspace))
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("already exists")) throw new SessionIdConflictError(target)
+      throw error
+    }
   }
 
   async archive(id: SessionId, options?: SessionCatalogOptions): Promise<SessionRecord> {
@@ -136,13 +171,8 @@ export class ServeSessionCatalog implements SessionCatalog {
     return events.length === 0 ? emptySessionSnapshot(id) : replaySession(events)
   }
 
-  private async mutate<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.mutationChain.then(operation)
-    this.mutationChain = run.then(
-      () => undefined,
-      () => undefined,
-    )
-    return run
+  private mutate<T>(operation: () => Promise<T>): Promise<T> {
+    return this.mutationLane.run("mutations", operation)
   }
 
   private async locate(
@@ -159,7 +189,13 @@ export class ServeSessionCatalog implements SessionCatalog {
   private catalogFor(workspace: ServeWorkspaceRegistration): JsonlSessionCatalog {
     const existing = this.catalogs.get(workspace.workspaceId)
     if (existing !== undefined) return existing
-    const catalog = new JsonlSessionCatalog(this.eventStoreFor(workspace), this.authorityForWorkspaceRegistration(workspace))
+    const root = resolveServeStorage({ serverRoot: this.serverRoot, workspaceId: workspace.workspaceId }).root
+    const catalog = new JsonlSessionCatalog(
+      this.eventStoreFor(workspace),
+      this.authorityForWorkspaceRegistration(workspace),
+      undefined,
+      new FileSessionNotesStore(root),
+    )
     this.catalogs.set(workspace.workspaceId, catalog)
     return catalog
   }

@@ -22,7 +22,7 @@ const MAX_TIMEOUT_MS = MAX_MODEL_BASH_TIMEOUT_MS
 const MAX_OUTPUT_BYTES = 20_000
 
 const inputSchema = z.strictObject({
-  command: z.string().min(1).describe("Bash command to execute; commands with side effects require approval."),
+  command: z.string().min(1).describe("Bash command to execute; authorization follows the Session permission policy."),
   timeout: z
     .number()
     .int()
@@ -61,7 +61,7 @@ function terminateProcessGroup(proc: Bun.Subprocess, signal: "SIGTERM" | "SIGKIL
 export class BashTool implements Tool<typeof inputSchema> {
   readonly name = "bash"
   readonly description =
-    "Runs a Bash command with the host user's permissions. Authorization comes from the session permission mode (full-access allows, every other mode asks the user); commands are not confined by any local security layer. Output is bounded and execution has a timeout cap. Prefer dedicated tools for file work: read_file over cat/head/tail, glob over find/ls, grep over grep/rg, file_edit over sed/awk, and write_file over heredoc or echo redirection."
+    "Run a Bash command with the host user's permissions, without a sandbox. The runtime checks the working directory and authorizes execution using the Session permission mode, explicit rules, and prepared command facts; a command may be allowed, require approval, or be denied. Output is bounded and execution has a timeout cap."
   readonly inputSchema = inputSchema
 
   constructor(private readonly options: { mode?: "agent" | "interactive" } = {}) {}

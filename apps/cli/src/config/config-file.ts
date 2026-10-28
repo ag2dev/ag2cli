@@ -20,9 +20,12 @@ export type ThemeCommitResult =
   | { readonly kind: "confirmed" }
   | { readonly kind: "failed-before-replace"; readonly error: unknown }
   | { readonly kind: "uncertain-after-replace"; readonly error: unknown }
+export interface TuiPreferenceStore {
+  commit(path: string, edits: TuiPreferenceEdits): Promise<ThemeCommitResult>
+}
 
-export interface TuiThemePreferenceStore {
-  commit(path: string, themeId: string): Promise<ThemeCommitResult>
+export interface TuiPreferenceEdits {
+  readonly theme?: string
 }
 
 export class RuntimeConfigFileError extends Error {
@@ -160,18 +163,20 @@ export function parseConfigFileText(text: string, path = "<memory>"): ConfigFile
 }
 
 /**
- * Apply the smallest JSONC edit that persists the TUI-local theme. The input
- * is validated before editing so callers can guarantee that a rejected write
- * leaves the original bytes untouched.
+ * Apply the smallest JSONC edit that persists one TUI-local preference. The
+ * value is validated before editing so callers can guarantee that a rejected
+ * write leaves the original bytes untouched.
  */
-export function updateTuiThemeConfigText(text: string, themeId: string, path = "<memory>"): string {
-  if (!(SUPPORTED_THEMES as readonly string[]).includes(themeId)) {
-    throw new Error(`Unsupported TUI theme: ${themeId}`)
+export function updateTuiPreferenceConfigText(text: string, key: TuiPreferenceKey, value: string, path = "<memory>"): string {
+  if (key === "theme" && !(SUPPORTED_THEMES as readonly string[]).includes(value)) {
+    throw new Error(`Unsupported TUI theme: ${value}`)
   }
   parseConfigFileText(text, path)
   const formattingOptions: FormattingOptions = { insertSpaces: true, tabSize: 2, eol: "\n" }
-  return applyEdits(text, modify(text, ["tui", "theme"], themeId as Theme, { formattingOptions }))
+  return applyEdits(text, modify(text, ["tui", key], value, { formattingOptions }))
 }
+
+export type TuiPreferenceKey = "theme"
 
 function isMissingFile(error: unknown): boolean {
   return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT")

@@ -2,52 +2,49 @@
 
 import { randomUUID } from "node:crypto"
 import { resolve } from "node:path"
-import { buildAgentRunRuntime } from "../composition/agent-run-runtime.js"
-import { guardianReviewDeadlineMs, pickGuardian, pickModelClient } from "../composition/model-client.js"
-import { ModelPlanProvider } from "../infrastructure/model/model-plan-provider.js"
-import type { PlanProvider } from "@ag2cli/runtime/ports/model-provider.js"
-import { connectSession, createPlan, getSessionSnapshot, readSessionModelCalls, readSessionTrace, runAgent } from "../public/sdk.js"
-import type { SessionClient } from "@ag2cli/client/session-client.js"
-import {
-  listCheckpointsCommand,
-  previewRewindCommand,
-  readEventsCommand,
-  rewindCommand,
-  setPermissionModeCommand,
-} from "@ag2cli/protocol/session-command.js"
-import { isSessionPermissionMode, type SessionPermissionMode } from "@ag2cli/core/session/session-security.js"
+import type { PublicPendingInteraction } from "@ag2cli/app-server-protocol/dto/interactions.js"
+import type { PublicSessionEvent } from "@ag2cli/app-server-protocol/dto/events.js"
+import type { PublicSessionSnapshot } from "@ag2cli/app-server-protocol/dto/snapshot.js"
+import { buildPublicHeadlessSession, type PublicHeadlessSession } from "../composition/headless-public-session.js"
+import { ModelConfigurationError } from "../composition/model-client.js"
+import { RpcApplicationError } from "../interfaces/transport/public-session-command-mapping.js"
 import { agentHelp, parseAgentArgs, publicCommandHelp, type AgentCliCommand } from "../interfaces/cli/agent-cli.js"
 import type { InvocationName } from "../interfaces/cli/unified-cli.js"
 import { isGuardianConfigured, loadRuntimeConfig, type RuntimeConfig } from "../config/runtime.js"
-import { type HeadlessOutputFormat } from "../config/output-format.js"
+import type { HeadlessOutputFormat } from "../config/output-format.js"
 import {
   errorEnvelope,
   exitCodeForError,
   HEADLESS_CAPABILITIES,
   successEnvelope,
+  type HeadlessCommand,
   type HeadlessErrorCode,
   type HeadlessMeta,
 } from "../interfaces/cli/headless-contract.js"
-import { createHeadlessJsonlEventWriter, serializeHeadless, serializeHeadlessEvent } from "../interfaces/cli/headless-output.js"
-import { planText, runText } from "../interfaces/cli/headless-output.js"
-import { sessionId as parseSessionId } from "@ag2cli/core/ids.js"
-import { findResumableRun } from "@ag2cli/runtime/application/session/resumable-run.js"
-import { readHeadlessPrompt } from "../interfaces/cli/headless-input.js"
+import {
+  createHeadlessJsonlEventWriter,
+  createHeadlessRunTracker,
+  runText,
+  serializeHeadless,
+  serializeHeadlessEvent,
+  type HeadlessJsonlEventWriter,
+  type HeadlessRunOutcome,
+  type HeadlessRunTracker,
+} from "../interfaces/cli/headless-output.js"
+import { readHeadlessPrompt, readStdinLines } from "../interfaces/cli/headless-input.js"
+import {
+  createHeadlessOperation,
+  createTtyInteractionSurface,
+  createTtyLineReader,
+  type HeadlessAbortKind,
+  type HeadlessLineReader,
+} from "../interfaces/cli/headless-operation.js"
 import { MAX_STDIN_BYTES } from "../capabilities/security/resource-limits.js"
 import { readAg2cliVersion } from "../public/version.js"
-import { createHeadlessOperation } from "../interfaces/cli/headless-operation.js"
-import { createAppServerConnectionLinkForEndpoint } from "../interfaces/cli/app-server-pairing.js"
-import type { RunResult } from "@ag2cli/core/execution/run.js"
+import { createAppServerConnectionLinkForEndpoint, PairAuthenticationError } from "../interfaces/cli/app-server-pairing.js"
 import type { ChildAgentRunner } from "../capabilities/execution/child-agent-runner.js"
 import { canonicalizeExistingDirectory } from "../capabilities/security/workspace.js"
 import { cleanupScratchRoots } from "../capabilities/security/scratch.js"
-
-/** Read-only commands inject this provider: reaching plan generation there is a programming error. */
-const readOnlyPlanProvider: PlanProvider = {
-  async generatePlan() {
-    throw new Error("This read-only command must not call PlanProvider")
-  },
-}
 
 /** Whole-process budget for async children to settle after the main run before cancels. */
 export const HEADLESS_ASYNC_DRAIN_TIMEOUT_MS = 300_000
@@ -56,7 +53,7 @@ export const HEADLESS_ASYNC_DRAIN_TIMEOUT_MS = 300_000
 export const HEADLESS_CHILD_CANCEL_GRACE_MS = 1_000
 
 /** A continuation's non-completed terminal surfaces as a throw so the existing error classification maps it. */
-function settleContinuation(result: RunResult): void {
+function settleContinuation(result: HeadlessRunOutcome): void {
   if (result.status === "failed") throw new Error(result.error ?? "continuation run failed")
   if (result.status === "cancelled") throw new DOMException("continuation run cancelled", "AbortError")
 }
@@ -67,7 +64,7 @@ export interface AsyncChildrenOrchestration {
   /** True while an unconsumed task notification is pending on the session. */
   readonly pendingNotifications: () => Promise<boolean>
   /** Starts one continuation run that consumes the pending notifications. */
-  readonly continueRun: () => Promise<RunResult>
+  readonly continueRun: () => Promise<HeadlessRunOutcome>
   readonly budgetMs?: number
   readonly cancelGraceMs?: number
   readonly signal?: AbortSignal
@@ -105,9 +102,137 @@ export async function orchestrateAsyncChildren(options: AsyncChildrenOrchestrati
     settleContinuation(await options.continueRun())
   }
 }
-import { SessionExecutionReservationConflictError } from "@ag2cli/runtime/ports/session-execution-reservation.js"
-import { SessionPolicyRevisionConflictError } from "@ag2cli/runtime/application/session/permission-state.js"
-import { ApprovalRequiredError } from "@ag2cli/runtime/application/execution/approval-required-error.js"
+
+export interface HeadlessAttachment {
+  readonly tracker: HeadlessRunTracker
+  readonly writer: HeadlessJsonlEventWriter | undefined
+  currentSnapshot(): Promise<PublicSessionSnapshot>
+  /** Re-reads the live snapshot into the tracker; catches replayed or already-terminal runs. */
+  refresh(): Promise<PublicSessionSnapshot>
+  awaitOutcome(commandId: string, signal?: AbortSignal): Promise<HeadlessRunOutcome>
+  /** Resolves once no run is active and no input is queued. */
+  awaitIdle(signal?: AbortSignal): Promise<void>
+  /** Waits for the next event batch (or the given signal). */
+  waitOnce(signal?: AbortSignal): Promise<void>
+  stop(): void
+}
+
+/**
+ * Live attachment over the public projection: durable events fan out to the
+ * run tracker, the JSONL writer and the interaction surface. Resyncs
+ * rebuild the attachment from canonical history instead of guessing.
+ */
+async function attachPublicSession(
+  session: PublicHeadlessSession,
+  options: {
+    readonly requestId: string
+    readonly jsonlCommand?: HeadlessCommand
+    readonly onInteraction?: (interaction: PublicPendingInteraction) => Promise<void>
+  },
+): Promise<{ readonly snapshot: PublicSessionSnapshot; readonly barrierRevision: number; readonly attachment: HeadlessAttachment }> {
+  const tracker = createHeadlessRunTracker()
+  const waiters: (() => void)[] = []
+  const wake = (): void => {
+    const pending = waiters.splice(0, waiters.length)
+    for (const waiter of pending) waiter()
+  }
+  let writer: HeadlessJsonlEventWriter | undefined
+  let pending: PublicSessionEvent[] = []
+  let collectPending = options.jsonlCommand !== undefined
+  // Deliberately hand-rolled: the chain keeps no drained tail, so a failed
+  // rebuild poisons every later rebuild and its rejection is never consumed.
+  // A per-key lane isolates failures instead; adopting it would silently
+  // change what a dead attachment does after its first resync failure.
+  let rebuildChain: Promise<void> = Promise.resolve()
+
+  function onEvent(events: readonly PublicSessionEvent[]): void {
+    tracker.apply(events)
+    if (writer !== undefined) writer.apply(events)
+    else if (collectPending) pending.push(...events)
+    if (options.onInteraction !== undefined) {
+      for (const event of events) {
+        if (event.type === "interaction.requested") void options.onInteraction(event.interaction).catch(() => {})
+      }
+    }
+    wake()
+  }
+
+  function onResyncRequired(): void {
+    rebuildChain = rebuildChain.then(async () => {
+      const previous = adapter
+      adapter = session.attach({ onEvent, onResyncRequired })
+      await previous.stop()
+      const started = await adapter.start()
+      tracker.refresh(started.snapshot)
+      writer?.apply(await session.readPublicEvents())
+      wake()
+    })
+  }
+
+  const callbacks = { onEvent, onResyncRequired }
+  let adapter = session.attach(callbacks)
+  const started = await adapter.start()
+  tracker.refresh(started.snapshot)
+  if (options.jsonlCommand !== undefined) {
+    writer = createHeadlessJsonlEventWriter(options.jsonlCommand, options.requestId, started.barrierRevision)
+    if (pending.length > 0) writer.apply(pending)
+  }
+  collectPending = false
+  pending = []
+
+  const waitOnce = (signal?: AbortSignal): Promise<void> =>
+    new Promise<void>((resolveWait, reject) => {
+      const waiter = (): void => {
+        cleanup()
+        resolveWait()
+      }
+      const onAbort = (): void => {
+        cleanup()
+        const reason = signal?.reason
+        reject(reason instanceof Error ? reason : new DOMException("headless operation cancelled", "AbortError"))
+      }
+      const cleanup = (): void => {
+        const index = waiters.indexOf(waiter)
+        if (index >= 0) waiters.splice(index, 1)
+        signal?.removeEventListener("abort", onAbort)
+      }
+      signal?.addEventListener("abort", onAbort, { once: true })
+      if (signal?.aborted) {
+        onAbort()
+        return
+      }
+      waiters.push(waiter)
+    })
+
+  return {
+    snapshot: started.snapshot,
+    barrierRevision: started.barrierRevision,
+    attachment: {
+      tracker,
+      writer,
+      currentSnapshot: () => adapter.currentSnapshot(),
+      refresh: async () => {
+        const snapshot = await adapter.currentSnapshot()
+        tracker.refresh(snapshot)
+        return snapshot
+      },
+      async awaitOutcome(commandId, signal) {
+        for (;;) {
+          const outcome = tracker.outcomeFor(commandId)
+          if (outcome !== undefined) return outcome
+          await waitOnce(signal)
+        }
+      },
+      async awaitIdle(signal) {
+        while (tracker.activeRunId() !== undefined || tracker.queuedInputCount() > 0) await waitOnce(signal)
+      },
+      waitOnce,
+      stop() {
+        adapter.stop()
+      },
+    },
+  }
+}
 
 async function main(argv: readonly string[] = process.argv.slice(2), options?: { invocationName?: InvocationName }): Promise<void> {
   const invocationName = options?.invocationName ?? "agent"
@@ -178,10 +303,11 @@ async function main(argv: readonly string[] = process.argv.slice(2), options?: {
 
   try {
     if (command.type === "pair") {
-      const operation = createHeadlessOperation(command.timeoutMs)
+      const operation = createHeadlessOperation({ timeoutMs: command.timeoutMs })
       try {
         const result = await createAppServerConnectionLinkForEndpoint({
           endpoint: command.endpoint,
+          expectedHostId: command.hostId,
           bearerToken: config.server.token,
           ...(command.clientKind === undefined ? {} : { clientKind: command.clientKind }),
           ...(command.ttlMs === undefined ? {} : { ttlMs: command.ttlMs }),
@@ -193,10 +319,171 @@ async function main(argv: readonly string[] = process.argv.slice(2), options?: {
         operation.close()
       }
     }
-    if (command.type === "plan" || command.type === "run") {
-      const operation = createHeadlessOperation(command.timeoutMs)
-      let connection: Awaited<ReturnType<typeof connectClient>> | undefined
-      let eventWriter: ReturnType<typeof createHeadlessJsonlEventWriter> | undefined
+
+    if (command.type === "session" && command.action !== "events" && command.action !== "resume") {
+      const operation = createHeadlessOperation({ timeoutMs: command.timeoutMs })
+      let catalogSession: PublicHeadlessSession | undefined
+      try {
+        const catalogWorkspaceRoot = "cwd" in command && command.cwd !== undefined ? command.cwd : process.cwd()
+        const targetSessionId = command.sessionId ?? randomUUID()
+        // The catalog and event root must follow --cwd for session create/
+        // resume; otherwise a target workspace would write into the caller's
+        // project and disappear from that workspace's /resume list.
+        catalogSession = await buildPublicHeadlessSession({
+          runtimeConfig: config,
+          sessionId: targetSessionId,
+          mode: "read",
+          workspaceRoot: catalogWorkspaceRoot,
+          signal: operation.signal,
+        })
+        const records = catalogSession.records
+        const outputFormat = command.format ?? config.outputFormat
+        if (command.action === "list") {
+          const listed = await records.list()
+          writeSuccess("session", requestId, listed, outputFormat, JSON.stringify(listed))
+          return
+        }
+        if (command.action === "create") {
+          await records.create(targetSessionId, await canonicalizeExistingDirectory(command.cwd ?? process.cwd()))
+          const record = await records.get()
+          if (record === undefined) throw new Error(`Session is unreadable after creation: ${targetSessionId}`)
+          writeSuccess("session", requestId, record, outputFormat, JSON.stringify(record), targetSessionId)
+          return
+        }
+        if (!command.sessionId) throw new Error(`session ${command.action} requires session-id`)
+        if (command.action === "get") {
+          const record = await records.get()
+          if (record === undefined) throw new Error(`Session does not exist: ${command.sessionId}`)
+          writeSuccess("session", requestId, record, outputFormat, JSON.stringify(record), command.sessionId)
+          return
+        }
+        if (command.action === "fork") {
+          const target = command.targetSessionId ?? randomUUID()
+          const record = await records.fork(target)
+          writeSuccess("session", requestId, record, outputFormat, JSON.stringify(record), target)
+          return
+        }
+        if (command.action === "archive") {
+          const record = await records.archive()
+          writeSuccess("session", requestId, record, outputFormat, JSON.stringify(record), command.sessionId)
+          return
+        }
+        if (command.action === "delete") {
+          await records.delete()
+          writeSuccess(
+            "session",
+            requestId,
+            { sessionId: command.sessionId, deleted: true },
+            outputFormat,
+            JSON.stringify({ sessionId: command.sessionId, deleted: true }),
+            command.sessionId,
+          )
+          return
+        }
+      } finally {
+        operation.close()
+        await catalogSession?.close().catch(() => {})
+      }
+    }
+
+    if (command.type === "session" && command.action === "resume") {
+      if (!command.sessionId) throw new Error("session resume requires session-id")
+      let graceful: ((kind: HeadlessAbortKind, hardAbort: () => void) => Promise<void>) | undefined
+      const operation = createHeadlessOperation({
+        timeoutMs: command.timeoutMs,
+        onGracefulCancel: (kind, hardAbort) => {
+          if (graceful === undefined) {
+            hardAbort()
+            return Promise.resolve()
+          }
+          return graceful(kind, hardAbort)
+        },
+      })
+      let resumedSession: PublicHeadlessSession | undefined
+      let attachment: HeadlessAttachment | undefined
+      try {
+        resumedSession = await buildPublicHeadlessSession({
+          runtimeConfig: config,
+          sessionId: command.sessionId,
+          mode: "resume",
+          ...(command.cwd === undefined ? {} : { workspaceRoot: command.cwd }),
+          ...(command.skillDir === undefined ? {} : { skillDir: command.skillDir }),
+          signal: operation.signal,
+        })
+        const facade = resumedSession.facade
+        const recordedRoot = await resumedSession.recordWorkspaceRoot()
+        if (recordedRoot !== undefined && command.cwd !== undefined && resolve(command.cwd) !== resolve(recordedRoot)) {
+          throw new Error("Session workspaceRoot does not match --cwd; the workspace cannot be changed during a run")
+        }
+        const outputFormat = command.format ?? config.outputFormat
+        const attached = await attachPublicSession(resumedSession, {
+          requestId,
+          ...(outputFormat === "jsonl" ? { jsonlCommand: "session" } : {}),
+        })
+        attachment = attached.attachment
+        const { tracker, writer } = attached.attachment
+        graceful = async (_kind, hardAbort) => {
+          const runId = tracker.activeRunId()
+          if (runId === undefined) {
+            hardAbort()
+            return
+          }
+          await facade.cancelRun({ sessionId: command.sessionId!, runId }).catch(() => undefined)
+          while (tracker.activeRunId() !== undefined) await attached.attachment.waitOnce(operation.signal)
+        }
+        const seed = await facade.resumableSubmit(resumedSession.sessionId)
+        await facade.submit(
+          {
+            sessionId: command.sessionId,
+            commandId: seed.commandId,
+            text: seed.goal,
+            ...(seed.context === undefined ? {} : { context: [...seed.context] }),
+            ...(seed.fileReferences === undefined
+              ? {}
+              : { fileReferences: seed.fileReferences.map((path) => ({ workspaceId: attached.snapshot.workspace.workspaceId, path })) }),
+            ...(seed.maxTurns === undefined ? {} : { maxTurns: seed.maxTurns }),
+          },
+          {
+            ...(seed.permissionMode === undefined ? {} : { permissionMode: seed.permissionMode }),
+            ...(seed.permissionRules === undefined ? {} : { permissionRules: seed.permissionRules }),
+          },
+        )
+        await attachment.refresh()
+        const outcome = await attachment.awaitOutcome(seed.commandId, operation.signal)
+        writeRunOutcome(
+          requestId,
+          outcome,
+          outputFormat,
+          command.sessionId,
+          operation.abortKind,
+          writer ? { revision: writer.revision, terminal: true } : undefined,
+          "session",
+        )
+        return
+      } finally {
+        attachment?.stop()
+        operation.close()
+        await resumedSession?.close().catch(() => {})
+      }
+    }
+
+    if (command.type === "run") {
+      const streaming = command.promptFromStdin === true
+      const interactive = !streaming && process.stdin.isTTY === true
+      let graceful: ((kind: HeadlessAbortKind, hardAbort: () => void) => Promise<void>) | undefined
+      const operation = createHeadlessOperation({
+        timeoutMs: command.timeoutMs,
+        onGracefulCancel: (kind, hardAbort) => {
+          if (graceful === undefined) {
+            hardAbort()
+            return Promise.resolve()
+          }
+          return graceful(kind, hardAbort)
+        },
+      })
+      let runSession: PublicHeadlessSession | undefined
+      let attachment: HeadlessAttachment | undefined
+      let lineReader: HeadlessLineReader | undefined
       try {
         // Auto mode routes every side-effect ask to the guardian reviewer;
         // without a resolved reviewer there is no answerer at all, so the
@@ -216,110 +503,200 @@ async function main(argv: readonly string[] = process.argv.slice(2), options?: {
           process.exitCode = exitCodeForError("USAGE_ERROR")
           return
         }
-        const prompt = await readHeadlessPrompt(
-          {
-            goal: command.goal,
-            ...(command.promptFromStdin ? { promptFromStdin: true } : {}),
-            stdin: Bun.stdin.stream(),
-            stdinIsTTY: process.stdin.isTTY,
-            signal: operation.signal,
-          },
-          MAX_STDIN_BYTES,
-        )
+        const stdinStream = (): ReadableStream<Uint8Array> => Bun.stdin.stream()
+        let prompt: Awaited<ReturnType<typeof readHeadlessPrompt>> | undefined
+        if (!streaming) {
+          prompt = await readHeadlessPrompt(
+            {
+              goal: command.goal,
+              stdin: stdinStream(),
+              stdinIsTTY: process.stdin.isTTY,
+              signal: operation.signal,
+            },
+            MAX_STDIN_BYTES,
+          )
+        }
         const workspaceRoot = await canonicalizeExistingDirectory(command.cwd ?? process.cwd())
-        const sessionId = command.sessionId ?? config.sessionId ?? randomUUID()
-        const correlationTrace =
-          config.correlation.traceId && config.correlation.operationId
-            ? { traceId: config.correlation.traceId, operationId: config.correlation.operationId, causationId: requestId }
-            : undefined
+        const sessionIdValue = command.sessionId ?? config.sessionId ?? randomUUID()
         // Async children are process-local: the orchestration loop below
         // needs the runner handle the composition assembles for `run`.
         let childRunner: ChildAgentRunner | null = null
-        connection = await connectClient(command, sessionId, config, operation.signal, {
+        runSession = await buildPublicHeadlessSession({
+          runtimeConfig: config,
+          sessionId: sessionIdValue,
+          mode: "run",
+          workspaceRoot,
+          ...(command.skillDir === undefined ? {} : { skillDir: command.skillDir }),
+          ...(interactive ? { interactive: true } : {}),
+          signal: operation.signal,
           onChildRunner: (runner) => {
             childRunner = runner
           },
         })
-        const client = connection.client
+        const facade = runSession.facade
         const outputFormat = command.format ?? config.outputFormat
-        const snapshot = await getSessionSnapshot(client, { signal: operation.signal })
+        const onInteraction = interactive
+          ? (interaction: PublicPendingInteraction): Promise<void> => {
+              lineReader ??= createTtyLineReader()
+              const surface = createTtyInteractionSurface(lineReader)
+              if (interaction.kind === "tool_approval") {
+                return surface
+                  .resolveToolApproval(interaction)
+                  .then((optionId) =>
+                    facade.resolveInteraction({
+                      kind: "tool_approval",
+                      sessionId: sessionIdValue,
+                      resolutionId: randomUUID(),
+                      interactionId: interaction.interactionId,
+                      optionId,
+                      expectedPolicyRevision: interaction.policyRevision,
+                      expectedScopeRevision: interaction.scopeRevision,
+                    }),
+                  )
+                  .then(() => undefined)
+              }
+              return surface
+                .answerAskUser(interaction)
+                .then((answer) =>
+                  facade.resolveInteraction({
+                    kind: "ask_user",
+                    sessionId: sessionIdValue,
+                    resolutionId: randomUUID(),
+                    interactionId: interaction.interactionId,
+                    answer,
+                  }),
+                )
+                .then(() => undefined)
+            }
+          : undefined
+        const attached = await attachPublicSession(runSession, {
+          requestId,
+          ...(outputFormat === "jsonl" ? { jsonlCommand: "run" } : {}),
+          ...(onInteraction === undefined ? {} : { onInteraction }),
+        })
+        attachment = attached.attachment
+        const { tracker, writer } = attached.attachment
+        const snapshot = attached.snapshot
         // An existing full-access session refuses an unflagged resume: the
         // confirmation semantics have no interactive approver here, so the
-        // explicit mode must ride every command (plan cannot carry the
-        // flag, and the TUI cannot see local-run history).
-        if (snapshot.lastRevision > 0 && snapshot.permissionMode === "full-access" && command.permissionMode === undefined) {
+        // explicit mode must ride every command (and the TUI cannot see
+        // local-run history).
+        if (snapshot.asOfRevision > 0 && snapshot.security.permissionMode === "full-access" && command.permissionMode === undefined) {
           writeError(
             command.type,
             requestId,
             new Error(
-              `session ${sessionId} is in full-access mode; resume it with an explicit mode (${invocationName} run --permission-mode <mode>)`,
+              `session ${sessionIdValue} is in full-access mode; resume it with an explicit mode (${invocationName} run --permission-mode <mode>)`,
             ),
             "USAGE_ERROR",
             outputFormat,
-            { sessionId, details: { permissionMode: "full-access" } },
+            { sessionId: sessionIdValue, details: { permissionMode: "full-access" } },
           )
           process.exitCode = exitCodeForError("USAGE_ERROR")
           return
         }
-        // --permission-mode only applies when explicitly provided. New sessions
-        // store it in the start_run seed; existing sessions record it through
-        // set_permission_mode before the run. Omission leaves canonical state unchanged.
-        let freshPermissionMode: SessionPermissionMode | undefined
+        // A session the catalog has never seen must exist before submit can
+        // admit any input; create is idempotent per (sessionId, payload).
+        if (snapshot.asOfRevision === 0) {
+          await facade.createSession({ sessionId: sessionIdValue, workspaceId: snapshot.workspace.workspaceId })
+        }
+        // --permission-mode only applies when explicitly provided; the CAS
+        // revision comes from the attachment's barrier snapshot. Omission
+        // leaves canonical state unchanged.
         if (command.permissionMode !== undefined) {
-          if (snapshot.lastRevision > 0) {
-            const result = await client.execute(
-              setPermissionModeCommand({
-                commandId: randomUUID(),
-                mode: command.permissionMode,
-                expectedPolicyRevision: snapshot.policyRevision,
-              }),
-              { signal: operation.signal },
-            )
-            if (result.type !== "permission_updated") throw new Error("Session did not return permission_updated")
-          } else {
-            freshPermissionMode = command.permissionMode
+          await facade.setPermissionMode({
+            sessionId: sessionIdValue,
+            mode: command.permissionMode,
+            expectedPolicyRevision: snapshot.security.policyRevision,
+          })
+        }
+        graceful = async (_kind, hardAbort) => {
+          const runId = tracker.activeRunId()
+          if (runId === undefined) {
+            hardAbort()
+            return
           }
+          await facade.cancelRun({ sessionId: sessionIdValue, runId }).catch(() => undefined)
+          while (tracker.activeRunId() !== undefined) await attached.attachment.waitOnce(operation.signal)
         }
-        eventWriter = outputFormat === "jsonl" ? createHeadlessJsonlEventWriter(client, command.type, requestId) : undefined
-        if (eventWriter) await eventWriter.start(operation.signal)
-        if (command.type === "plan") {
-          const plan = await createPlan(
-            client,
-            {
-              commandId: requestId,
-              goal: prompt.goal,
-              ...(prompt.context ? { context: prompt.context } : {}),
-              workspace: workspaceRoot,
-              ...(correlationTrace ? { trace: correlationTrace } : {}),
-            },
-            { signal: operation.signal },
-          )
-          await eventWriter?.flush(operation.signal)
-          writeSuccess(
-            "plan",
-            requestId,
-            plan,
-            outputFormat,
-            planText(plan),
-            sessionId,
-            undefined,
-            eventWriter ? { revision: eventWriter.revision, terminal: true } : undefined,
-          )
-          return
+
+        const submit = async (commandId: string, text: string, extensions?: { readonly maxTurns?: number }): Promise<void> => {
+          await facade.submit({
+            sessionId: sessionIdValue,
+            commandId,
+            text,
+            ...(extensions?.maxTurns === undefined ? {} : { maxTurns: extensions.maxTurns }),
+          })
+          await attached.attachment.refresh()
         }
-        const result = await runAgent(
-          client,
-          {
-            commandId: requestId,
-            goal: prompt.goal,
-            ...(prompt.context ? { context: prompt.context } : {}),
-            workspace: workspaceRoot,
-            ...(command.maxTurns ? { maxTurns: command.maxTurns } : {}),
-            ...(freshPermissionMode ? { permissionMode: freshPermissionMode } : {}),
-            ...(correlationTrace ? { trace: correlationTrace } : {}),
-          },
-          { signal: operation.signal },
-        )
+
+        let outcome: HeadlessRunOutcome
+        if (streaming) {
+          // `-` streams stdin line by line: the first line is the goal,
+          // later lines steer the active run or start a new one when idle.
+          let stopRequested = false
+          let stopWaiter: (() => void) | undefined
+          const stopReader = (): void => {
+            stopRequested = true
+            stopWaiter?.()
+          }
+          const previousGraceful = graceful
+          graceful = async (kind, hardAbort) => {
+            stopReader()
+            await previousGraceful?.(kind, hardAbort)
+          }
+          const stopped = new Promise<void>((resolveStop) => {
+            stopWaiter = resolveStop
+          })
+          const iterator = readStdinLines(stdinStream(), MAX_STDIN_BYTES, operation.signal)[Symbol.asyncIterator]()
+          let lastCommandId: string | undefined
+          let goalSubmitted = false
+          try {
+            for (;;) {
+              const next = await Promise.race([
+                iterator.next(),
+                stopped.then((): IteratorResult<string> => ({ done: true, value: undefined })),
+              ])
+              if (stopRequested || next.done) break
+              const text = next.value.trim()
+              if (text === "") continue
+              if (!goalSubmitted) {
+                goalSubmitted = true
+                lastCommandId = requestId
+                await submit(lastCommandId, text, command.maxTurns === undefined ? undefined : { maxTurns: command.maxTurns })
+                continue
+              }
+              const runId = tracker.activeRunId()
+              if (runId === undefined) {
+                const commandId = randomUUID()
+                lastCommandId = commandId
+                await submit(commandId, text)
+                continue
+              }
+              try {
+                await facade.steer({ sessionId: sessionIdValue, runId, commandId: randomUUID(), text })
+              } catch (error) {
+                if (!(error instanceof RpcApplicationError) || error.kind !== "run_not_active") throw error
+                const commandId = randomUUID()
+                lastCommandId = commandId
+                await submit(commandId, text)
+              }
+            }
+          } finally {
+            await iterator.return?.(undefined).catch(() => undefined)
+          }
+          if (!goalSubmitted) throw new Error("stdin did not contain a non-empty prompt")
+          // Exit only when stdin is exhausted, no run is active and no
+          // input is waiting in the mailbox.
+          await attached.attachment.awaitIdle(operation.signal)
+          const streamed = tracker.outcomeFor(lastCommandId!)
+          if (streamed === undefined) throw new Error("streaming dispatch produced no run outcome")
+          outcome = streamed
+        } else {
+          if (prompt === undefined) throw new Error("run requires a goal")
+          await submit(requestId, prompt.goal, command.maxTurns === undefined ? undefined : { maxTurns: command.maxTurns })
+          outcome = await attached.attachment.awaitOutcome(requestId, operation.signal)
+        }
         if (childRunner !== null) {
           // Hold-back before the final round: the process stays while
           // async children run, consuming their notifications through
@@ -330,251 +707,125 @@ async function main(argv: readonly string[] = process.argv.slice(2), options?: {
             runner: childRunner,
             signal: operation.signal,
             pendingNotifications: async () => {
-              const snapshot = await getSessionSnapshot(client, { signal: operation.signal })
-              return snapshot.inputs.some((input) => input.kind === "notification" && input.status === "pending")
+              const current = await attached.attachment.currentSnapshot()
+              return current.inputs.some((input) => input.kind === "notification" && input.status === "queued")
             },
-            continueRun: () =>
-              runAgent(
-                client,
-                {
-                  commandId: randomUUID(),
-                  goal: "background children settled; consume notifications and wrap up",
-                  workspace: workspaceRoot,
-                  ...(correlationTrace ? { trace: correlationTrace } : {}),
-                },
-                { signal: operation.signal },
-              ),
+            continueRun: async () => {
+              const commandId = randomUUID()
+              await submit(commandId, "background children settled; consume notifications and wrap up")
+              return await attached.attachment.awaitOutcome(commandId, operation.signal)
+            },
           })
         }
-        await eventWriter?.flush(operation.signal)
         writeRunOutcome(
           requestId,
-          result,
+          outcome,
           outputFormat,
-          sessionId,
+          sessionIdValue,
           operation.abortKind,
-          eventWriter ? { revision: eventWriter.revision, terminal: true } : undefined,
+          writer ? { revision: writer.revision, terminal: true } : undefined,
         )
         return
       } finally {
-        eventWriter?.close()
+        attachment?.stop()
+        lineReader?.close()
         operation.close()
-        await connection?.close().catch(() => {})
+        await runSession?.close().catch(() => {})
       }
     }
 
-    if (command.type === "session" && command.action !== "events") {
-      const operation = createHeadlessOperation(command.timeoutMs)
-      let localHost: Awaited<ReturnType<typeof buildAgentRunRuntime>> | undefined
-      try {
-        const catalogWorkspaceRoot = "cwd" in command && command.cwd !== undefined ? command.cwd : process.cwd()
-        localHost = await buildAgentRunRuntime({
-          signal: operation.signal,
-          runtimeConfig: config,
-          // The catalog and event root must follow --cwd for session create/
-          // resume; otherwise a target workspace would write into the caller's
-          // project and disappear from that workspace's /resume list.
-          workspaceRoot: catalogWorkspaceRoot,
-          provider: readOnlyPlanProvider,
-        })
-        const catalog = localHost.catalog
-        if (!catalog) throw new Error("Session catalog is unavailable")
-        const options = { signal: operation.signal }
-        if (command.action === "list") {
-          const records = await catalog.list(options)
-          writeSuccess("session", requestId, records, command.format ?? config.outputFormat, JSON.stringify(records))
-          return
-        }
-        if (command.action === "create") {
-          const createdId = parseSessionId(command.sessionId ?? randomUUID())
-          const workspaceRoot = await canonicalizeExistingDirectory(command.cwd ?? process.cwd())
-          await catalog.create(createdId, workspaceRoot, options)
-          const record = await catalog.get(createdId, options)
-          if (!record) throw new Error(`Session is unreadable after creation: ${createdId}`)
-          writeSuccess("session", requestId, record, command.format ?? config.outputFormat, JSON.stringify(record), record.sessionId)
-          return
-        }
-        if (!command.sessionId) throw new Error(`session ${command.action} requires session-id`)
-        const id = parseSessionId(command.sessionId)
-        if (command.action === "get") {
-          const record = await catalog.get(id, options)
-          if (!record) throw new Error(`Session does not exist: ${id}`)
-          writeSuccess("session", requestId, record, command.format ?? config.outputFormat, JSON.stringify(record), id)
-          return
-        }
-        if (command.action === "fork") {
-          const target = parseSessionId(command.targetSessionId ?? randomUUID())
-          const record = await catalog.fork(id, target, undefined, options)
-          writeSuccess("session", requestId, record, command.format ?? config.outputFormat, JSON.stringify(record), target)
-          return
-        }
-        if (command.action === "archive") {
-          const record = await catalog.archive(id, options)
-          writeSuccess("session", requestId, record, command.format ?? config.outputFormat, JSON.stringify(record), id)
-          return
-        }
-        if (command.action === "delete") {
-          await catalog.delete(id, options)
-          writeSuccess(
-            "session",
-            requestId,
-            { sessionId: id, deleted: true },
-            command.format ?? config.outputFormat,
-            JSON.stringify({ sessionId: id, deleted: true }),
-            id,
-          )
-          return
-        }
-      } finally {
-        operation.close()
-        await localHost?.close()
-      }
-    }
-
-    if (command.type === "session" && command.action === "resume") {
-      if (!command.sessionId) throw new Error("session resume requires session-id")
-      const id = parseSessionId(command.sessionId)
-      const operation = createHeadlessOperation(command.timeoutMs)
-      let connection: Awaited<ReturnType<typeof connectClient>> | undefined
-      let eventWriter: ReturnType<typeof createHeadlessJsonlEventWriter> | undefined
-      try {
-        connection = await connectClient(command, id, config, operation.signal)
-        const client = connection.client
-        const eventResult = await client.execute(readEventsCommand(), { signal: operation.signal })
-        if (eventResult.type !== "events") throw new Error("Session did not return events")
-        const resumable = findResumableRun(eventResult.events)
-        if (!resumable) throw new Error(`Session has no unfinished run to resume: ${id}`)
-        // The retry must repeat the recorded start_run input exactly: a
-        // fresh-seeded run carries its permissionMode in the fingerprint, so
-        // resubmitting without it is an idempotency conflict. Reuse the
-        // recorded seed — the same reuse-recovery the host applies to
-        // interrupted runs — instead of dropping it. The anchor matches the
-        // runtime's start_run family so a foreign family's CommandAccepted
-        // sharing the commandId never feeds this retry.
-        const anchor = eventResult.events.find(
-          (event) =>
-            event.type === "CommandAccepted" &&
-            event.payload.family === "start_run" &&
-            event.payload.commandId === resumable.payload.commandId,
-        )
-        const recordedMode = anchor?.type === "CommandAccepted" ? anchor.payload.inputFingerprint.permissionMode : undefined
-        const resumeMode = isSessionPermissionMode(recordedMode) ? recordedMode : undefined
-        const outputFormat = command.format ?? config.outputFormat
-        eventWriter = outputFormat === "jsonl" ? createHeadlessJsonlEventWriter(client, "session", requestId) : undefined
-        if (eventWriter) await eventWriter.start(operation.signal)
-        const result = await runAgent(
-          client,
-          {
-            commandId: resumable.payload.commandId,
-            goal: resumable.payload.goal,
-            maxTurns: resumable.payload.maxTurns,
-            ...(resumeMode ? { permissionMode: resumeMode } : {}),
-            ...(command.cwd ? { workspace: command.cwd } : {}),
-          },
-          { signal: operation.signal },
-        )
-        await eventWriter?.flush(operation.signal)
-        writeRunOutcome(
-          requestId,
-          result,
-          outputFormat,
-          id,
-          operation.abortKind,
-          eventWriter ? { revision: eventWriter.revision, terminal: true } : undefined,
-          "session",
-        )
-        return
-      } finally {
-        eventWriter?.close()
-        operation.close()
-        await connection?.close().catch(() => {})
-      }
-    }
-
-    const sessionId = command.sessionId
-    if (!sessionId) throw new Error("This command requires session-id")
-    const operation = createHeadlessOperation(command.timeoutMs)
-    let connection: Awaited<ReturnType<typeof connectClient>> | undefined
+    const sessionIdValue = command.sessionId
+    if (!sessionIdValue) throw new Error("This command requires session-id")
+    const operation = createHeadlessOperation({ timeoutMs: command.timeoutMs })
+    let readSession: PublicHeadlessSession | undefined
     try {
-      connection = await connectClient(command, sessionId, config, operation.signal)
-      const client = connection.client
+      readSession = await buildPublicHeadlessSession({
+        runtimeConfig: config,
+        sessionId: sessionIdValue,
+        mode: "read",
+        ...("cwd" in command && command.cwd !== undefined ? { workspaceRoot: command.cwd } : {}),
+        signal: operation.signal,
+      })
+      const facade = readSession.facade
+      const recordedRoot = await readSession.recordWorkspaceRoot()
+      const commandCwd = "cwd" in command ? command.cwd : undefined
+      if (recordedRoot !== undefined && commandCwd !== undefined && resolve(commandCwd) !== resolve(recordedRoot)) {
+        throw new Error("Session workspaceRoot does not match --cwd; the workspace cannot be changed during a run")
+      }
+      const outputFormat = command.format ?? config.outputFormat
       if (command.type === "inspect") {
-        const snapshot = await getSessionSnapshot(client, { signal: operation.signal })
-        writeSuccess("inspect", requestId, snapshot, command.format ?? config.outputFormat, JSON.stringify(snapshot), sessionId)
+        const snapshot = await readSession.publicSnapshot()
+        writeSuccess("inspect", requestId, snapshot, outputFormat, JSON.stringify(snapshot), sessionIdValue)
         return
       }
       if (command.type === "observe") {
-        const records = await readSessionModelCalls(client, config.observability.includePayload, { signal: operation.signal })
-        writeSuccess("observe", requestId, records, command.format ?? config.outputFormat, JSON.stringify(records), sessionId)
+        const records = (
+          await facade.modelCalls({ sessionId: sessionIdValue, ...(config.observability.includePayload ? { includePayload: true } : {}) })
+        ).records
+        writeSuccess("observe", requestId, records, outputFormat, JSON.stringify(records), sessionIdValue)
         return
       }
       if (command.type === "trace") {
-        const records = await readSessionTrace(client, { signal: operation.signal })
-        writeSuccess("trace", requestId, records, command.format ?? config.outputFormat, JSON.stringify(records), sessionId)
+        const records = (await facade.trace({ sessionId: sessionIdValue })).records
+        writeSuccess("trace", requestId, records, outputFormat, JSON.stringify(records), sessionIdValue)
         return
       }
       if (command.type === "session" && command.action === "checkpoints") {
-        const result = await client.execute(listCheckpointsCommand(), { signal: operation.signal })
-        if (result.type !== "checkpoints") throw new Error("Session did not return checkpoints")
-        const outputFormat = command.format ?? config.outputFormat
+        const result = await facade.listCheckpoints({ sessionId: sessionIdValue })
         const text = result.checkpoints
           .map((checkpoint) => `${checkpoint.checkpointId} · ${checkpoint.kind} · revision ${checkpoint.headRevision}`)
           .join("\n")
-        writeSuccess("session", requestId, result.checkpoints, outputFormat, text, sessionId, undefined, {
-          revision: result.snapshot.lastRevision,
+        const snapshot = await readSession.publicSnapshot()
+        writeSuccess("session", requestId, result.checkpoints, outputFormat, text, sessionIdValue, undefined, {
+          revision: snapshot.asOfRevision,
         })
         return
       }
       if (command.type === "session" && (command.action === "preview-rewind" || command.action === "rewind")) {
-        const request =
-          command.action === "preview-rewind"
-            ? previewRewindCommand({
-                checkpointId: command.checkpointId!,
-                expectedRevision: command.expectedRevision,
-              })
-            : rewindCommand({
-                commandId: requestId,
-                checkpointId: command.checkpointId!,
-                expectedRevision: command.expectedRevision,
-              })
-        const result = await client.execute(request, { signal: operation.signal })
-        const outputFormat = command.format ?? config.outputFormat
         if (command.action === "preview-rewind") {
-          if (result.type !== "rewind_preview") throw new Error("Session did not return rewind_preview")
-          writeSuccess("session", requestId, result.preview, outputFormat, JSON.stringify(result.preview), sessionId, undefined, {
-            revision: result.snapshot.lastRevision,
+          const result = await facade.previewRewind({
+            sessionId: sessionIdValue,
+            checkpointId: command.checkpointId!,
+            ...(command.expectedRevision === undefined ? {} : { expectedRevision: command.expectedRevision }),
+          })
+          writeSuccess("session", requestId, result, outputFormat, JSON.stringify(result), sessionIdValue, undefined, {
+            revision: result.currentRevision,
           })
           return
         }
-        if (result.type !== "rewind_result") throw new Error("Session did not return rewind_result")
-        if (result.result.status === "failed" || result.result.status === "already_failed") {
-          writeError("session", requestId, result.result.error, "RUNTIME_ERROR", outputFormat, {
-            sessionId,
-            details: { result: result.result },
+        const result = await facade.rewind({
+          sessionId: sessionIdValue,
+          commandId: requestId,
+          checkpointId: command.checkpointId!,
+          ...(command.expectedRevision === undefined ? {} : { expectedRevision: command.expectedRevision }),
+        })
+        if (result.status === "failed" || result.status === "already_failed") {
+          writeError("session", requestId, result.error ?? new Error(`rewind ${result.status}`), "RUNTIME_ERROR", outputFormat, {
+            sessionId: sessionIdValue,
+            details: { result },
           })
           process.exitCode = exitCodeForError("RUNTIME_ERROR")
           return
         }
-        writeSuccess("session", requestId, result.result, outputFormat, result.result.status, sessionId, undefined, {
-          revision: result.snapshot.lastRevision,
+        const snapshot = await readSession.publicSnapshot()
+        writeSuccess("session", requestId, result, outputFormat, result.status, sessionIdValue, undefined, {
+          revision: snapshot.asOfRevision,
         })
         return
       }
       if (command.type === "session" && command.action === "events") {
-        const result = await client.execute(readEventsCommand(), { signal: operation.signal })
-        if (result.type !== "events") throw new Error("Session did not return events")
-        const outputFormat = command.format ?? config.outputFormat
+        const events = await readSession.readPublicEvents()
         if (outputFormat === "jsonl") {
-          for (const event of result.events) process.stdout.write(serializeHeadlessEvent("session", requestId, event))
+          for (const event of events) process.stdout.write(serializeHeadlessEvent("session", requestId, event))
         } else {
-          writeSuccess("session", requestId, result.events, outputFormat, JSON.stringify(result.events), sessionId)
+          writeSuccess("session", requestId, events, outputFormat, JSON.stringify(events), sessionIdValue)
         }
         return
       }
       throw new Error(`session ${command.type === "session" ? command.action : ""} is not implemented`)
     } finally {
       operation.close()
-      await connection?.close().catch(() => {})
+      await readSession?.close().catch(() => {})
     }
   } catch (error) {
     const errorCommand = command.type === "session" ? "session" : command.type
@@ -586,87 +837,11 @@ async function main(argv: readonly string[] = process.argv.slice(2), options?: {
   }
 }
 
-async function connectClient(
-  command: Exclude<AgentCliCommand, { readonly type: "help" | "serve" | "pair" }>,
-  sessionId: string,
-  config: RuntimeConfig,
-  signal?: AbortSignal,
-  edges?: { readonly onChildRunner?: (runner: ChildAgentRunner) => void },
-): Promise<{
-  readonly client: SessionClient
-  readonly catalog: import("@ag2cli/runtime/ports/session-catalog.js").SessionCatalog
-  readonly close: () => Promise<void>
-}> {
-  const commandCwd = "cwd" in command ? command.cwd : undefined
-  if (command.type === "plan" || command.type === "run") {
-    if (signal?.aborted)
-      throw signal.reason instanceof Error ? signal.reason : new DOMException("headless operation cancelled", "AbortError")
-    const host = await buildAgentRunRuntime({
-      signal,
-      runtimeConfig: config,
-      workspaceRoot: commandCwd ?? process.cwd(),
-      strictCapabilities: command.skillDir !== undefined,
-      ...(edges?.onChildRunner === undefined ? {} : { onChildRunner: edges.onChildRunner }),
-      ...(command.type === "plan"
-        ? { provider: new ModelPlanProvider(await pickModelClient(config)) }
-        : {
-            client: await pickModelClient(config),
-            // The guardian answers auto-mode asks; a run seeded with auto (or
-            // resuming one) converges approval_required without it.
-            guardian: await pickGuardian(config),
-            guardianDeadlineMs: guardianReviewDeadlineMs(config),
-            ...(command.skillDir ? { skillRoot: command.skillDir } : {}),
-          }),
-    })
-    return {
-      client: connectSession(host.sessionServer, sessionId),
-      catalog: host.catalog,
-      close: () => host.close(),
-    }
-  }
-  // The personal local CLI is intentionally non-interactive at this boundary;
-  // a future TUI approval broker can be injected without changing the runtime.
-  const needsExecution = command.type === "session" && command.action === "resume"
-  const explicitCapabilities =
-    command.type === "session" && command.action === "resume"
-      ? {
-          ...(command.skillDir ? { skillRoot: command.skillDir } : {}),
-        }
-      : {}
-  const host = await buildAgentRunRuntime({
-    signal,
-    strictCapabilities: command.type === "session" && command.action === "resume" ? command.skillDir !== undefined : false,
-    runtimeConfig: config,
-    sessionId: parseSessionId(sessionId),
-    workspaceRoot: commandCwd,
-    ...explicitCapabilities,
-    ...(needsExecution
-      ? {
-          client: await pickModelClient(config),
-          // A resumed run keeps its auto mode: the configured guardian, if
-          // any, stays its only ask answerer.
-          guardian: await pickGuardian(config),
-          guardianDeadlineMs: guardianReviewDeadlineMs(config),
-        }
-      : { provider: readOnlyPlanProvider }),
-  })
-  try {
-    const current = await host.catalog?.get(parseSessionId(sessionId))
-    if (current?.snapshot.workspaceRoot && commandCwd !== undefined && resolve(commandCwd) !== resolve(current.snapshot.workspaceRoot)) {
-      throw new Error("Session workspaceRoot does not match --cwd; the workspace cannot be changed during a run")
-    }
-    return { client: connectSession(host.sessionServer, sessionId), catalog: host.catalog, close: () => host.close() }
-  } catch (error) {
-    await host.close().catch(() => {})
-    throw error
-  }
-}
-
 function writeSuccess<T>(
-  command: "version" | "capabilities" | "pair" | "plan" | "run" | "inspect" | "observe" | "trace" | "session",
+  command: "version" | "capabilities" | "pair" | "run" | "inspect" | "observe" | "trace" | "session",
   requestId: string,
   data: T,
-  format: import("../config/output-format.js").HeadlessOutputFormat,
+  format: HeadlessOutputFormat,
   text: string,
   sessionId?: string,
   runId?: string,
@@ -676,7 +851,7 @@ function writeSuccess<T>(
 }
 
 function writeError(
-  command: "version" | "capabilities" | "pair" | "plan" | "run" | "inspect" | "observe" | "trace" | "session" | "help" | "serve",
+  command: "version" | "capabilities" | "pair" | "run" | "inspect" | "observe" | "trace" | "session" | "help" | "serve",
   requestId: string,
   error: unknown,
   code: HeadlessErrorCode,
@@ -716,7 +891,7 @@ function writeError(
 
 function writeRunOutcome(
   requestId: string,
-  result: RunResult,
+  result: HeadlessRunOutcome,
   format: HeadlessOutputFormat,
   sessionId: string,
   abortKind: "timeout" | "signal" | undefined,
@@ -727,8 +902,8 @@ function writeRunOutcome(
     writeSuccess(command, requestId, result, format, runText(result), sessionId, result.runId, meta)
     return
   }
-  // Replay of a durable approval_required terminal classifies identically to
-  // the live ApprovalRequiredError throw, so same-id retries stay exit 5.
+  // A durable approval_required terminal classifies identically to a live
+  // refusal, so same-id retries stay exit 5.
   const code: HeadlessErrorCode =
     result.status === "cancelled"
       ? abortKind === "timeout"
@@ -764,38 +939,55 @@ function requestedOutputFormat(argv: readonly string[]): HeadlessOutputFormat {
   return configured === "text" || configured === "jsonl" ? configured : "json"
 }
 
+/** Public §16 codes mapped onto the headless envelope codes. */
+const RPC_ERROR_CODES: Readonly<Record<string, HeadlessErrorCode>> = {
+  invalid_params: "USAGE_ERROR",
+  invalid_intent: "USAGE_ERROR",
+  invalid_result: "PROTOCOL_ERROR",
+  method_not_found: "PROTOCOL_ERROR",
+  protocol_version_mismatch: "PROTOCOL_ERROR",
+  scope_denied: "PROTOCOL_ERROR",
+  session_not_found: "RUNTIME_ERROR",
+  run_not_active: "RUNTIME_ERROR",
+  revision_conflict: "PERSISTENCE_ERROR",
+  revision_ahead: "PERSISTENCE_ERROR",
+  policy_revision_conflict: "PERSISTENCE_ERROR",
+  reservation_conflict: "PERSISTENCE_ERROR",
+  command_idempotency_conflict: "PERSISTENCE_ERROR",
+  interaction_already_resolved: "RUNTIME_ERROR",
+  stale_approval: "RUNTIME_ERROR",
+  interaction_expired: "RUNTIME_ERROR",
+  unsupported_event: "PROTOCOL_ERROR",
+  capability_unavailable: "RUNTIME_ERROR",
+  capability_denied: "PERMISSION_DENIED",
+  workspace_access_denied: "PERMISSION_DENIED",
+  workspace_unavailable: "PERMISSION_DENIED",
+  workspace_path_denied: "PERMISSION_DENIED",
+  workspace_changed: "PERSISTENCE_ERROR",
+  interaction_lease_required: "PROTOCOL_ERROR",
+  interaction_lease_scope_mismatch: "PROTOCOL_ERROR",
+  interaction_lease_held: "PROTOCOL_ERROR",
+  interaction_lease_stale: "PROTOCOL_ERROR",
+  interaction_scope_unclassified: "PROTOCOL_ERROR",
+  interaction_unavailable: "PROTOCOL_ERROR",
+  invalid_lease_ttl: "PROTOCOL_ERROR",
+  connection_not_registered: "PROTOCOL_ERROR",
+  invalid_host_result: "PROTOCOL_ERROR",
+}
+
+/**
+ * Two error layers only: public contract failures arrive as typed
+ * RpcApplicationError codes, local lifecycle failures as typed error
+ * classes. Message regexes are deliberately absent.
+ */
 function classifyHeadlessError(error: unknown): HeadlessErrorCode {
-  if (error instanceof ApprovalRequiredError) return "APPROVAL_REQUIRED"
-  if (error instanceof SessionExecutionReservationConflictError) return "RUNTIME_ERROR"
-  if (error instanceof SessionPolicyRevisionConflictError) return "PERSISTENCE_ERROR"
-  if (error instanceof DOMException && error.name === "AbortError") return "CANCELLED"
-  if (error instanceof Error && error.name === "AbortError") return "CANCELLED"
+  if (error instanceof RpcApplicationError) return RPC_ERROR_CODES[error.kind] ?? "RUNTIME_ERROR"
+  if (error instanceof PairAuthenticationError) return "AUTH_ERROR"
+  if (error instanceof ModelConfigurationError) return "PROVIDER_ERROR"
   if (error instanceof DOMException && error.name === "TimeoutError") return "TIMEOUT"
   if (error instanceof Error && error.name === "TimeoutError") return "TIMEOUT"
-  const message = error instanceof Error ? error.message : String(error)
-  if (/timeout|timed out|\u8d85\u65f6/i.test(message)) return "TIMEOUT"
-  if (/approval|approve|\u6279\u51c6|\u5ba1\u6279|\u9700\u786e\u8ba4/i.test(message)) return "APPROVAL_REQUIRED"
-  if (/permission denied|\u6743\u9650\u62d2\u7edd|\u88ab\u7b56\u7565\u62d2\u7edd|workspace.*\u7981\u6b62/i.test(message))
-    return "PERMISSION_DENIED"
-  if (/authentication|unauthorized|forbidden|api key|\u51ed\u8bc1|401|403/i.test(message)) return "AUTH_ERROR"
-  if (
-    /EventStore|Session metadata|\u6301\u4e45\u5316|JSONL \u635f\u574f|JSONL.*corrupted|revision conflict|revision \u51b2\u7a81|reservation_conflict/i.test(
-      message,
-    )
-  )
-    return "PERSISTENCE_ERROR"
-  if (/configuration is missing|missing LLM configuration|\u914d\u7f6e\u7f3a\u5931|\u7f3a\u5c11 LLM \u914d\u7f6e/i.test(message))
-    return "PROVIDER_ERROR"
-  if (
-    /explicit skills|skills director(?:y|ies)|skills files?|skill-dir|unsupported (?:OpenAI compatibility|thinking mode|reasoning effort)|remote configuration is not supported|\u663e\u5f0f skills|skills \u76ee\u5f55|skills \u6587\u4ef6|\u8fdc\u7a0b\u914d\u7f6e\u4e0d\u652f\u6301/i.test(
-      message,
-    )
-  )
-    return "CONFIG_ERROR"
-  if (/transport|HTTP.*failed|request body|\u8bf7\u6c42\u4f53|protocol/i.test(message)) return "TRANSPORT_ERROR"
-  if (/\u5de5\u5177|tool/i.test(message)) return "TOOL_ERROR"
-  if (/AG2CLI_|configuration|unsupported|\u914d\u7f6e|profile|\u4e0d\u652f\u6301\u7684/i.test(message)) return "CONFIG_ERROR"
-  if (/provider|model|\u6a21\u578b|\u6a21\u578b\u8c03\u7528/i.test(message)) return "PROVIDER_ERROR"
+  if (error instanceof DOMException && error.name === "AbortError") return "CANCELLED"
+  if (error instanceof Error && error.name === "AbortError") return "CANCELLED"
   return "RUNTIME_ERROR"
 }
 

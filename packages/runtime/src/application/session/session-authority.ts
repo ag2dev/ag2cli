@@ -9,6 +9,7 @@ import {
   type EventStore,
   type EventStoreWriter,
 } from "../../ports/event-store.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { SessionRevisionConflictError } from "./revision-conflict.js"
 
 export interface SessionWriter {
@@ -31,15 +32,17 @@ export async function commitSessionEvents(input: {
   readonly events: readonly AgentEvent[]
   readonly expectedRevision?: number
   readonly transitionId?: string
-  readonly onCommitted?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onCommitted?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }): Promise<SessionCommitResult> {
   const result = await input.authority.appendAtRevision(input.events, input.expectedRevision, input.transitionId)
-  if (!result.replayed) {
-    try {
-      await input.onCommitted?.(result.events)
-    } catch {
-      // Observers are reconstructable from the canonical store and cannot veto a commit.
-    }
+  try {
+    // A replay can be the only delivery that ever ran: the original attempt
+    // may die after the durable append but before observers execute, so
+    // replays must fan out too. Delivery is at-least-once; observers filter
+    // duplicates with the replayed flag.
+    await input.onCommitted?.(result.events, result.replayed === true)
+  } catch {
+    // Observers are reconstructable from the canonical store and cannot veto a commit.
   }
   return result
 }
@@ -66,7 +69,11 @@ export class SessionWriterConflictError extends Error {
 }
 
 export class SessionAuthority {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly commitLane = new OrderedLane<string>()
+  // Bespoke join-and-mirror guard, deliberately not an OrderedLane: the map
+  // stores the raw openWriterNow promise, awaiters await-then-recheck the
+  // synchronous writers cache, and close() drains it — resolved-value cache
+  // semantics a keyed FIFO tail cannot express.
   private readonly opening = new Map<string, Promise<SessionWriter>>()
   private readonly currentEpoch = new Map<string, number>()
   private readonly writers = new Map<string, SessionWriter>()
@@ -125,7 +132,7 @@ export class SessionAuthority {
     const operation = (async () => {
       const opening = await Promise.allSettled([...this.opening.values()])
       const failures = opening.flatMap((result) => (result.status === "rejected" ? [result.reason] : []))
-      await Promise.allSettled([...this.pending.values()])
+      await Promise.allSettled(this.commitLane.tails())
       const pendingReleases = await Promise.allSettled([...this.acquiredPendingRelease].map((writer) => this.releaseAcquiredWriter(writer)))
       failures.push(...pendingReleases.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])))
       const releases = await Promise.allSettled([...this.writers.values()].map((writer) => this.revoke(writer)))
@@ -165,18 +172,7 @@ export class SessionAuthority {
       }
     }
     if (events.some((event) => event.sessionId !== writer.sessionId)) throw new Error("Session authority scope mismatch")
-    const previous = this.pending.get(writer.sessionId.toString()) ?? Promise.resolve()
-    const operation = previous.then(() => this.commitNow(writer, expectedRevision, transitionId, events))
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(writer.sessionId.toString(), tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(writer.sessionId.toString()) === tracked) this.pending.delete(writer.sessionId.toString())
-    }
+    return this.commitLane.run(writer.sessionId.toString(), () => this.commitNow(writer, expectedRevision, transitionId, events))
   }
 
   private async commitNow(
@@ -268,8 +264,10 @@ export class SessionAuthority {
   private async openWriterNow(sessionId: SessionId): Promise<SessionWriter> {
     const key = sessionId.toString()
     const previous = this.writers.get(key)
-    const pending = this.pending.get(key)
-    if (pending !== undefined) await pending
+    // A no-op entrant waits for exactly the commits already admitted on this
+    // key, so a new epoch's first read cannot overlap a revoked writer's
+    // in-flight read/append window.
+    if (previous === undefined) await this.commitLane.run(key, async () => undefined)
     if (previous !== undefined) return previous
     const nextEpoch = (this.currentEpoch.get(key) ?? 0) + 1
     const ownerNonce = `${sessionId}:${nextEpoch}:${globalThis.crypto.randomUUID()}`

@@ -1,6 +1,6 @@
 /**
  * Card surface: the framed card claiming modal keys (the theme panel
- * first), rendered between transcript and composer. The snapshot
+ * first), rendered on the modal task surface. The snapshot
  * carries the composed card view; the store's granted rows bound its
  * height together with the cap, and the renderer's degradation ladder
  * does the rest. Every run line lands through the shared Ink bridge.

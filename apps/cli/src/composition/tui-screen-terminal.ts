@@ -46,6 +46,8 @@ export interface TuiScreenTerminalOptions {
   readonly environment?: Record<string, string | undefined>
   /** Runs a terminfo capability query; returns "" when unavailable. */
   readonly probeRunner?: (name: string) => string
+  /** Runs an stty invocation on the tty; returns null when it fails. */
+  readonly sttyRunner?: (args: string[]) => string | null
   /** Passed to the screen owner, which enables paired wheel-only mouse modes. */
   readonly mouseTracking?: boolean
 }
@@ -60,6 +62,12 @@ export function createTuiScreenTerminal(options: TuiScreenTerminalOptions = {}):
     ((name: string): string => {
       const result = spawnSync("tput", [name], { env: environment, encoding: "utf8" })
       return result.status === 0 ? (result.stdout ?? "") : ""
+    })
+  const runStty =
+    options.sttyRunner ??
+    ((args: string[]): string | null => {
+      const result = spawnSync("stty", args, { stdio: ["inherit", "pipe", "pipe"], encoding: "utf8" })
+      return result.status === 0 ? (result.stdout ?? "") : null
     })
   const size = (): TerminalSize => ({ columns: stdout.columns ?? 80, rows: stdout.rows ?? 24 })
   return {
@@ -82,6 +90,17 @@ export function createTuiScreenTerminal(options: TuiScreenTerminalOptions = {}):
     },
     setRawMode: (enabled) => {
       stdin.setRawMode(enabled)
+    },
+    establishCanonicalInput: () => {
+      // A raw-mode off switch only restores whatever snapshot the first
+      // raw transition took, so cooked flags must be re-established
+      // explicitly when the tty was inherited altered. stty -a lists
+      // negated flags with a dash; `sane` restores the cooked default.
+      // A failed probe proceeds degraded: ISIG stays as inherited, and
+      // the splash's own Ctrl+C belt still covers the exit.
+      const settings = runStty(["-a"])
+      if (settings === null) return
+      if (/-(?:isig|icanon|echo|echoe|opost)\b/.test(settings)) runStty(["sane"])
     },
     size,
     onData: (handler) => {
@@ -128,7 +147,7 @@ export function createTuiScreenTerminal(options: TuiScreenTerminalOptions = {}):
       }),
     onSignal: (handler) => {
       const listeners = new Map<ScreenSignal, () => void>()
-      for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+      for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as const) {
         const listener = (): void => handler(signal)
         listeners.set(signal, listener)
         process.on(signal, listener)

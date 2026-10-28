@@ -1,16 +1,12 @@
 import type { CallModelInput } from "@ag2cli/runtime/ports/model/contract.js"
 import type { OpenAIEndpointDescriptor, OpenAIReasoningEffort, OpenAIThinkingMode } from "@ag2cli/runtime/ports/model/compatibility.js"
 
-export const DEFAULT_OPENAI_MAX_TOKENS = 32_768
-const OUTPUT_RESERVE_TOKENS = 256
-
 export interface OpenAIRequestPolicyOptions {
   readonly descriptor: OpenAIEndpointDescriptor
-  readonly input: Pick<CallModelInput, "messages" | "systemPrompt" | "tools" | "maxTokens" | "thinking" | "reasoningEffort">
-  readonly configuredMaxTokens?: number
+  readonly input: Pick<CallModelInput, "messages" | "systemPrompt" | "tools" | "thinking" | "reasoningEffort">
+  readonly maxTokens: number
   readonly configuredThinking?: OpenAIThinkingMode
   readonly configuredReasoningEffort?: OpenAIReasoningEffort
-  readonly contextWindow?: number
 }
 
 /** Build only provider-specific parameters; messages remain owned by the client adapter. */
@@ -19,7 +15,7 @@ export function buildOpenAICompletionParams(options: OpenAIRequestPolicyOptions)
   const thinking = input.thinking ?? options.configuredThinking ?? "auto"
   const effort = input.reasoningEffort ?? options.configuredReasoningEffort ?? "auto"
   const params: Record<string, unknown> = {
-    [descriptor.maxTokensField]: resolveMaxTokens(options),
+    [descriptor.maxTokensField]: options.maxTokens,
   }
 
   const explicitThinking = thinking !== "auto" || effort !== "auto"
@@ -56,15 +52,7 @@ export function buildOpenAICompletionParams(options: OpenAIRequestPolicyOptions)
   return params
 }
 
-function resolveMaxTokens(options: OpenAIRequestPolicyOptions): number {
-  const requested = options.input.maxTokens ?? options.configuredMaxTokens ?? DEFAULT_OPENAI_MAX_TOKENS
-  if (options.contextWindow === undefined) return requested
-  const estimatedInput = estimateRequestTokens(options.input)
-  const available = Math.max(1, options.contextWindow - estimatedInput - OUTPUT_RESERVE_TOKENS)
-  return Math.min(requested, available)
-}
-
-function estimateRequestTokens(input: OpenAIRequestPolicyOptions["input"]): number {
+export function estimateRequestTokens(input: Pick<CallModelInput, "messages" | "systemPrompt" | "tools">): number {
   let characters = 0
   for (const message of input.messages) {
     const content = message.message.content

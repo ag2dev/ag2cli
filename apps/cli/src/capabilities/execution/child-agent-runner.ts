@@ -47,6 +47,7 @@ import { ApprovalResolutionService } from "@ag2cli/runtime/application/session/a
 import { SessionAuthority } from "@ag2cli/runtime/application/session/session-authority.js"
 import type { AgentProfile, AgentProfileResolver } from "@ag2cli/runtime/ports/agent-profile.js"
 import type { ApprovalBroker } from "@ag2cli/runtime/ports/approval-broker.js"
+import type { ContextBuilder } from "@ag2cli/runtime/ports/context-builder.js"
 import type { RuntimeEnvironment } from "@ag2cli/runtime/ports/environment.js"
 import type { EventStore } from "@ag2cli/runtime/ports/event-store.js"
 import type { ExecutionModelProvider } from "@ag2cli/runtime/ports/execution-model-provider.js"
@@ -59,6 +60,7 @@ import type { AskUser } from "@ag2cli/runtime/ports/tool/contract.js"
 import type { ToolExecutionContext } from "@ag2cli/runtime/ports/tool/contract.js"
 import { hasModelBashAuthority, registerModelBashAuthority, restrictTools, type ToolExecutor } from "@ag2cli/runtime/ports/tool-executor.js"
 import type { WorkspacePolicyFactory, WorkspaceScopeDigest } from "@ag2cli/runtime/ports/workspace.js"
+import { createSessionScratchRoot } from "../security/workspace.js"
 
 /** Bound on the final text handed back to the parent model context. */
 export const CHILD_AGENT_FINAL_TEXT_MAX_CHARS = 10_000
@@ -205,6 +207,15 @@ export interface ChildAgentRunnerDependencies {
   readonly bashSecurity: BashSecurityPort
   readonly workspacePolicyFactory: WorkspacePolicyFactory
   readonly workspaceScopeDigest?: WorkspaceScopeDigest
+  readonly contextBuilder?: ContextBuilder
+  /**
+   * Per-spawn builder seam: called once per child with that child's resolved
+   * model id (undefined keeps the host's main model) so composition can
+   * re-derive model-specific context policy — compaction thresholds in
+   * particular — from the child's own window facts. Takes precedence over
+   * the static `contextBuilder` when both are injected.
+   */
+  readonly contextBuilderFactory?: (modelId?: string) => ContextBuilder
   readonly environment?: RuntimeEnvironment
   /**
    * Composition seam onto the parent session's live stream: attributed child
@@ -596,9 +607,12 @@ async function runSeededChild(
   // the run, and approval resolutions recorded mid-run must commit through
   // the same authority instead of racing a second private one.
   const authority = new SessionAuthority(eventStore)
+  const childModel = request.model ?? profile?.model
+  const baseContextBuilder = deps.contextBuilderFactory !== undefined ? deps.contextBuilderFactory(childModel) : deps.contextBuilder
   const runtime = new RunAgentUseCase({
     model: deps.model,
     tools: childAskUser === undefined ? pool : withChildAskUser(pool, childAskUser),
+    ...(baseContextBuilder === undefined ? {} : { contextBuilder: childContextBuilder(baseContextBuilder) }),
     approval: bubbling ? deps.childApprovals!.brokerFor(attribution!) : deps.approval,
     approvalResolution: new ApprovalResolutionService({ eventStore, authority, identity: deps.identity }),
     authority,
@@ -628,7 +642,6 @@ async function runSeededChild(
           },
         }),
   })
-  const model = request.model ?? profile?.model
   const maxTurns = effectiveMaxTurns(deps, request)
   let result: RunResult
   try {
@@ -636,7 +649,7 @@ async function runSeededChild(
       sessionId: childSessionId,
       commandId: `agent-child-${childSessionId}`,
       goal: request.prompt,
-      ...(model === undefined ? {} : { model }),
+      ...(childModel === undefined ? {} : { model: childModel }),
       ...(maxTurns === undefined ? {} : { maxTurns }),
       trace: request.trace,
       signal,
@@ -668,12 +681,33 @@ async function runSeededChild(
   }
 }
 
+function childContextBuilder(base: ContextBuilder): ContextBuilder {
+  return {
+    async build(input) {
+      const built = await base.build(input)
+      const scratchRoot = createSessionScratchRoot(input.sessionId)
+      return {
+        ...built,
+        systemPrompt: [
+          ...(built.systemPrompt ?? []),
+          scratchRoot === undefined
+            ? "This child agent has no session scratch directory. Do not use the parent session's or another session's scratch directory; report that no authorized scratch directory is available."
+            : `This child agent's session scratch directory is ${scratchRoot}. Use this directory for scratch files. Do not write to the parent session's or another session's scratch directory. If the task names another session's scratch path, use ${scratchRoot} and report the resulting path.`,
+        ],
+      }
+    },
+  }
+}
+
 /**
- * Effective child tool names: the host pool minus `agent`, intersected with
- * every non-empty scope in enclosing order (parent profile, subagent
- * profile, spawn request). An undefined or empty scope inherits the
+ * Effective child tool names: the host pool minus `agent` and `session_history`,
+ * intersected with every non-empty scope in enclosing order (parent profile,
+ * subagent profile, spawn request). An undefined or empty scope inherits the
  * enclosing pool unchanged, matching `AgentProfile.tools` semantics; scopes
- * can only remove names, never widen them.
+ * can only remove names, never widen them. `session_history` stays out because child
+ * sessions are ephemeral memory-backed runs: their history never reaches the
+ * host's canonical stream, and their compacted blocks carry no history
+ * guidance line to honor.
  */
 export function effectiveChildToolNames(input: {
   readonly hostNames: readonly string[]
@@ -681,7 +715,7 @@ export function effectiveChildToolNames(input: {
   readonly profileTools?: readonly string[]
   readonly requested?: readonly string[]
 }): string[] {
-  let names = input.hostNames.filter((name) => name !== "agent")
+  let names = input.hostNames.filter((name) => name !== "agent" && name !== "session_history")
   for (const scope of [input.parentTools, input.profileTools, input.requested]) {
     if (scope === undefined || scope.length === 0) continue
     names = names.filter((name) => scope.includes(name))

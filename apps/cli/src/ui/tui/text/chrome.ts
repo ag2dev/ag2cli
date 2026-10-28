@@ -15,6 +15,7 @@
  */
 import type { TextRun } from "./theme.js"
 import { clipText, textWidth } from "./measure.js"
+import { horizontalTabWindow } from "./horizontal-navigation.js"
 
 type RunLine = readonly TextRun[]
 
@@ -23,6 +24,12 @@ export const FRAME_FLOOR_COLUMNS = 20
 
 /** Smallest terminal the frame supports; below it the view collapses to one diagnostic line. */
 export const SUPPORT_FLOOR = { columns: 20, rows: 6 } as const
+
+/** Brand and workspace rows used only when the empty transcript is visible. */
+export function workspaceIntroRows(displayPath: string, width: number): readonly RunLine[] {
+  const path = clipText(displayPath, Math.max(1, width - 5)).text
+  return [[{ text: "", token: "text" }], [{ text: "  >_ AG2CLI", token: "brand" }], [{ text: `     ${path}`, token: "muted" }]]
+}
 
 const CORNER_TOP_LEFT = "╭"
 const CORNER_TOP_RIGHT = "╮"
@@ -38,7 +45,7 @@ const border = (text: string): TextRun => ({ text, token: "border" })
  * through positionally (later runs survive); the walk stops at the first
  * run whose lead grapheme cannot fit.
  */
-function clipRuns(runs: readonly TextRun[], width: number): readonly TextRun[] {
+export function clipTextRuns(runs: readonly TextRun[], width: number): readonly TextRun[] {
   const clipped: TextRun[] = []
   let budget = Math.max(0, Math.floor(width))
   for (const run of runs) {
@@ -55,7 +62,7 @@ function clipRuns(runs: readonly TextRun[], width: number): readonly TextRun[] {
 
 export interface FrameBoxOptions {
   readonly width: number
-  /** Left-aligned top-border title (accent token). */
+  /** Left-aligned top-border title. */
   readonly title?: string
   /** Right-aligned top-border label, e.g. "+3 -1" (muted token). */
   readonly rightTitle?: string
@@ -70,7 +77,7 @@ function titleSegment(label: string | undefined, textBudget: number): readonly T
   if (label === undefined) return []
   const clipped = clipText(label, textBudget).text
   if (clipped.length === 0) return []
-  return [border(" "), { text: clipped, token: "accent" }, border(" ")]
+  return [border(" "), { text: clipped, token: "title" }, border(" ")]
 }
 
 function rightTitleSegment(label: string | undefined, textBudget: number): readonly TextRun[] {
@@ -108,7 +115,7 @@ export function frameInnerWidth(width: number): number {
 /** Frame-render a styled body: clip to the inner width, pad, close the rails. */
 function frameBodyRow(runs: readonly TextRun[], width: number): RunLine {
   const inner = frameInnerWidth(width)
-  const clipped = clipRuns(runs, inner)
+  const clipped = clipTextRuns(runs, inner)
   const used = clipped.reduce((sum, run) => sum + textWidth(run.text), 0)
   const pad = Math.max(0, inner - used)
   return [
@@ -138,34 +145,55 @@ export interface TabRowOptions {
   readonly tabs: readonly string[]
   readonly activeIndex: number
   readonly width: number
+  readonly focused?: boolean
 }
 
 /**
- * Active-tab row: `❮ label ❯` with the label on the selected overlay,
- * plus a `n/m` counter when more than one tab exists. Clipped to width.
+ * Horizontal tab strip: all labels when they fit, otherwise the active
+ * label, nearby labels, explicit overflow, and its position in the set.
  */
 export function tabRow(options: TabRowOptions): RunLine {
   const tabs = options.tabs
   const activeIndex = Math.max(0, Math.min(tabs.length - 1, Math.floor(options.activeIndex)))
-  const active = tabs[activeIndex]
-  if (active === undefined) return []
-  const runs: TextRun[] = [
-    { text: "❮ ", token: "muted" },
-    { text: active, token: "accent", overlays: ["selected"] },
-    { text: " ❯", token: "muted" },
-  ]
-  if (tabs.length > 1) runs.push({ text: `  ${activeIndex + 1}/${tabs.length}`, token: "muted" })
-  return clipRuns(runs, Math.max(1, Math.floor(options.width)))
+  if (tabs.length === 0) return []
+  const window = horizontalTabWindow(tabs, activeIndex, options.width)
+  const runs: TextRun[] = []
+  let segments = 0
+  const separator = (): void => {
+    if (segments > 0) runs.push({ text: " · ", token: "muted" })
+    segments += 1
+  }
+  if (window.start > 0) {
+    separator()
+    runs.push({ text: "‹", token: "muted" })
+  }
+  for (let index = window.start; index < window.end; index += 1) {
+    separator()
+    if (index === activeIndex) {
+      runs.push({ text: "❮ ", token: "muted" })
+      runs.push({ text: tabs[index]!, token: "suggestion", ...(options.focused ? { overlays: ["selected"] as const } : {}) })
+      runs.push({ text: " ❯", token: "muted" })
+    } else runs.push({ text: tabs[index]!, token: "muted" })
+  }
+  if (window.end < tabs.length) {
+    separator()
+    runs.push({ text: "›", token: "muted" })
+  }
+  if (tabs.length > 1) {
+    separator()
+    runs.push({ text: `${activeIndex + 1}/${tabs.length}`, token: "muted" })
+  }
+  return clipTextRuns(runs, Math.max(1, Math.floor(options.width)))
 }
 
 /** Muted key-hint row, clipped to width. */
 export function hintRow(text: string, width: number): RunLine {
   const runs: TextRun[] = [{ text, token: "muted" }]
-  return clipRuns(runs, Math.max(1, Math.floor(width)))
+  return clipTextRuns(runs, Math.max(1, Math.floor(width)))
 }
 
 /**
- * Breadcrumb row: `‹ a · b · current` with the last part accent and the
+ * Breadcrumb row: `‹ a · b · current` with the last part styled as a title and the
  * rest muted. Over-wide rows drop the oldest parts (a leading `…` marks
  * the elision) so the current location always survives; a still-over-wide
  * single part clips.
@@ -180,7 +208,7 @@ export function breadcrumbRow(parts: readonly string[], width: number): RunLine 
     if (ellipsis) runs.push({ text: "…", token: "muted" })
     list.forEach((part, index) => {
       if (index > 0 || ellipsis) runs.push({ text: " · ", token: "muted" })
-      runs.push({ text: part, token: index === list.length - 1 ? "accent" : "muted" })
+      runs.push({ text: part, token: index === list.length - 1 ? "title" : "muted" })
     })
     return runs
   }
@@ -192,5 +220,5 @@ export function breadcrumbRow(parts: readonly string[], width: number): RunLine 
     ellipsis = true
     runs = render(ellipsis, visible)
   }
-  return clipRuns(runs, budget)
+  return clipTextRuns(runs, budget)
 }

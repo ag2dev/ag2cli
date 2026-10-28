@@ -3,6 +3,7 @@ import type { SessionId } from "@ag2cli/core/ids.js"
 import { replaySession } from "@ag2cli/core/session/session-snapshot.js"
 import type { EventStore } from "../../ports/event-store.js"
 import { MAX_CONTEXT_WINDOW_TOKENS } from "@ag2cli/core/model/limits.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { commandIdempotencyConflictError, resolveCommandIdempotency, type CommandIdempotencyFamily } from "./command-idempotency.js"
 import { appendSessionEventsIfRevision } from "./revision-conflict.js"
 import type { SessionAuthority } from "./session-authority.js"
@@ -42,30 +43,19 @@ export interface UpdateSessionContextWindowDependencies {
     nextEventId(): string
     now(): string
   }
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 /** Persist a session-scoped context limit without coupling transport clients to event details. */
 export class UpdateSessionContextWindowUseCase {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
 
   constructor(private readonly deps: UpdateSessionContextWindowDependencies) {}
 
   async execute(input: UpdateSessionContextWindowInput): Promise<UpdateSessionContextWindowResult> {
     validateCommandId(input.commandId)
     validateUpdate(input.update)
-    const previous = this.pending.get(input.sessionId.toString())
-    const operation = (previous ?? Promise.resolve()).then(() => this.executeNow(input))
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(input.sessionId.toString(), tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(input.sessionId.toString()) === tracked) this.pending.delete(input.sessionId.toString())
-    }
+    return this.lane.run(input.sessionId.toString(), () => this.executeNow(input))
   }
 
   private async executeNow(input: UpdateSessionContextWindowInput): Promise<UpdateSessionContextWindowResult> {

@@ -3,6 +3,7 @@ import { resolve } from "node:path"
 import { callModelExecutionProvider } from "../infrastructure/model/call-model-execution-provider.js"
 import { defaultContextBuilder, type RuntimeContextEnvironment } from "@ag2cli/runtime/application/context/default-context-builder.js"
 import { compactContextBuilder, contextCompactor } from "@ag2cli/runtime/application/context/compact-context-builder.js"
+import { estimateRequestUsage } from "@ag2cli/runtime/application/context/compact.js"
 import type { AgentProfile, AgentProfileResolver } from "@ag2cli/runtime/ports/agent-profile.js"
 import { registryToolExecutor } from "../capabilities/tools/registry-tool-executor.js"
 import { guardModelToolExecutor } from "../capabilities/tools/model-tool-executor-guard.js"
@@ -13,8 +14,10 @@ import { modelClientToStream } from "../infrastructure/model/stream-adapter.js"
 import { planId, runId, type SessionId } from "@ag2cli/core/ids.js"
 import type { PlanProvider } from "@ag2cli/runtime/ports/model-provider.js"
 import { createDenyAllApprovalBroker, type ApprovalBroker } from "@ag2cli/runtime/ports/approval-broker.js"
+import type { AskBroker } from "@ag2cli/runtime/ports/ask-broker.js"
 import { createGuardianWaitRegistry, type Guardian } from "@ag2cli/runtime/ports/guardian.js"
 import type { ExecutionModelProvider } from "@ag2cli/runtime/ports/execution-model-provider.js"
+import type { SessionNotesUpdater } from "@ag2cli/runtime/ports/session-notes-store.js"
 import type { ToolExecutor } from "@ag2cli/runtime/ports/tool-executor.js"
 import type { ContextBuilder } from "@ag2cli/runtime/ports/context-builder.js"
 import { createWorkspaceAttachmentLoader } from "../capabilities/context/workspace-attachments.js"
@@ -27,6 +30,7 @@ import { GrepTool } from "../capabilities/tools/grep-tool.js"
 import { BashTool } from "../capabilities/tools/bash-tool.js"
 import { WebFetchTool } from "../capabilities/tools/web-fetch-tool.js"
 import { TodoWriteTool } from "../capabilities/tools/todo-write-tool.js"
+import { SessionHistoryTool } from "../capabilities/tools/session-history-tool.js"
 import { AskUserQuestionTool } from "../capabilities/tools/ask-user-tool.js"
 import type { AskUser } from "@ag2cli/runtime/ports/tool/contract.js"
 import type { ApiToolDefinition } from "@ag2cli/core/tool-facts.js"
@@ -37,7 +41,7 @@ import { BASH_SECURITY_PROMPT } from "../capabilities/security/bash-prompt.js"
 import { ReadFileStateMap } from "../capabilities/tools/file-state.js"
 import { buildSystemPrompt } from "@ag2cli/runtime/application/prompt/system-prompt.js"
 import { buildRuntimeEnvironmentContext } from "../capabilities/context/system-context.js"
-import { buildAgentBehaviorPrompt } from "@ag2cli/runtime/application/prompt/agent-behavior.js"
+import { buildAgentBehaviorPrompt, buildToolRoutingPrompt } from "@ag2cli/runtime/application/prompt/agent-behavior.js"
 import type { MemorySelector } from "@ag2cli/runtime/application/memory/retrieve.js"
 import { SkillTool } from "../capabilities/tools/skill-tool.js"
 import { AgentTool } from "../capabilities/tools/agent-tool.js"
@@ -79,6 +83,13 @@ export interface AgentServerRuntimeOptions extends AgentServerBuildContext {
   /** Expose Bash only to explicit interactive `!` commands, not to the model. */
   readonly enableInteractiveShell?: boolean
   readonly askUser?: AskUser
+  /**
+   * Durable ask_user surface. Injecting it moves ask ownership from the
+   * askUser callback to the canonical lifecycle: the executor parks on
+   * this broker and every answerer — a local card or a remote client —
+   * resolves through the public interaction surface.
+   */
+  readonly ask?: AskBroker
   readonly contextBuilder?: ContextBuilder
   readonly memorySelector?: MemorySelector
   /** Receives safe, read-only composition diagnostics for rich clients. */
@@ -124,6 +135,7 @@ export const RUNTIME_OPTION_KEYS = [
   "guardianDeadlineMs",
   "enableInteractiveShell",
   "askUser",
+  "ask",
   "contextBuilder",
   "memorySelector",
   "onRuntimeStatus",
@@ -227,6 +239,62 @@ export async function createAgentServerFromServices(options: AgentServerRuntimeO
       normalizeModelBashPreparation,
       quoteShellArgs: (argv) => tryQuoteShellArgs([...argv]),
     }
+    const contextOptions = {
+      systemSections: [
+        ...buildSystemPrompt({
+          identity: ["You are AG2CLI, an open-source coding agent and CLI that helps users with software engineering tasks."],
+        }).map((text, index) => ({ id: `identity.${index}`, text })),
+        ...buildAgentBehaviorPrompt(),
+      ],
+      ...(services.policy.responseLanguage === undefined ? {} : { responseLanguage: services.policy.responseLanguage }),
+      dynamicPrompt: (tools: readonly ApiToolDefinition[]) => [
+        ...buildToolRoutingPrompt({ toolNames: tools.map((tool) => tool.name) }),
+        ...(tools.some((tool) => tool.name === "bash") ? [{ id: "policy.bash-security", text: BASH_SECURITY_PROMPT }] : []),
+      ],
+      runtimeContextSource: (environment: RuntimeContextEnvironment) =>
+        buildRuntimeEnvironmentContext(environment, services.workspace.workspaceRoot).join("\n"),
+      // Re-scan on every context build so an external `/memory` editor takes
+      // effect on the next turn without adding a second memory lifecycle.
+      memorySource: services.sources.memory.rescan,
+      ...(options.memorySelector ? { memorySelector: options.memorySelector } : {}),
+      skillSource: services.sources.skills.rescan,
+      ...(services.capabilities.loadProjectInstructions ? { instructionSource: () => services.sources.instructions.load().files } : {}),
+    }
+    const summarizeContext = model === undefined ? undefined : createModelSummarizer(model, services.storage.observability)
+    // Session notes are a main-conversation capability only: the side model
+    // call shares the model layer, and children keep their own plain builder.
+    const sessionNotes =
+      model === undefined
+        ? undefined
+        : {
+            store: services.storage.notesStore,
+            updater: createNotesUpdater(model),
+            eventsSource: (id: SessionId) => services.storage.eventStore.read(id),
+          }
+    const compactCapability = services.capabilities.compact
+    const compactor = summarizeContext
+      ? contextCompactor({
+          summarize: summarizeContext,
+          thresholds: compactCapability.thresholds,
+          toolTokensEstimate: estimateRequestUsage({ messages: [], tools: modelTools.listTools() }).toolTokens,
+          ...(sessionNotes ? { sessionNotes } : {}),
+          transcriptPathFor: services.storage.transcriptPath,
+        })
+      : undefined
+    const contextBuilder =
+      options.contextBuilder ??
+      (summarizeContext
+        ? compactContextBuilder({
+            ...contextOptions,
+            enable: compactCapability.enable,
+            thresholds: compactCapability.thresholds,
+            maxOutputTokens: compactCapability.maxOutputTokens,
+            traceSink: services.storage.traceSink,
+            summarize: summarizeContext,
+            ...(sessionNotes ? { sessionNotes } : {}),
+            transcriptPathFor: services.storage.transcriptPath,
+          })
+        : defaultContextBuilder(contextOptions))
     // The child runner assembles only when a model layer exists; the agent
     // tool stays registered either way and the judgment alone decides
     // visibility. Child permission surfaces are minted per spawn from the
@@ -257,6 +325,21 @@ export async function createAgentServerFromServices(options: AgentServerRuntimeO
         bashSecurity,
         workspacePolicyFactory: (policyOptions) => new WorkspacePolicy(policyOptions),
         workspaceScopeDigest: computeWorkspaceScopeDigest,
+        // Children re-derive their compaction thresholds from their own
+        // model's window facts instead of sharing the parent builder, and
+        // trace compaction to their own per-child sink.
+        ...(summarizeContext === undefined
+          ? {}
+          : {
+              contextBuilderFactory: (modelId?: string) =>
+                compactContextBuilder({
+                  ...contextOptions,
+                  enable: compactCapability.enable,
+                  thresholds: compactCapability.thresholdsForModel(modelId),
+                  traceSink: services.storage.childTraceSinkFactory(),
+                  summarize: summarizeContext,
+                }),
+            }),
         environment: { cwd: process.cwd(), platform: process.platform },
         // The runner assembles before the server exists, so attributed child
         // events flow through the late-bound session transient seam.
@@ -313,40 +396,6 @@ export async function createAgentServerFromServices(options: AgentServerRuntimeO
         : {}),
     }
     options.onRuntimeStatus?.(runtimeStatus)
-    const contextOptions = {
-      basePrompt: buildSystemPrompt({
-        identity: [
-          "You are AG2CLI, an open-source coding agent and CLI that helps users with software engineering tasks.",
-          "For information that depends on the current runtime environment, prefer the runtime context or call the relevant tool instead of guessing from model knowledge.",
-        ],
-      }),
-      ...(services.policy.responseLanguage === undefined ? {} : { responseLanguage: services.policy.responseLanguage }),
-      dynamicPrompt: (tools: readonly ApiToolDefinition[]) => [
-        ...buildAgentBehaviorPrompt({ toolNames: tools.map((tool) => tool.name) }),
-        ...(tools.some((tool) => tool.name === "bash") ? [BASH_SECURITY_PROMPT] : []),
-      ],
-      runtimeContextSource: (environment: RuntimeContextEnvironment) =>
-        buildRuntimeEnvironmentContext(environment, services.workspace.workspaceRoot).join("\n"),
-      // Re-scan on every context build so an external `/memory` editor takes
-      // effect on the next turn without adding a second memory lifecycle.
-      memorySource: services.sources.memory.rescan,
-      ...(options.memorySelector ? { memorySelector: options.memorySelector } : {}),
-      skillSource: services.sources.skills.rescan,
-      ...(services.capabilities.loadProjectInstructions ? { instructionSource: () => services.sources.instructions.load().files } : {}),
-    }
-    const summarizeContext = model === undefined ? undefined : createModelSummarizer(model, services.storage.observability)
-    const compactor = summarizeContext ? contextCompactor({ summarize: summarizeContext }) : undefined
-    const contextBuilder =
-      options.contextBuilder ??
-      (summarizeContext
-        ? compactContextBuilder({
-            ...contextOptions,
-            enable: services.capabilities.compact.enable,
-            thresholds: services.capabilities.compact.thresholds,
-            traceSink: services.storage.traceSink,
-            summarize: summarizeContext,
-          })
-        : defaultContextBuilder(contextOptions))
 
     server = new InProcessSessionServer({
       provider,
@@ -390,12 +439,13 @@ export async function createAgentServerFromServices(options: AgentServerRuntimeO
               tools: modelTools,
               ...(interactiveShell ? { shellTools: interactiveShell } : {}),
               approval,
+              ...(options.ask === undefined ? {} : { ask: options.ask }),
               // Surfaces follow the injected interactive adapters: a host
               // without an ask answerer must not advertise tools whose
               // judgment needs one. The guardian answers auto-mode asks.
               permissionSurfaces: {
                 approvalSurface: options.approval !== undefined || options.guardian !== undefined,
-                interactionSurface: options.askUser !== undefined,
+                interactionSurface: options.askUser !== undefined || options.ask !== undefined,
               },
               ...(options.guardian === undefined ? {} : { guardian: options.guardian }),
               // The configured timeout bounds the whole review race, so the
@@ -434,7 +484,6 @@ export async function createAgentServerFromServices(options: AgentServerRuntimeO
       serialPoint: settledServer.policySerialPoint,
       notify: (id, text) => settledServer.enqueueHostNotification(id, text),
     })
-    await server.recoverUnfinishedRuns()
     return server
   } catch (error) {
     try {
@@ -486,6 +535,11 @@ async function createCoreTools(
     new GrepTool(),
     new TodoWriteTool(),
   )
+  // Session history is bound to the executing session's canonical stream —
+  // the tool resolves the store through the executor's execution context,
+  // never a model-supplied path. Children never see it: the child runner
+  // drops the name from their pool.
+  registry.register(new SessionHistoryTool({ events: (sessionId) => services.storage.eventStore.read(sessionId) }))
   // ask_user is part of the fixed launch set: its visibility belongs to the
   // permission judgment — whose interaction-surface fact derives from the
   // injected askUser adapter — not to registration, so a surface-less host
@@ -536,4 +590,19 @@ async function createCoreTools(
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return
   throw signal.reason instanceof Error ? signal.reason : new DOMException("headless operation cancelled", "AbortError")
+}
+
+/**
+ * Side model call that rewrites the notes body. The updater port returns
+ * body text only, so unlike the summarizer there is no model-call
+ * observation channel on this path.
+ */
+function createNotesUpdater(model: ExecutionModelProvider): SessionNotesUpdater {
+  return async ({ sessionId, messages, signal }) => {
+    const response = await model.generate({ sessionId, runId: runId(randomUUID()), messages, tools: [], signal })
+    return response.message.content
+      .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
+      .map((block) => block.text)
+      .join("")
+  }
 }

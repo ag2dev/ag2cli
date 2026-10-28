@@ -21,6 +21,10 @@ export class NdjsonAppServerTransport implements AppServerTransport {
   private readonly decoder = new TextDecoder()
   private readonly encoder = new TextEncoder()
   private readonly reader: ByteStreamReader
+  // Deliberately hand-rolled: this public client toolkit depends only on
+  // the protocol package, and remote browser clients consume it
+  // dependency-free — the shared concurrency primitive would drag the
+  // runtime package transitively into every remote consumer.
   private writeChain = Promise.resolve()
   private closed = false
   private buffer = ""

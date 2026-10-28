@@ -1,6 +1,6 @@
 import type { RunId, TaskId } from "../ids.js"
 
-export type BackgroundTaskType = "agent" | "shell" | "loop"
+export type BackgroundTaskType = "agent" | "shell" | "user_shell" | "loop"
 export type BackgroundTaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled"
 
 /** The durable state shared by the TUI, headless clients and future app clients. */
@@ -12,6 +12,9 @@ export interface TaskSnapshot {
   readonly createdAt: string
   readonly prompt?: string
   readonly argv?: readonly string[]
+  readonly command?: string
+  readonly cwd?: string
+  readonly timeoutMs?: number
   readonly intervalMs?: number
   readonly maxRuns?: number
   readonly runCount: number

@@ -83,9 +83,8 @@ export class AskUserQuestionTool implements Tool<typeof inputSchema> {
     }
     const hasChat = answers.some((answer) => answer.action === "chat")
     // Decline is explicit only (an empty answer array or cancel actions).
-    // An "answered" row with no selection means the user submitted a
-    // multi-select without toggling anything — "none of these" is an
-    // answer, not a hard rejection.
+    // A multi-select may combine choices and free text, but an empty row is
+    // not a valid answer; submitted empty rows are rejected at resolution.
     const hasDeclined = answers.length === 0 || answers.some((answer) => answer.action === "cancel")
     const outcome: AskUserOutcome = hasChat ? "rejected" : hasDeclined ? "declined" : "answered"
     if (outcome === "rejected") {

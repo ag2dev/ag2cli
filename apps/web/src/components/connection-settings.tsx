@@ -13,6 +13,7 @@ const identities = createBrowserDeviceIdentityStore()
 
 export function ConnectionSettings({ client, onClose, connected }: { client: BrowserClient; onClose: () => void; connected: boolean }) {
   const [endpoint, setEndpoint] = useState(readPreference("endpoint") ?? "ws://127.0.0.1:8787/app-server")
+  const [hostId, setHostId] = useState("")
   const [token, setToken] = useState("")
   const [link, setLink] = useState("")
   const [busy, setBusy] = useState(false)
@@ -41,7 +42,9 @@ export function ConnectionSettings({ client, onClose, connected }: { client: Bro
         const url = new URL(address)
         if (!["ws:", "wss:"].includes(url.protocol)) throw new Error("Use a ws:// or wss:// App Server endpoint.")
         identity = await identities.load(browserDeviceStorageKey(address))
-        if (token.trim()) identity = await pairBrowserDevice(address, browserClientId(), token.trim())
+        if (token.trim()) {
+          identity = await pairBrowserDevice(address, browserClientId(), token.trim(), { expectedHostId: hostId.trim() })
+        }
       }
       if (identity) await identities.save(browserDeviceStorageKey(address), identity)
     } catch (cause) {
@@ -108,6 +111,20 @@ export function ConnectionSettings({ client, onClose, connected }: { client: Bro
               value={endpoint}
               onChange={(event) => setEndpoint(event.target.value)}
               placeholder="ws://127.0.0.1:8787/app-server"
+              className="h-9 text-xs"
+            />
+          </label>
+          <label className="flex flex-col gap-1.5 text-xs font-medium">
+            Expected Host ID
+            <span className="text-[10px] font-normal leading-relaxed text-muted-foreground">
+              Required when pairing with an operator token. Compare it with the Host ID printed by the server.
+            </span>
+            <Input
+              required={Boolean(token.trim()) && !link.trim()}
+              autoComplete="off"
+              value={hostId}
+              onChange={(event) => setHostId(event.target.value)}
+              placeholder="ag2cli-host.v1.…"
               className="h-9 text-xs"
             />
           </label>

@@ -1,14 +1,14 @@
 /**
  * Skill loading layer.
  *
- * A skill is a loadable set of operational instructions: when the model encounters a matching scenario,
- * it follows the skill's instruction body to complete a multi-step workflow. The format is minimal: one Markdown file per skill
+ * A skill is a loadable set of task steps: when the model encounters a matching scenario,
+ * it may follow applicable steps within the user's request. The format is minimal: one Markdown file per skill
  * (frontmatter + instruction body). After loading, the skill list is added to the system prompt so the model knows
- * which capabilities are available; the skill tool executes the instructions.
+ * which capabilities are available; the skill tool returns the body but does not execute the steps.
  *
  * Difference from memory:
  *  - memory = facts (who/what), recalled and injected passively;
- *  - skill = instructions (how to do something), selected and executed deliberately.
+ *  - skill = task guidance (how to do something), selected and followed within the user's request.
  * Their structure is similar (frontmatter files), but their semantics and injection methods differ, so they remain separate modules.
  *
  * Format:

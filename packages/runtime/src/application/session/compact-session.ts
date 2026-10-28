@@ -55,7 +55,7 @@ export interface CompactSessionDependencies {
   /** Optional cross-process guard used by local durable compositions. */
   readonly executionReservation?: SessionExecutionReservation
   readonly reservationOwnerId?: string
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 /** Server-independent application operation for explicit session compaction. */

@@ -1,31 +1,40 @@
 /**
  * TUI process entrypoint: TTY guards, argument parsing, configuration,
- * the embedded runtime and the process wiring around the TUI Ink host.
- * The interactive tree is wired exclusively through createTuiInkHost;
- * this file owns what cannot live there — config, the model client and
- * runtime build, session selection, signals and process exit.
+ * the embedded runtime and the process wiring around the kernel entry
+ * and the Ink frame. The interactive tree is wired exclusively through
+ * createTuiEntry + createInkTuiFrame; this file owns what cannot live
+ * there — config, the model client and runtime build, session
+ * selection, signals and process exit.
  */
-import { randomUUID } from "node:crypto"
 import type { Dirent } from "node:fs"
 import { readdir } from "node:fs/promises"
+import { homedir } from "node:os"
 import { basename, dirname, join, relative, sep } from "node:path"
-import { sessionId as mintSessionId } from "@ag2cli/core/ids.js"
-import { createPendingApprovalBroker } from "@ag2cli/runtime/ports/approval-broker.js"
 import { parseGitDiff, readGitDiff } from "../capabilities/workspace/git-diff.js"
 import { cleanupScratchRoots } from "../capabilities/security/scratch.js"
 import { drainChildAgents, type ChildAgentRunner } from "../capabilities/execution/child-agent-runner.js"
 import { loadRuntimeConfig, loadTuiThemePreference } from "../config/runtime.js"
 import { guardianReviewDeadlineMs, pickGuardian, pickModelClient } from "../composition/model-client.js"
+import { resolveTuiProviderIdentity } from "../composition/tui-provider-identity.js"
 import { createTuiEmbeddedSession } from "../composition/tui-embedded-session.js"
-import { createTuiInkHost, type CompletionItem } from "../composition/tui-ink-host.js"
+import { createTuiEntry, type CompletionItem, type TuiEntry } from "../composition/tui-entry.js"
+import { createTuiSessionId } from "../composition/tui-session-id.js"
+import { openTuiPublicSession } from "../composition/tui-public-session.js"
+import { createTuiResumeSeam } from "../composition/tui-resume-seam.js"
 import { buildTuiRuntime } from "../composition/tui-runtime.js"
-import { createChildApprovalRunnerSurface } from "../composition/child-approval-bridge.js"
+import { createChildDecisionSurface } from "../composition/child-decision-surface.js"
+import {
+  createChildApprovalBridge,
+  createChildApprovalRunnerSurface,
+  type ChildApprovalBridge,
+} from "../composition/child-approval-bridge.js"
 import { createTuiScreen } from "../composition/tui-screen-terminal.js"
+import { workspaceIntroLines, type TuiStartupScreen } from "../composition/tui-startup-screen.js"
+import { createTuiPreferencesCoordinator } from "../composition/tui-preferences.js"
+import { createTuiPreferenceStore } from "../infrastructure/persistence/tui-preference-store.js"
 import { createTuiHistoryStore, resolveTuiHistoryPath } from "../infrastructure/persistence/tui-history-store.js"
-import { createTuiThemePreferenceStore } from "../infrastructure/persistence/tui-theme-preference-store.js"
-import { connectSession } from "../public/sdk.js"
 import { parseTuiProcessArgs, TUI_PROCESS_HELP, type TuiProcessArgs } from "../interfaces/cli/tui-process-args.js"
-import { SUPPORT_FLOOR } from "../ui/tui/bootstrap/ink.js"
+import { createInkTuiFrame, SUPPORT_FLOOR, type InkTuiFrame } from "../ui/tui/bootstrap/ink.js"
 
 const RUNTIME_CLOSE_TIMEOUT_MS = 2_000
 
@@ -146,26 +155,23 @@ async function prepareStartup(args: TuiProcessArgs, workspaceRoot: string) {
     ...(args.configPath === undefined ? {} : { configPath: args.configPath }),
   })
   const themePreference = loadTuiThemePreference(args.configPath, process.env, workspaceRoot)
-  const historyStore = createTuiHistoryStore(resolveTuiHistoryPath(config.applicationHome))
-  const modelClient = await pickModelClient(config)
-  const guardian = await pickGuardian(config)
+  const modelClient = await pickModelClient(config, { onModelMiss: null })
+  const guardian = await pickGuardian(config, { onModelMiss: null })
   const guardianDeadlineMs = guardianReviewDeadlineMs(config)
   const mentionItems = await readWorkspaceCompletionItems(workspaceRoot)
   return {
     config,
     themePreference,
-    historyStore,
     modelClient,
     guardian,
     guardianDeadlineMs,
+    providerIdentity: resolveTuiProviderIdentity(config),
     mentionItems,
-    history: await historyStore.load(),
-    modelDisplayName: config.provider.model ?? "configured-model",
   }
 }
 
-/** Process entrypoint: argument + TTY guards, config and runtime, then the Ink host until exit. */
-export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<void> {
+/** Process entrypoint: argument + TTY guards, config and runtime, then the kernel entry and Ink frame until exit. */
+export async function main(argv: readonly string[] = process.argv.slice(2), startupScreen?: TuiStartupScreen): Promise<void> {
   const args = parseTuiProcessArgs(argv)
   if ("help" in args) {
     process.stdout.write(`${TUI_PROCESS_HELP}\n`)
@@ -191,6 +197,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     return
   }
   const workspaceRoot = process.cwd()
+  const homeDirectory = homedir()
   let startup: Awaited<ReturnType<typeof prepareStartup>>
   try {
     startup = await prepareStartup(args, workspaceRoot)
@@ -199,30 +206,80 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     process.exitCode = 1
     return
   }
+  const promptHistory = createTuiHistoryStore(resolveTuiHistoryPath(startup.config.applicationHome))
+  await promptHistory.load()
   // From here the screen owns stdin, so every failure path exits the
   // process directly instead of returning into a held-open event loop.
-  const screen = createTuiScreen({ mouseTracking: args.noMouse !== true })
-  // Late-bound runtime: the host must exist first (the runtime build
-  // injects the host's ask bridge), and the factory only runs inside
-  // host.start/switchSession — after the runtime is set.
+  // A handed-in startup screen is adopted as-is: it already prepared,
+  // activated and painted, and the frame's idempotent prepare/activate
+  // reuse it without a second buffer switch.
+  const screen = startupScreen?.screen ?? createTuiScreen({ mouseTracking: args.noMouse !== true })
+  // Late-bound assembly: the runtime build wires the child approval
+  // bridge, the entry receives a session factory that needs that
+  // runtime, and the theme coordinator is built before the frame it
+  // swaps — shutdown reaches all of them through these holders.
   let runtime: Awaited<ReturnType<typeof buildTuiRuntime>> | null = null
-  let host: ReturnType<typeof createTuiInkHost> | null = null
-  // The runtime build hands the assembled child-agent runner over; the
-  // host's cancel-child effect speaks to it (children are process-local).
+  let entry: TuiEntry | undefined
+  let frame: InkTuiFrame | undefined
+  // The runtime build hands the assembled child-agent runner over;
+  // shutdown drains it (children are process-local).
   let childRunner: ChildAgentRunner | null = null
+  // Deliberately hand-rolled: shutdown memoizes forever, failure included —
+  // a run-once guard that evicts on failure would newly allow re-running a
+  // failed shutdown.
   let shutdownPromise: Promise<void> | undefined
+  // The public session factory is late-bound with the runtime: one TUI
+  // process embeds exactly one entry and one workspace, so every embedded
+  // session opens the public contract over that host.
+  const publicSessionFor = (session: string) => {
+    if (runtime === null) {
+      throw new Error("the TUI session factory needs a built runtime and a selected session")
+    }
+    return openTuiPublicSession({
+      host: runtime,
+      sessionId: session,
+      workspaceRoot,
+      guardianAvailable: startup.guardian !== undefined,
+    })
+  }
   const shutdown = (requestedExitCode: number): Promise<void> => {
     if (shutdownPromise !== undefined) return shutdownPromise
     shutdownPromise = (async () => {
       let exitCode = requestedExitCode
+      // The frame first: it fences input and restores the terminal
+      // while the session loop can still dispatch.
       try {
-        await host?.stop()
+        await frame?.stop()
       } catch (error) {
-        process.stderr.write(`\r\n[tui shutdown] host cleanup failed: ${error instanceof Error ? error.message : String(error)}\r\n`)
+        process.stderr.write(`\r\n[tui shutdown] frame cleanup failed: ${error instanceof Error ? error.message : String(error)}\r\n`)
+        if (exitCode === 0) exitCode = 1
+      }
+      entry?.kernel.dispose?.()
+      // An adopted startup screen is already active while no frame
+      // exists yet; a failure in that window must still restore the
+      // terminal before the process exits.
+      if (frame === undefined) {
+        try {
+          screen.teardown()
+          await screen.flush()
+        } catch (error) {
+          process.stderr.write(`\r\n[tui shutdown] screen cleanup failed: ${error instanceof Error ? error.message : String(error)}\r\n`)
+          if (exitCode === 0) exitCode = 1
+        } finally {
+          screen.finishShutdown()
+        }
+      }
+      // Then the session loop: teardown kills the hooks and the
+      // generation fence every abandoned observation rode.
+      try {
+        await entry?.teardown()
+      } catch (error) {
+        process.stderr.write(`\r\n[tui shutdown] session teardown failed: ${error instanceof Error ? error.message : String(error)}\r\n`)
         if (exitCode === 0) exitCode = 1
       }
       // Async children are process-local: their terminals must land in
-      // durable history before the runtime that writes it closes.
+      // durable history before the runtime that writes it closes. The
+      // entry teardown already swept the bridged cards closed.
       if (childRunner !== null) await drainChildAgents(childRunner)
       if (runtime !== null) {
         const close = waitBounded(
@@ -246,40 +303,48 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     return shutdownPromise
   }
   try {
-    host = createTuiInkHost({
-      screen,
-      // Auto mode joins the mode picker only when its reviewer resolved.
-      guardianAvailable: startup.guardian !== undefined,
+    const preferences = createTuiPreferencesCoordinator({
+      initialTheme: startup.themePreference.theme,
+      configPath: startup.themePreference.configPath,
+      store: createTuiPreferenceStore(),
+      // The coordinator exists before the frame it swaps, so the live
+      // re-render reaches the frame through the holder above.
+      onThemeChange: (next) => frame?.setTheme(next),
+    })
+    // Child cards ride the kernel's decision chain: the surface raises
+    // bridge tokens as ask/approval facts, and the entry's executor
+    // settles them back onto the bridge.
+    const childDecisions = createChildDecisionSurface(() => childApprovals)
+    const childApprovals: ChildApprovalBridge = createChildApprovalBridge(childDecisions.surface)
+    const resumeSeam = createTuiResumeSeam(() => runtime?.catalog ?? null)
+    const createdEntry = createTuiEntry({
+      workspaceRoot,
       createSession: (context) => {
-        if (runtime === null || context.sessionId === undefined) {
+        if (context.sessionId === undefined) {
           throw new Error("the TUI session factory needs a built runtime and a selected session")
         }
-        return createTuiEmbeddedSession({
-          client: connectSession(runtime.sessionServer, context.sessionId),
-          writer: context.writer,
-          // A fresh session's log holds no SessionCreated yet; the first
-          // directory add needs a root to mint it from.
-          workspaceRoot,
-          ...context.hooks,
-          answers: context.ask,
-          agents: context.agents,
-        })
+        return {
+          session: createTuiEmbeddedSession({
+            session: publicSessionFor(context.sessionId),
+            writer: context.writer,
+            // A fresh session's log holds no directory facts yet; the
+            // first directory add needs a root to mint from.
+            workspaceRoot,
+            ...context.hooks,
+            agents: context.agents,
+          }),
+          sessionId: context.sessionId,
+        }
       },
-      identity: { brand: "ag2cli", workspace: workspaceRoot, model: startup.modelDisplayName },
-      initialTheme: startup.themePreference.theme,
-      ...(startup.themePreference.configPath === undefined ? {} : { themeConfigPath: startup.themePreference.configPath }),
-      themePreference: createTuiThemePreferenceStore(),
-      firstRunThemeSelection: startup.themePreference.source === "default",
-      providerName: startup.config.provider.protocol,
-      modelName: startup.modelDisplayName,
-      ...(startup.config.provider.baseURL === undefined ? {} : { endpoint: startup.config.provider.baseURL }),
-      ...(startup.config.provider.contextWindow === undefined ? {} : { contextWindow: startup.config.provider.contextWindow }),
-      effort: startup.config.ui.effort,
+      preferences,
+      promptHistory,
       completion: { mention: () => startup.mentionItems },
-      history: startup.history,
-      onHistory: (text) => {
-        void startup.historyStore.add(text)
-      },
+      provider: () => ({
+        label: startup.providerIdentity.providerName,
+        modelName: startup.providerIdentity.modelName,
+        endpoint: startup.providerIdentity.endpoint,
+        protocol: startup.providerIdentity.protocol,
+      }),
       diffFiles: {
         files: async (signal?: AbortSignal) =>
           parseGitDiff(await readGitDiff(workspaceRoot, signal)).map((file) => ({
@@ -292,50 +357,67 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
             diff: file.diff,
           })),
       },
-      sessions: {
-        list: async () => {
-          const records = (await runtime?.catalog.list()) ?? []
-          return records
-            .filter((record) => !record.archived)
-            .map((record) => ({
-              sessionId: `${record.sessionId}`,
-              ...(record.title === undefined ? {} : { title: record.title }),
-              lastRevision: record.snapshot.lastRevision,
-            }))
-        },
-      },
+      resumeSessions: resumeSeam.resumeSessions,
+      setSessionTitleIfAbsent: resumeSeam.setTitleIfAbsent,
+      resumeGate: resumeSeam.resumeGate,
+      childDecisions,
+      // The registry is process-scoped: the lever reads the live runner
+      // regardless of the session binding, and a settled id answers false.
+      cancelChild: (childId) => childRunner?.cancelChild(childId) ?? false,
       onExit: () => {
         void shutdown(0)
       },
-      onCancelChild: (childSessionId) => {
-        childRunner?.cancelChild(childSessionId)
-      },
       onFatal: (reason) => {
-        // The frame fault already restored the host terminal; exit is
-        // now queued behind runtime close and the terminal output barrier.
         process.stderr.write(`\r\n[tui fatal] ${reason}\r\n`)
         void shutdown(1)
       },
     })
-    // Signal/stdin-end first fence screen input; the host then unmounts Ink,
-    // waits for its output barrier, restores Screen, and closes the runtime.
+    entry = createdEntry
+    childDecisions.bind(createdEntry.kernel)
+    // Signal/stdin-end first fence screen input; shutdown then unmounts
+    // the frame, tears the session loop down, and closes the runtime.
     screen.onTerminationRequest(() => {
       void shutdown(0)
     })
+    // Input-ownership swap: take, adopt and stand-down run as one
+    // synchronous block, and the frame created right after registers its
+    // input handler before any further byte can arrive. The stand-down
+    // also flips the tty from the splash's canonical mode to raw inside
+    // this block — the mode flip preserves queued input — so lines
+    // typed before, during and after the swap each land exactly once.
+    const bufferedKeys = startupScreen?.takeTypeAhead() ?? ""
+    if (bufferedKeys.length > 0) createdEntry.kernel.adoptTypeAhead(bufferedKeys)
+    // The startup screen's own early-exit guards stand down only now:
+    // the termination fence above is in place, so a Ctrl+C during the
+    // runtime build reaches shutdown instead of a raw process exit.
+    startupScreen?.handoff()
+    const createdFrame = createInkTuiFrame({
+      screen,
+      kernel: createdEntry.kernel,
+      theme: startup.themePreference.theme,
+      intro: (width) => workspaceIntroLines(workspaceRoot, homeDirectory, width),
+      onFatal: (reason) => {
+        // The frame fault already restored the terminal; exit is now
+        // queued behind session teardown, runtime close and the
+        // terminal output barrier.
+        process.stderr.write(`\r\n[tui fatal] ${reason}\r\n`)
+        void shutdown(1)
+      },
+    })
+    frame = createdFrame
     // Process-private embedded host; the TUI never reads discovery and
-    // never connects a daemon. A pending approval broker parks ask-classed
-    // tools on ToolApprovalRequested until the approval card resolves them.
+    // never connects a daemon. Pending brokers park ask-classed tools on
+    // the durable interactions until a decision resolves them through the
+    // public resolution surface.
     runtime = await buildTuiRuntime({
       client: startup.modelClient,
-      approval: createPendingApprovalBroker(),
-      // Attributed child asks bubble onto the host's child approval cards
-      // through the same bridge the cards settle through.
-      childApprovals: createChildApprovalRunnerSurface(host.childApprovals),
+      // Attributed child asks settle fail-closed through the same
+      // bridge the runner raises them onto.
+      childApprovals: createChildApprovalRunnerSurface(childApprovals),
       // Auto-mode asks are answered by this reviewer alone, bounded by the
       // configured whole-review deadline from the same startup snapshot.
       ...(startup.guardian === undefined ? {} : { guardian: startup.guardian }),
       ...(startup.guardianDeadlineMs === undefined ? {} : { guardianDeadlineMs: startup.guardianDeadlineMs }),
-      askUser: host.ask.askUser,
       onChildRunner: (runner) => {
         childRunner = runner
       },
@@ -355,20 +437,24 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
         .sort((left, right) => right.snapshot.lastRevision - left.snapshot.lastRevision || right.createdAt.localeCompare(left.createdAt))[0]
       selectedSessionId = latest === undefined ? undefined : `${latest.sessionId}`
     }
-    const initialSessionId = selectedSessionId ?? randomUUID()
+    const initialSessionId = selectedSessionId ?? createTuiSessionId()
     // The session exists before anything connects: a fresh id lands in
     // the catalog, a resumed one is already there.
-    const catalogId = mintSessionId(initialSessionId)
-    if ((await runtime.catalog.get(catalogId)) === undefined) {
-      await runtime.catalog.create(catalogId, workspaceRoot)
+    await publicSessionFor(initialSessionId).ensureSession()
+    await createdEntry.start({ sessionId: initialSessionId })
+    if (startupScreen?.preparation.ok === true) {
+      // The splash tail has no line break. Clear it through the same
+      // screen FIFO and flush barrier before Ink writes its first frame.
+      screen.frame("\u001b[2J\u001b[H")
+      await screen.flush()
     }
-    const preparation = await host.start({ sessionId: initialSessionId })
+    const preparation = createdFrame.start()
     if (!preparation.ok) {
       process.stderr.write(`${preparation.diagnostics}\n`)
       await shutdown(1)
       return
     }
-    await host.flush()
+    await createdFrame.flush()
   } catch (error) {
     process.stderr.write(`tui startup failed: ${error instanceof Error ? error.message : String(error)}\n`)
     await shutdown(1)

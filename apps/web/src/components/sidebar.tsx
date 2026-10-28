@@ -2,7 +2,6 @@ import { ChevronRight, Folder, MessageSquare, Search, SquarePen, Terminal } from
 import { useEffect, useRef, useState } from "react"
 import { cn } from "../lib/utils"
 import type { BrowserClientState } from "../lib/browser-client"
-import type { PendingApproval } from "../lib/conversation"
 import {
   Sidebar,
   SidebarContent,
@@ -26,13 +25,13 @@ export function workspaceName(root: string): string {
 
 interface AppSidebarProps {
   state: BrowserClientState
-  approvals: readonly PendingApproval[]
+  pendingCount: number
   onNew: (workspaceId?: string) => void
   onSelect: (sessionId: string) => void
   onConnection: () => void
 }
 
-export function AppSidebar({ state, approvals, onNew, onSelect, onConnection }: AppSidebarProps) {
+export function AppSidebar({ state, pendingCount, onNew, onSelect, onConnection }: AppSidebarProps) {
   const [search, setSearch] = useState("")
   // Fold state lives outside the search-swapped subtree so it survives body swaps.
   const [folded, setFolded] = useState<Record<string, boolean>>({})
@@ -96,7 +95,7 @@ export function AppSidebar({ state, approvals, onNew, onSelect, onConnection }: 
                 <SidebarMenu>
                   {matches.length ? (
                     matches.map((session) => {
-                      const workspace = state.workspaces.find((item) => item.workspaceId === session.workspaceId)
+                      const workspace = state.workspaces.find((item) => item.workspaceId === session.workspace.workspaceId)
                       return (
                         <SidebarMenuItem key={session.sessionId}>
                           <SidebarMenuButton
@@ -127,7 +126,7 @@ export function AppSidebar({ state, approvals, onNew, onSelect, onConnection }: 
             {state.workspaces.length ? (
               state.workspaces.map((workspace) => {
                 const name = workspaceName(workspace.workspaceRoot)
-                const sessions = state.sessions.filter((session) => session.workspaceId === workspace.workspaceId)
+                const sessions = state.sessions.filter((session) => session.workspace.workspaceId === workspace.workspaceId)
                 const isFolded = folded[workspace.workspaceId] ?? false
                 return (
                   <SidebarGroup key={workspace.workspaceId}>
@@ -166,8 +165,8 @@ export function AppSidebar({ state, approvals, onNew, onSelect, onConnection }: 
                               >
                                 <MessageSquare />
                                 <span>{session.title ?? "Untitled conversation"}</span>
-                                {state.activeSessionId === session.sessionId && approvals.length > 0 ? (
-                                  <span className="ml-auto size-1.5 shrink-0 rounded-full bg-destructive" title="Waiting for approval" />
+                                {state.activeSessionId === session.sessionId && pendingCount > 0 ? (
+                                  <span className="ml-auto size-1.5 shrink-0 rounded-full bg-destructive" title="Waiting for your input" />
                                 ) : null}
                               </SidebarMenuButton>
                             </SidebarMenuItem>

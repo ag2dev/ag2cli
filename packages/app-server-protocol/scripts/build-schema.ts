@@ -8,7 +8,7 @@
 import { mkdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { zodToJsonSchema } from "zod-to-json-schema"
-import { APP_SERVER_METHOD_PARAM_SCHEMAS, APP_SERVER_NOTIFICATION_SCHEMAS } from "../src/schema.js"
+import { APP_SERVER_METHOD_PARAM_SCHEMAS, APP_SERVER_METHOD_RESULT_SCHEMAS, APP_SERVER_NOTIFICATION_SCHEMAS } from "../src/schema.js"
 
 const outputDir = path.join(import.meta.dirname, "..", "dist", "schema")
 
@@ -22,13 +22,18 @@ async function main(): Promise<void> {
     await writeFile(path.join(outputDir, "methods", `${method}.params.json`), `${JSON.stringify(jsonSchema, null, 2)}\n`)
   }
 
+  for (const [method, schema] of Object.entries(APP_SERVER_METHOD_RESULT_SCHEMAS)) {
+    const jsonSchema = zodToJsonSchema(schema, { name: `${method}.result`, target: "jsonSchema7" })
+    await writeFile(path.join(outputDir, "methods", `${method}.result.json`), `${JSON.stringify(jsonSchema, null, 2)}\n`)
+  }
+
   for (const [method, schema] of Object.entries(APP_SERVER_NOTIFICATION_SCHEMAS)) {
     const jsonSchema = zodToJsonSchema(schema, { name: `${method}.params`, target: "jsonSchema7" })
     await writeFile(path.join(outputDir, "notifications", `${method}.params.json`), `${JSON.stringify(jsonSchema, null, 2)}\n`)
   }
 
   console.log(
-    `Wrote ${Object.keys(APP_SERVER_METHOD_PARAM_SCHEMAS).length} method schemas and ${Object.keys(APP_SERVER_NOTIFICATION_SCHEMAS).length} notification schemas to ${outputDir}`,
+    `Wrote ${Object.keys(APP_SERVER_METHOD_PARAM_SCHEMAS).length} method schemas, ${Object.keys(APP_SERVER_METHOD_RESULT_SCHEMAS).length} result schemas, and ${Object.keys(APP_SERVER_NOTIFICATION_SCHEMAS).length} notification schemas to ${outputDir}`,
   )
 }
 

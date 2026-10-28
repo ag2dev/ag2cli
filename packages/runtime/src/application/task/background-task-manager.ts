@@ -23,7 +23,9 @@ export class BackgroundTaskManager {
   async create(sessionId: SessionId, input: Parameters<BackgroundTaskRegistry["create"]>[1]): Promise<TaskSnapshot> {
     // Background execution is unavailable in this assembly; creating a task
     // that could never run must fail closed instead of queueing silently.
-    if (this.executor === undefined) throw new Error("Background task execution is unavailable")
+    if (this.executor === undefined || this.executor.canRun?.(input) === false) {
+      throw new Error("Background task execution is unavailable")
+    }
     const task = await this.registry.create(sessionId, input)
     if (this.executor && task.type === "loop") {
       this.scheduleLoop(sessionId, task)
@@ -39,6 +41,7 @@ export class BackgroundTaskManager {
     if (this.executor) {
       for (const task of tasks) {
         if (task.status !== "queued") continue
+        if (this.executor.canRun?.(task) === false) continue
         if (task.type === "loop" && task.nextRunAt) this.scheduleLoop(sessionId, task)
         else if (task.type !== "loop") this.launch(sessionId, task)
       }

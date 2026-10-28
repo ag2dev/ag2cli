@@ -34,6 +34,7 @@ import type {
   ToolDiffHunk,
   ToolDiffLine,
   ToolStatus,
+  PublicToolStatus,
   TranscriptBlock,
   TranscriptTextBlock,
 } from "./index.js"
@@ -68,6 +69,8 @@ export interface DurableBlockInput {
   readonly kind: TextBlockKind
   readonly body: string
   readonly inputId?: string
+  /** Canonical acceptance instant for a user input. */
+  readonly acceptedAt?: string
   /**
    * Run association carried onto the block: assistant turns reconcile by
    * it, shell rows claim by it, and user/status/error rows keep it for
@@ -90,6 +93,7 @@ export interface ToolApplyInput {
   readonly name: string
   readonly input?: unknown
   readonly status: ToolStatus
+  readonly toolStatus?: PublicToolStatus
   readonly result?: string
   readonly partialInput?: string
   /** Expand/collapse toggle; canonical upserts omit it so the flag survives. */
@@ -305,12 +309,14 @@ function boundDiff(diff: unknown): ToolDiff | undefined {
     const totals = [candidate.addedLines, candidate.removedLines, candidate.sites]
     if (totals.some((value) => typeof value !== "number" || !Number.isInteger(value) || value < 0)) throw new Error("totals")
     if (candidate.truncated !== undefined && typeof candidate.truncated !== "boolean") throw new Error("truncated")
+    if (candidate.previewAvailable !== undefined && typeof candidate.previewAvailable !== "boolean") throw new Error("previewAvailable")
     const clean: ToolDiff = {
       hunks,
       addedLines: candidate.addedLines as number,
       removedLines: candidate.removedLines as number,
       sites: candidate.sites as number,
       ...(candidate.truncated === undefined ? {} : { truncated: candidate.truncated }),
+      ...(candidate.previewAvailable === undefined ? {} : { previewAvailable: candidate.previewAvailable }),
     }
     const serialized = JSON.stringify(clean)
     if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > MAX_TEXT_BYTES) return undefined
@@ -417,6 +423,11 @@ function mergedToolBlock(
     input: resolvedInput,
     title: toolTitle(resolvedInput),
     status: input.status,
+    ...(input.toolStatus !== undefined
+      ? { toolStatus: input.toolStatus }
+      : previous?.toolStatus !== undefined
+        ? { toolStatus: previous.toolStatus }
+        : {}),
     collapsed: input.collapsed ?? previous?.collapsed ?? true,
     ...(input.startedAt !== undefined
       ? { startedAt: input.startedAt }
@@ -652,16 +663,30 @@ export function createSessionProjection(options: ProjectionOptions = {}): TuiSes
     }
   }
   /** Claim a pending user row for a durable echo; false means plain append. */
-  const claimPendingUser = (text: string): boolean => {
+  const claimPendingUser = (input: DurableBlockInput): boolean => {
     if (pendingUserIndexes.length === 0) return false
     const matches = (index: number): boolean => {
       const row = transcript[index]
-      return row?.kind === "user" && row.body === text
+      return row?.kind === "user" && row.body === input.body
     }
     const at = pendingUserIndexes.findIndex(matches)
     const claimed = at >= 0 ? at : pendingUserIndexes.findIndex((index) => transcript[index]?.kind === "user")
     if (claimed < 0) return false
-    pendingUserIndexes.splice(claimed, 1)
+    const [index] = pendingUserIndexes.splice(claimed, 1)
+    const row = index === undefined ? undefined : transcript[index]
+    if (row?.kind === "user" && (input.inputId !== undefined || input.acceptedAt !== undefined)) {
+      transcript = transcript.map((entry, candidateIndex) =>
+        candidateIndex === index
+          ? {
+              ...row,
+              ...(input.inputId === undefined ? {} : { inputId: input.inputId }),
+              ...(input.acceptedAt === undefined ? {} : { acceptedAt: input.acceptedAt }),
+            }
+          : entry,
+      )
+      noteReplaceAt(index)
+      bump()
+    }
     return true
   }
   const shellRelatedRunIds = (runId: string): Set<string> => {
@@ -774,10 +799,19 @@ export function createSessionProjection(options: ProjectionOptions = {}): TuiSes
     if (row?.kind !== "shell") return true
     const relatedRunIds = shellRelatedRunIds(runId)
     const buffered = takePendingShellOutput(runId)
-    let rendered = buffered === undefined ? "" : buffered
-    if (rendered.length > 0) rendered = appendBoundedText(shellOutput(row.body), rendered)
     const result = normalizeShellResult(body)
-    rendered = appendBoundedText(rendered, result)
+    let rendered: string
+    if (result === "(no output)") {
+      // A redacted durable result carries no output fact: the live stream
+      // (row tail plus still-pending deltas) is the only output this run
+      // will ever project, so an empty body must not replace it.
+      rendered = appendBoundedText(shellOutput(row.body), buffered ?? "")
+      if (rendered.length === 0) rendered = result
+    } else {
+      let live = buffered === undefined ? "" : buffered
+      if (live.length > 0) live = appendBoundedText(shellOutput(row.body), live)
+      rendered = appendBoundedText(live, result)
+    }
     transcript = transcript.map((entry, at) =>
       at === index ? { ...entry, revision: durableWatermark, body: `${shellMarker(row.body)}\n${boundText(rendered)}` } : entry,
     )
@@ -1135,6 +1169,7 @@ export function createSessionProjection(options: ProjectionOptions = {}): TuiSes
               input: block.input,
               ...(block.title === undefined ? {} : { title: block.title }),
               status: block.status,
+              ...(block.toolStatus === undefined ? {} : { toolStatus: block.toolStatus }),
               ...(block.result === undefined ? {} : { result: block.result }),
               ...(block.partialInput === undefined ? {} : { partialInput: block.partialInput }),
               ...(block.durationMs === undefined ? {} : { durationMs: block.durationMs }),
@@ -1296,7 +1331,7 @@ export function createSessionProjection(options: ProjectionOptions = {}): TuiSes
       // Optimistic claims: a pending user row is claimed by text (chip-form
       // echoes FIFO-claim the oldest pending row and keep their compact
       // text); a shell run-start goal claims its pending shell row.
-      if (input.kind === "user" && claimPendingUser(input.body)) return true
+      if (input.kind === "user" && claimPendingUser(input)) return true
       if (input.kind === "shell" && input.runId !== undefined && shellDurable(input.runId, input.body, input.shellPhase)) return true
       // A first-seen durable assistant response with no visible text (a
       // tool-only turn) parks no empty row (legacy first-append guard).
@@ -1306,6 +1341,7 @@ export function createSessionProjection(options: ProjectionOptions = {}): TuiSes
         revision: input.revision,
         body: boundText(input.kind === "assistant" ? stripAnsi(input.body) : input.body),
         ...(input.kind === "user" && input.inputId !== undefined ? { inputId: input.inputId } : {}),
+        ...(input.kind === "user" && input.acceptedAt !== undefined ? { acceptedAt: input.acceptedAt } : {}),
         ...(input.runId !== undefined ? { runId: input.runId } : {}),
         ...(input.kind !== "assistant"
           ? {}

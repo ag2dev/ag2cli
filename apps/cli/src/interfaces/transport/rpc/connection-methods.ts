@@ -1,40 +1,31 @@
 import {
+  APP_SERVER_METHODS,
   APP_SERVER_PROTOCOL_VERSION,
-  type AppServerClientInfo,
+  type AppServerCapabilities,
   type AppServerScope,
-  type JsonValue,
+  type ServerDescribeResult,
+  type ServerInitializeParams,
   type ServerInitializeResult,
 } from "@ag2cli/app-server-protocol/types.js"
+import { publicSessionEventTypeSchema } from "@ag2cli/app-server-protocol/dto/events.js"
 import { parseServerInitializeParams } from "@ag2cli/app-server-protocol/validation.js"
-import { RpcApplicationError, toJson, type MethodContext } from "./method-context.js"
+import type { MethodContext } from "./method-context.js"
+import { RpcApplicationError } from "../public-session-command-mapping.js"
 import { statSync } from "node:fs"
 
-const DEFAULT_CAPABILITIES = [
-  "server.describe",
-  "server.health",
-  "session.list",
-  "session.create",
-  "session.get",
-  "session.fork",
-  "session.archive",
-  "session.delete",
-  "session.attach",
-  "session.detach",
-  "session.snapshot",
-  "session.command",
-  "session.plan",
-  "session.submit",
-  "session.cancel",
-  "session.resolveApproval",
-  "session.replay",
-  "session.trace",
-  "session.modelCalls",
-  "session.resync",
-  "interaction.acquire",
-  "interaction.renew",
-  "interaction.release",
-  "interaction.takeover",
-] as const
+const SESSION_METHODS = APP_SERVER_METHODS.filter((method) => method.startsWith("session."))
+const SESSION_EVENT_TYPES = publicSessionEventTypeSchema.options
+
+/** Declarative advertisement only: authorization is scope + policy + lease, never clientKind. */
+function defaultCapabilities(context: MethodContext): AppServerCapabilities {
+  return {
+    session: { methods: SESSION_METHODS, eventTypes: SESSION_EVENT_TYPES },
+    interactions: { approval: true, askUser: true },
+    workspace: { diff: true, readFile: true },
+    security: { permissionModes: [...context.selectableModes], editableRules: true },
+    execution: { explicitShell: true },
+  }
+}
 
 export class ConnectionMethods {
   constructor(private readonly context: MethodContext) {}
@@ -42,43 +33,50 @@ export class ConnectionMethods {
   async initialize(value: unknown): Promise<ServerInitializeResult> {
     if (this.context.initialized) throw new RpcApplicationError("already_initialized", "Connection is already initialized")
     const params = parseServerInitializeParams(value)
-    if (
-      this.context.authenticatedDeviceId !== undefined &&
-      params.device?.deviceId !== undefined &&
-      params.device.deviceId !== this.context.authenticatedDeviceId
-    ) {
-      throw new RpcApplicationError("device_auth_mismatch", "server.initialize deviceId does not match the transport identity")
+    if (params.hostId !== this.context.descriptor.hostId) {
+      throw new RpcApplicationError("host_identity_mismatch", "server.initialize Host ID does not match this Host")
     }
-    if (params.serverFingerprint !== undefined && params.serverFingerprint !== this.context.descriptor.fingerprint) {
-      throw new RpcApplicationError("server_fingerprint_mismatch", "Server fingerprint does not match")
-    }
-    if (this.context.authenticatedDevicePublicKey !== undefined) {
-      if (this.context.deviceProofVerifier === undefined) {
-        throw new RpcApplicationError("device_proof_unavailable", "Device proof verification is not enabled on this Host")
-      }
-      if (params.device?.challenge === undefined || params.device.signature === undefined) {
-        throw new RpcApplicationError("device_proof_required", "This device must submit a challenge proof")
-      }
-      const verified = await this.context.deviceProofVerifier.verify({
-        deviceId: this.context.authenticatedDeviceId!,
-        publicKey: this.context.authenticatedDevicePublicKey,
-        clientId: params.client.clientId,
-        proof: params.device,
-      })
-      if (!verified) throw new RpcApplicationError("device_proof_invalid", "Device challenge proof is invalid or expired")
+    if (params.auth.type === "operator" && (params.requestedScopes?.length !== 1 || params.requestedScopes[0] !== "device:admin")) {
+      throw new RpcApplicationError("scope_denied", "Operator initialization must request only device:admin")
     }
     const requested = params.requestedScopes ?? this.context.grantedScopes
     const denied = requested.filter((scope) => !this.context.grantedScopes.includes(scope))
     if (denied.length > 0) throw new RpcApplicationError("scope_denied", `The requested scopes are not authorized: ${denied.join(", ")}`)
-    this.context.setClientKind(params.client.clientKind)
+    return this.completeInitialization(params.client, requested, params.auth.type === "device")
+  }
+
+  /** Initialize a private in-process connection without inventing wire credentials. */
+  async initializeLocal(
+    params: Omit<ServerInitializeParams, "hostId" | "auth" | "appServerProtocolVersion"> & {
+      readonly appServerProtocolVersion?: ServerInitializeParams["appServerProtocolVersion"]
+    },
+  ): Promise<ServerInitializeResult> {
+    if (this.context.initialized) throw new RpcApplicationError("already_initialized", "Connection is already initialized")
+    if (params.appServerProtocolVersion !== undefined && params.appServerProtocolVersion !== APP_SERVER_PROTOCOL_VERSION) {
+      throw new RpcApplicationError("unsupported_protocol_version", "Unsupported App Server protocol version")
+    }
+    const requested = params.requestedScopes ?? this.context.grantedScopes
+    const denied = requested.filter((scope) => !this.context.grantedScopes.includes(scope))
+    if (denied.length > 0) throw new RpcApplicationError("scope_denied", `The requested scopes are not authorized: ${denied.join(", ")}`)
+    return this.completeInitialization(params.client, requested, true)
+  }
+
+  private async completeInitialization(
+    client: ServerInitializeParams["client"],
+    requested: readonly AppServerScope[],
+    registerDevicePresence: boolean,
+  ): Promise<ServerInitializeResult> {
+    this.context.setClientKind(client.clientKind)
     this.context.setScopes([...requested])
     this.context.setPresenceRegistration(
-      this.context.presenceRegistry?.register({
-        connectionId: this.context.connectionId,
-        deviceId: this.context.deviceId,
-        client: params.client,
-        notify: (method, values) => this.context.emit(method, values),
-      }),
+      registerDevicePresence
+        ? this.context.presenceRegistry?.register({
+            connectionId: this.context.connectionId,
+            deviceId: this.context.deviceId,
+            client,
+            notify: (method, values) => this.context.emit(method, values),
+          })
+        : undefined,
     )
     this.context.markInitialized()
     const canReadSessions = this.context.scopes.includes("session:read") || this.context.scopes.includes("session:write")
@@ -93,11 +91,12 @@ export class ConnectionMethods {
     return {
       appServerProtocolVersion: APP_SERVER_PROTOCOL_VERSION,
       server: this.context.descriptor,
-      connection: { connectionId: this.context.connectionId, deviceId: this.context.deviceId, scopes: this.context.scopes },
-      capabilities: capabilitiesForClient(
-        this.context.capabilities ?? defaultCapabilities(this.context.scopes, this.context.deviceRegistry),
-        this.context.clientKind,
-      ),
+      connection: {
+        connectionId: this.context.connectionId,
+        ...(registerDevicePresence ? { deviceId: this.context.deviceId } : {}),
+        scopes: this.context.scopes,
+      },
+      capabilities: this.context.capabilities ?? defaultCapabilities(this.context),
       host: {
         profile: this.context.profile,
         ...(registeredWorkspaces !== undefined
@@ -112,12 +111,15 @@ export class ConnectionMethods {
     }
   }
 
-  health(): JsonValue {
+  health(): { readonly ok: boolean; readonly status: string; readonly protocolVersion: number } {
     return { ok: true, status: "ready", protocolVersion: APP_SERVER_PROTOCOL_VERSION }
   }
 
-  describe(): JsonValue {
-    return toJson(this.context.descriptor)
+  describe(): ServerDescribeResult {
+    return {
+      server: this.context.descriptor,
+      capabilities: this.context.capabilities ?? defaultCapabilities(this.context),
+    }
   }
 }
 
@@ -127,15 +129,4 @@ function isDirectory(value: string): boolean {
   } catch {
     return false
   }
-}
-
-function capabilitiesForClient(capabilities: readonly string[], clientKind: AppServerClientInfo["clientKind"]): readonly string[] {
-  if (clientKind !== "mobile") return capabilities
-  const denied = new Set(["session.fork", "session.delete", "session.rewind", "session.shell", "session.permission"])
-  return capabilities.filter((capability) => !denied.has(capability))
-}
-
-function defaultCapabilities(grantedScopes: readonly AppServerScope[], deviceRegistry: MethodContext["deviceRegistry"]): readonly string[] {
-  if (deviceRegistry === undefined || !grantedScopes.includes("device:admin")) return DEFAULT_CAPABILITIES
-  return [...DEFAULT_CAPABILITIES, "device.list", "device.revoke"]
 }

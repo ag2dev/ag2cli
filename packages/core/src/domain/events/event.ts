@@ -48,6 +48,8 @@ export type AgentEventType =
   | "ToolCallPrepared"
   | "ToolApprovalRequested"
   | "ToolApprovalResolved"
+  | "AskUserRequested"
+  | "AskUserResolved"
   | "ToolCallExecutionStarted"
   | "RunCompleted"
   | "RunFailed"
@@ -178,7 +180,7 @@ export type AgentEvent =
         /** Full request snapshot is persisted only when the observability policy captures model payloads. */
         request?: CanonicalModelRequest
         context?: ContextProvenance
-        /** Policy revision the request was bound to; a later commit that moved it invalidates the response. */
+        /** Policy revision used to assemble the request; tool dispatch rechecks the current policy. */
         boundPolicyRevision: number
       }
     >
@@ -466,6 +468,44 @@ export type AgentEvent =
       }
     >
   | AgentEventBase<
+      "AskUserRequested",
+      {
+        runId: RunId
+        turn: number
+        toolUseId: string
+        name: string
+        /**
+         * Question set in the runtime domain (labels, no wire ids). The
+         * public projector derives the stable question/option ids from the
+         * payload ordering; clients resolve against those derived ids.
+         */
+        questions: readonly {
+          question: string
+          header?: string
+          multiSelect?: boolean
+          options: readonly { label: string; description?: string }[]
+        }[]
+      }
+    >
+  | AgentEventBase<
+      "AskUserResolved",
+      {
+        runId: RunId
+        turn: number
+        toolUseId: string
+        outcome: "answered" | "chat" | "declined" | "expired"
+        /**
+         * One row per question, selected option labels; present iff the
+         * outcome is "answered".
+         */
+        answers?: readonly { header: string; selected: readonly string[]; freeText?: string; questionIndex?: number }[]
+        /** Partial, ID-validated answer context supplied with a chat outcome. */
+        contextAnswers?: readonly { questionIndex: number; header: string; selected: readonly string[]; freeText?: string }[]
+        /** Who resolved; absent means the user. System marks restart expiry. */
+        resolvedBy?: "system"
+      }
+    >
+  | AgentEventBase<
       "ToolCallExecutionStarted",
       {
         runId: RunId
@@ -490,7 +530,7 @@ export type AgentEvent =
         runId: RunId
         turns: number
         message: string
-        code?: "approval_required"
+        code?: "approval_required" | "interaction_expired"
       }
     >
   | AgentEventBase<"RunCancelled", { runId: RunId; turns: number; reason?: string }>

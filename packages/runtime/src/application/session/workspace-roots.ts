@@ -5,6 +5,7 @@ import { DEFAULT_SESSION_PERMISSION_MODE } from "@ag2cli/core/session/session-se
 import type { EventStore } from "../../ports/event-store.js"
 import type { PolicySerialPoint } from "../../ports/policy-serial-point.js"
 import type { WorkspaceScopeDigest } from "../../ports/workspace.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { appendSessionEventsIfRevision } from "./revision-conflict.js"
 import { SessionAuthority } from "./session-authority.js"
 import { commandIdempotencyConflictError, resolveCommandIdempotency, type CommandIdempotencyFamily } from "./command-idempotency.js"
@@ -76,12 +77,12 @@ export interface AddAdditionalDirectoryDependencies {
   readonly workspaceScopeDigest: WorkspaceScopeDigest
   /** Serializes the read-judge-append window against tool dispatch on one session. */
   readonly serialPoint: PolicySerialPoint
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 /** Persist one additional directory before exposing it to the session. */
 export class AddAdditionalDirectoryUseCase {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
   private readonly authority: SessionAuthority
 
   constructor(private readonly deps: AddAdditionalDirectoryDependencies) {
@@ -89,23 +90,11 @@ export class AddAdditionalDirectoryUseCase {
   }
 
   async execute(input: AddAdditionalDirectoryInput): Promise<AddAdditionalDirectoryResult> {
-    const key = input.sessionId.toString()
-    const previous = this.pending.get(key)
-    const operation = (previous ?? Promise.resolve()).then(() =>
+    return this.lane.run(input.sessionId.toString(), () =>
       this.deps.serialPoint.critical(input.sessionId, `add-directory:${input.commandId}`, "permission-commit", () =>
         this.executeNow(input),
       ),
     )
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(key, tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(key) === tracked) this.pending.delete(key)
-    }
   }
 
   private async executeNow(input: AddAdditionalDirectoryInput): Promise<AddAdditionalDirectoryResult> {

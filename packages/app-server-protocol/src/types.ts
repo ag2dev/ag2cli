@@ -1,4 +1,4 @@
-import type { AppServerErrorCode } from "./error-codes.js"
+import type { AppServerCapabilities } from "./dto/capabilities.js"
 
 /** JSON values are the only values that may cross the App Server boundary. */
 export type JsonPrimitive = string | number | boolean | null
@@ -51,6 +51,7 @@ export const APP_SERVER_PROTOCOL_VERSION = 1 as const
 export type AppServerProtocolVersion = typeof APP_SERVER_PROTOCOL_VERSION
 
 export const APP_SERVER_METHODS = [
+  "server.preflight",
   "server.initialize",
   "server.describe",
   "server.health",
@@ -63,21 +64,46 @@ export const APP_SERVER_METHODS = [
   "session.attach",
   "session.detach",
   "session.snapshot",
-  "session.command",
   "session.plan",
+  "session.compact",
+  "session.addDirectory",
+  "session.setContextWindow",
+  "session.clearContextWindow",
+  "session.selectAgent",
+  "session.updateGoal",
+  "session.listCheckpoints",
+  "session.previewRewind",
+  "session.rewind",
   "session.submit",
-  "session.cancel",
-  "session.resolveApproval",
+  "session.steer",
+  "session.cancelRun",
+  "session.cancelInput",
+  "session.messages",
+  "session.resolveInteraction",
+  "session.getPermissionPolicy",
+  "session.setPermissionMode",
+  "session.setPermissionRules",
   "session.replay",
   "session.trace",
   "session.modelCalls",
   "session.resync",
+  "session.createTask",
+  "session.listTasks",
+  "session.cancelTask",
+  "session.getTaskLogs",
+  "session.executeShell",
+  "session.executeUserShell",
   "interaction.acquire",
   "interaction.renew",
   "interaction.release",
   "interaction.takeover",
+  "pair.create",
+  "pair.preview",
+  "pair.claim",
   "device.list",
   "device.revoke",
+  "workspace.diff",
+  "workspace.readFile",
 ] as const
 
 export type AppServerMethod = (typeof APP_SERVER_METHODS)[number]
@@ -86,7 +112,6 @@ export const APP_SERVER_NOTIFICATION_METHODS = [
   "session.event",
   "session.transient",
   "session.resyncRequired",
-  "session.operation.failed",
   "presence.updated",
   "interaction.lease.updated",
 ] as const
@@ -101,6 +126,8 @@ export const APP_SERVER_SCOPES = [
   "config:read",
   "config:write",
   "device:admin",
+  "session:policy",
+  "workspace:read",
 ] as const
 
 export type AppServerScope = (typeof APP_SERVER_SCOPES)[number]
@@ -113,18 +140,65 @@ export interface AppServerClientInfo {
   readonly capabilities?: readonly string[]
 }
 
+export type AppServerHostProofPurpose = "pairing-link" | "admin-pairing" | "device-connect"
+
+/** Server-owned identity signer used by the public WebSocket handshake. */
+export interface AppServerHostIdentitySigner {
+  readonly hostId: string
+  readonly hostPublicKey: string
+  sign(message: Uint8Array): Uint8Array
+}
+
+export interface ServerPreflightParams {
+  readonly nonce: string
+  readonly purpose: AppServerHostProofPurpose
+}
+
+interface ServerPreflightResultBase {
+  readonly hostId: string
+  readonly hostPublicKey: string
+  readonly nonce: string
+  /** Unix epoch milliseconds; the signed proof lifetime is at most 60 seconds. */
+  readonly expiresAt: number
+  readonly signature: string
+}
+
+export type ServerPreflightResult =
+  | (ServerPreflightResultBase & {
+      readonly purpose: "device-connect"
+      /** Bound to this WebSocket connection. */
+      readonly deviceChallenge: string
+      readonly deviceChallengeExpiresAt: number
+    })
+  | (ServerPreflightResultBase & {
+      readonly purpose: "pairing-link" | "admin-pairing"
+      readonly deviceChallenge?: never
+      readonly deviceChallengeExpiresAt?: never
+    })
+
 export interface AppServerDeviceProof {
   readonly deviceId: string
-  readonly challenge?: string
-  readonly signature?: string
+  readonly challenge: string
+  readonly signature: string
 }
 
 export interface AppServerDeviceChallenge {
-  readonly deviceId: string
   readonly challenge: string
-  readonly serverFingerprint: string
-  readonly expiresAt: string
+  readonly hostId: string
+  readonly expiresAt: number
 }
+
+export interface AppServerDeviceAuth {
+  readonly type: "device"
+  readonly device: AppServerDeviceProof & { readonly credential: string }
+}
+
+export interface AppServerOperatorAuth {
+  readonly type: "operator"
+  readonly bearerToken: string
+}
+
+export type ServerInitializeAuth = AppServerDeviceAuth | AppServerOperatorAuth
 
 /** Device metadata safe to expose to an authenticated device administrator. */
 export interface AppServerDeviceRecord {
@@ -164,38 +238,57 @@ export interface AppServerDeviceRegistry {
   revoke(deviceId: string): Promise<boolean>
 }
 
-export interface AppServerPairingStartInput {
+export interface AppServerPairCreateParams {
   readonly scopes: readonly AppServerScope[]
   readonly ttlMs?: number
 }
 
-export interface AppServerPairingChallenge {
-  /** Short-lived secret returned once to the already-authorized pairing initiator. */
+export interface AppServerPairCreateResult {
   readonly pairingToken: string
+  readonly hostId: string
   readonly scopes: readonly AppServerScope[]
   readonly expiresAt: string
 }
 
-export interface AppServerPairingClaimInput {
+export interface AppServerPairPreviewParams {
   readonly pairingToken: string
-  readonly name: string
-  readonly clientKind: AppServerClientInfo["clientKind"]
-  readonly publicKey?: string
 }
 
-/** Host-owned, in-memory pairing state; it must not share Session persistence. */
+export interface AppServerPairPreviewResult {
+  readonly hostId: string
+  readonly scopes: readonly AppServerScope[]
+  readonly expiresAt: string
+}
+
+export interface AppServerPairClaimParams {
+  readonly pairingToken: string
+  readonly name: string
+  readonly clientKind: "web" | "mobile"
+  readonly publicKey: string
+}
+
+export type AppServerPairClaimResult = AppServerDeviceRegistration
+
+/** Host-owned pairing authority; ticket state must not share Session persistence. */
 export interface AppServerPairingRegistry {
-  start(input: AppServerPairingStartInput): Promise<AppServerPairingChallenge>
-  claim(input: AppServerPairingClaimInput): Promise<AppServerDeviceRegistration | undefined>
+  create(input: AppServerPairCreateParams): Promise<AppServerPairCreateResult>
+  preview(pairingToken: string): Promise<AppServerPairPreviewResult | undefined>
+  claim(input: AppServerPairClaimParams): Promise<AppServerPairClaimResult | undefined>
   close(): void
 }
 
 export interface ServerInitializeParams {
   readonly appServerProtocolVersion: AppServerProtocolVersion
+  readonly hostId: string
   readonly client: AppServerClientInfo
-  readonly device?: AppServerDeviceProof
+  readonly auth: ServerInitializeAuth
   readonly requestedScopes?: readonly AppServerScope[]
-  readonly serverFingerprint?: string
+  /**
+   * Client-side render/input support, declared but never negotiated: the public
+   * durable stream is identical for every client and unknown informational
+   * events are skippable, so the server must not filter on this field.
+   */
+  readonly clientCapabilities?: AppServerCapabilities
   readonly recovery?: {
     readonly sessionId?: string
     readonly afterRevision?: number
@@ -205,8 +298,14 @@ export interface ServerInitializeParams {
 export interface AppServerDescriptor {
   readonly name: string
   readonly version: string
-  readonly fingerprint: string
+  readonly hostId: string
   readonly protocolVersion: AppServerProtocolVersion
+}
+
+/** Authoritative discovery result: the Host descriptor plus its capabilities. */
+export interface ServerDescribeResult {
+  readonly server: AppServerDescriptor
+  readonly capabilities: AppServerCapabilities
 }
 
 export interface ServerInitializeResult {
@@ -214,10 +313,10 @@ export interface ServerInitializeResult {
   readonly server: AppServerDescriptor
   readonly connection: {
     readonly connectionId: string
-    readonly deviceId: string
+    readonly deviceId?: string
     readonly scopes: readonly AppServerScope[]
   }
-  readonly capabilities: readonly string[]
+  readonly capabilities: AppServerCapabilities
   readonly host?: {
     readonly profile: "durable" | "ephemeral"
     /** Service descriptor only; never the Session routing authority. */
@@ -233,70 +332,115 @@ export interface ServerInitializeResult {
   }
 }
 
-export interface SessionListParams {
-  readonly includeArchived?: boolean
-}
+export type {
+  SessionListParams,
+  SessionCreateParams,
+  SessionGetParams,
+  SessionForkParams,
+  SessionArchiveParams,
+  SessionDeleteParams,
+  SessionControlLeaseRef,
+  SessionListResult,
+  SessionSnapshotResult,
+  SessionGetResult,
+  SessionArchiveResult,
+  SessionDeleteResult,
+} from "./dto/catalog-methods.js"
 
-export interface SessionCreateParams {
-  readonly sessionId?: string
-  /** Stable registry identity; physical paths are never Session routing input. */
-  readonly workspaceId: string
-  readonly title?: string
-}
+export type { AppServerCapabilities } from "./dto/capabilities.js"
 
-export interface SessionGetParams {
-  readonly sessionId: string
-  readonly includeArchived?: boolean
-}
+export type {
+  SessionAttachParams,
+  SessionDetachParams,
+  SessionSnapshotMethodParams,
+  SessionReplayParams,
+  SessionResyncParams,
+  SessionAttachResult,
+  SessionDetachResult,
+  SessionSnapshotMethodResult,
+  SessionReplayResult,
+  SessionResyncResult,
+} from "./dto/recovery-methods.js"
 
-/** Immutable logical position used by rewind/fork operations. */
-export interface SessionHistoryCursor {
-  readonly sessionId: string
-  readonly branchId: string
-  readonly nodeId: string
-  readonly physicalRevision: number
-  readonly recordHash: string
-}
+export type {
+  SessionSubmitParams,
+  SessionSubmitResult,
+  SessionSteerParams,
+  SessionSteerResult,
+  SessionCancelRunParams,
+  SessionCancelRunResult,
+  SessionCancelInputParams,
+  SessionCancelInputResult,
+  SessionMessagesParams,
+  SessionMessagesResult,
+  SessionResolveInteractionParams,
+  SessionResolveInteractionResult,
+} from "./dto/write-methods.js"
 
-/** Fixed single-scope lease reference; `session.fork`/`session.archive`/`session.delete`
- * always require `session-control`, so the scope value is carried in the type rather than
- * accepted at runtime. */
-export interface SessionControlLeaseRef {
-  readonly scope: "session-control"
-  readonly generation: number
-}
+export type {
+  SessionGetPermissionPolicyParams,
+  SessionGetPermissionPolicyResult,
+  SessionSetPermissionModeParams,
+  SessionSetPermissionModeResult,
+  SessionSetPermissionRulesParams,
+  SessionSetPermissionRulesResult,
+  PublicPermissionPolicy,
+  PublicPermissionRule,
+} from "./dto/policy.js"
 
-export interface SessionForkParams {
-  readonly sourceSessionId: string
-  readonly targetSessionId?: string
-  readonly cursor?: SessionHistoryCursor
-  readonly title?: string
-  readonly lease?: SessionControlLeaseRef
-}
+export type {
+  WorkspaceDiffParams,
+  WorkspaceDiffResult,
+  WorkspaceDiffChange,
+  WorkspaceChangeOperation,
+  WorkspaceFileKind,
+  WorkspaceReadFileParams,
+  WorkspaceReadFileResult,
+} from "./dto/workspace.js"
 
-export interface SessionArchiveParams {
-  readonly sessionId: string
-  readonly lease?: SessionControlLeaseRef
-}
+export type {
+  SessionCreateTaskParams,
+  SessionCreateTaskResult,
+  SessionListTasksParams,
+  SessionListTasksResult,
+  SessionCancelTaskParams,
+  SessionCancelTaskResult,
+  SessionGetTaskLogsParams,
+  SessionGetTaskLogsResult,
+  TaskLogChunk,
+  SessionExecuteShellParams,
+  SessionExecuteShellResult,
+  SessionExecuteUserShellParams,
+  SessionExecuteUserShellResult,
+  SessionShellAdmissionResult,
+} from "./dto/task-methods.js"
 
-export interface SessionDeleteParams {
-  readonly sessionId: string
-  readonly lease?: SessionControlLeaseRef
-}
+export type {
+  SessionCompactParams,
+  SessionCompactResult,
+  SessionAddDirectoryParams,
+  SessionAddDirectoryResult,
+  SessionSetContextWindowParams,
+  SessionSetContextWindowResult,
+  SessionClearContextWindowParams,
+  SessionClearContextWindowResult,
+  SessionSelectAgentParams,
+  SessionSelectAgentResult,
+  SessionGoalUpdateParams,
+  SessionUpdateGoalParams,
+  SessionUpdateGoalResult,
+  PublicGoal,
+} from "./dto/session-action-methods.js"
 
-export interface SessionAttachParams {
-  readonly sessionId: string
-  readonly afterRevision?: number
-  readonly includeTransient?: boolean
-}
-
-export interface SessionDetachParams {
-  readonly sessionId: string
-}
-
-export interface SessionSnapshotParams {
-  readonly sessionId: string
-}
+export type {
+  SessionListCheckpointsParams,
+  SessionListCheckpointsResult,
+  SessionPreviewRewindParams,
+  SessionPreviewRewindResult,
+  SessionRewindParams,
+  SessionRewindResult,
+  PublicCheckpoint,
+} from "./dto/rewind-methods.js"
 
 export const PERMISSION_MODES = ["accept-edits", "plan", "full-access", "manual"] as const
 export type AppServerPermissionMode = (typeof PERMISSION_MODES)[number]
@@ -314,121 +458,6 @@ export type AppServerTaskType = (typeof TASK_TYPES)[number]
 
 export type AppServerGoalUpdate = { readonly action: "set"; readonly text: string } | { readonly action: "clear" | "pause" | "resume" }
 
-/**
- * Public semantic actions used by clients for session controls.
- *
- * These names are deliberately independent from the private runtime command
- * discriminants. The App Server adapter owns the mapping on each Host.
- */
-export type AppServerSessionCommandAction =
-  | {
-      readonly type: "addDirectory"
-      readonly directory: string
-      readonly workspaceRoot?: string
-      readonly expectedScopeRevision?: number
-    }
-  | {
-      readonly type: "setPermissionMode"
-      readonly mode: AppServerPermissionMode
-      readonly expectedPolicyRevision?: number
-    }
-  | {
-      readonly type: "setPermissionRules"
-      readonly rules: readonly AppServerPermissionRule[]
-      readonly expectedPolicyRevision?: number
-    }
-  | { readonly type: "compact"; readonly instructions?: string }
-  | { readonly type: "setContextWindow"; readonly contextWindow: number }
-  | { readonly type: "clearContextWindow" }
-  | { readonly type: "setAgent"; readonly agentName?: string }
-  | { readonly type: "updateGoal"; readonly update: AppServerGoalUpdate }
-  | {
-      readonly type: "createTask"
-      readonly taskType: AppServerTaskType
-      readonly title: string
-      readonly prompt?: string
-      readonly argv?: readonly string[]
-      readonly intervalMs?: number
-      readonly maxRuns?: number
-      readonly workspace?: string
-      readonly parentRunId?: string
-    }
-  | { readonly type: "listTasks" }
-  | {
-      readonly type: "cancelTask"
-      readonly taskId: string
-      readonly reason?: string
-    }
-  | { readonly type: "listCheckpoints" }
-  | {
-      readonly type: "previewRewind"
-      readonly checkpointId: string
-    }
-  | {
-      readonly type: "rewind"
-      readonly checkpointId: string
-    }
-  | {
-      readonly type: "steer"
-      readonly runId: string
-      readonly text: string
-    }
-  | {
-      readonly type: "cancelInput"
-      readonly inputId: string
-      readonly reason?: string
-    }
-  | {
-      readonly type: "executeShell"
-      readonly argv: readonly string[]
-      readonly cwd?: string
-      readonly timeoutMs?: number
-    }
-  | {
-      readonly type: "executeUserShell"
-      readonly command: string
-      readonly cwd?: string
-      readonly timeoutMs?: number
-    }
-
-/**
- * Canonical action discriminant vocabulary for `session.command`. The union
- * above and this list must stay in lockstep; the symmetric-difference
- * assertion below fails compilation when either side gains an unmirrored
- * entry.
- */
-
-export const SESSION_COMMAND_ACTION_TYPES = [
-  "addDirectory",
-  "setPermissionMode",
-  "setPermissionRules",
-  "compact",
-  "setContextWindow",
-  "clearContextWindow",
-  "setAgent",
-  "updateGoal",
-  "createTask",
-  "listTasks",
-  "cancelTask",
-  "listCheckpoints",
-  "previewRewind",
-  "rewind",
-  "steer",
-  "cancelInput",
-  "executeShell",
-  "executeUserShell",
-] as const
-
-export type AppServerSessionCommandActionType = (typeof SESSION_COMMAND_ACTION_TYPES)[number]
-
-type AssertNever<T extends never> = T
-
-/** Adding a union member without extending the vocabulary (or vice versa) fails compilation. */
-export type AssertSessionCommandActionVocabulary = AssertNever<
-  | Exclude<AppServerSessionCommandAction["type"], AppServerSessionCommandActionType>
-  | Exclude<AppServerSessionCommandActionType, AppServerSessionCommandAction["type"]>
->
-
 /** Runtime guards derived from the canonical vocabularies; narrow wire values without bare casts. */
 export function isAppServerPermissionMode(value: string): value is AppServerPermissionMode {
   return (PERMISSION_MODES as readonly string[]).includes(value)
@@ -436,45 +465,6 @@ export function isAppServerPermissionMode(value: string): value is AppServerPerm
 
 export function isPermissionRuleBehavior(value: string): value is AppServerPermissionRuleBehavior {
   return (PERMISSION_RULE_BEHAVIORS as readonly string[]).includes(value)
-}
-
-export function isSessionCommandActionType(value: string): value is AppServerSessionCommandActionType {
-  return (SESSION_COMMAND_ACTION_TYPES as readonly string[]).includes(value)
-}
-
-export interface SessionCommandParams {
-  readonly sessionId: string
-  readonly commandId: string
-  readonly action: AppServerSessionCommandAction
-  readonly expectedRevision?: number
-  /**
-   * Single scope reference: the caller already knows which action it is
-   * submitting, so it declares the one scope it believes applies. The Host
-   * still recomputes the required scope from the action and rejects a
-   * mismatch with `interaction_lease_scope_mismatch`.
-   */
-  readonly lease?: {
-    readonly scope: InteractionLeaseScope
-    readonly generation: number
-  }
-}
-
-export interface SessionSubmitParams {
-  readonly sessionId: string
-  readonly commandId: string
-  /** Raw input is intentionally preserved; the Host owns intent parsing. */
-  readonly text: string
-  readonly context?: readonly string[]
-  readonly fileReferences?: readonly string[]
-  readonly workspace?: string
-  readonly expectedRevision?: number
-  /**
-   * Partial map of scope generations the caller currently holds. `submit`
-   * only learns the required scope after parsing the `InputIntent`
-   * server-side, so it reports every scope it holds and the Host looks up
-   * the one it needs.
-   */
-  readonly lease?: Partial<Record<InteractionLeaseScope, number>>
 }
 
 export interface SessionPlanParams {
@@ -491,28 +481,6 @@ export interface SessionPlanParams {
   }
 }
 
-export interface SessionCancelParams {
-  readonly sessionId: string
-  readonly commandId?: string
-  readonly runId?: string
-}
-
-export interface SessionResolveApprovalParams {
-  readonly sessionId: string
-  readonly runId: string
-  readonly turn: number
-  readonly toolUseId: string
-  readonly preparedEventId: string
-  readonly expectedScopeRevision: number
-  readonly expectedPolicyRevision: number
-  readonly decision: "approved" | "denied"
-}
-
-export interface SessionReplayParams {
-  readonly sessionId: string
-  readonly afterRevision?: number
-}
-
 export interface SessionTraceParams {
   readonly sessionId: string
 }
@@ -520,11 +488,6 @@ export interface SessionTraceParams {
 export interface SessionModelCallsParams {
   readonly sessionId: string
   readonly includePayload?: boolean
-}
-
-export interface SessionResyncParams {
-  readonly sessionId: string
-  readonly afterRevision?: number
 }
 
 /**
@@ -544,8 +507,6 @@ export interface InteractionParams {
 }
 
 export interface AppServerPresenceClient {
-  readonly connectionId: string
-  readonly deviceId: string
   readonly clientId: string
   readonly clientKind: AppServerClientInfo["clientKind"]
   readonly name: string
@@ -553,8 +514,6 @@ export interface AppServerPresenceClient {
 }
 
 export interface AppServerInteractionHolder {
-  readonly connectionId: string
-  readonly deviceId: string
   readonly clientId: string
   readonly clientKind: AppServerClientInfo["clientKind"]
   readonly name: string
@@ -574,31 +533,6 @@ export interface DeviceRevokeParams {
   readonly deviceId: string
 }
 
-export interface SessionAttachResult {
-  readonly sessionId: string
-  readonly snapshot: JsonValue
-  readonly events: readonly JsonValue[]
-  readonly workspace?: {
-    readonly workspaceId: string
-    readonly workspaceRoot: string
-    readonly availability: "available" | "unavailable"
-  }
-  /** Bounded in-memory live projection; omitted when includeTransient was false. */
-  readonly transientEvents?: readonly JsonValue[]
-  readonly presence: {
-    readonly sessionId: string
-    readonly clients: readonly AppServerPresenceClient[]
-    readonly leases: AppServerInteractionLeases
-  }
-}
-
-export interface SessionReplayResult {
-  readonly sessionId: string
-  readonly events: readonly JsonValue[]
-  readonly nextRevision: number
-  readonly complete: boolean
-}
-
 export interface SessionTraceResult {
   readonly sessionId: string
   readonly records: readonly JsonValue[]
@@ -609,18 +543,6 @@ export interface SessionModelCallsResult {
   readonly records: readonly JsonValue[]
 }
 
-export interface SessionSubmitResult {
-  readonly accepted: boolean
-  readonly sessionId: string
-  readonly commandId: string
-  readonly intent: "prompt" | "slash" | "mention" | "shell"
-  /** Present for synchronous slash commands and uses the session.command action vocabulary. */
-  readonly action?: AppServerSessionCommandResultAction
-  readonly runId?: string
-  readonly result?: JsonValue
-  readonly snapshot?: JsonValue
-}
-
 export interface SessionPlanResult {
   readonly accepted: boolean
   readonly sessionId: string
@@ -628,30 +550,6 @@ export interface SessionPlanResult {
   readonly intent: "plan"
   readonly result?: JsonValue
   readonly snapshot?: JsonValue
-}
-
-export type AppServerSessionCommandResultAction =
-  | "directoryAdded"
-  | "permissionUpdated"
-  | "compacted"
-  | "contextWindowUpdated"
-  | "agentUpdated"
-  | "goalUpdated"
-  | "taskCreated"
-  | "tasksListed"
-  | "taskCancelled"
-  | "checkpointsListed"
-  | "rewindPreviewed"
-  | "rewound"
-  | "shellResult"
-
-export interface SessionCommandResult {
-  readonly accepted: boolean
-  readonly sessionId: string
-  readonly commandId: string
-  readonly action: AppServerSessionCommandResultAction
-  readonly result: JsonValue
-  readonly snapshot: JsonValue
 }
 
 export interface AppServerEventNotification {
@@ -693,15 +591,6 @@ export interface AppServerResyncRequiredNotification {
   readonly reason: "queue_overflow" | "revision_gap" | "rewind" | "restart"
 }
 
-export interface AppServerOperationFailedNotification {
-  readonly sessionId: string
-  readonly commandId: string
-  readonly intent: "prompt" | "mention" | "shell"
-  readonly message: string
-  /** Stable machine-readable code when the failure has a cataloged cause. */
-  readonly code?: AppServerErrorCode
-}
-
 export interface AppServerPresenceNotification {
   readonly sessionId: string
   readonly clients: readonly AppServerPresenceClient[]
@@ -726,10 +615,6 @@ export type AppServerNotificationParams =
       readonly params: AppServerResyncRequiredNotification
     }
   | {
-      readonly method: "session.operation.failed"
-      readonly params: AppServerOperationFailedNotification
-    }
-  | {
       readonly method: "presence.updated"
       readonly params: AppServerPresenceNotification
     }
@@ -737,22 +622,3 @@ export type AppServerNotificationParams =
       readonly method: "interaction.lease.updated"
       readonly params: AppServerLeaseNotification
     }
-
-export type InputIntent =
-  | {
-      readonly kind: "prompt"
-      readonly text: string
-      readonly fileReferences?: readonly string[]
-    }
-  | {
-      readonly kind: "slash"
-      readonly name: string
-      readonly args: readonly string[]
-      readonly raw: string
-    }
-  | {
-      readonly kind: "mention"
-      readonly text: string
-      readonly references: readonly string[]
-    }
-  | { readonly kind: "shell"; readonly command: string; readonly raw: string }

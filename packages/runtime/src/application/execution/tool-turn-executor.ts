@@ -12,11 +12,15 @@ import type {
 } from "../../ports/guardian.js"
 import { createGuardianDeadlineTimer, DEFAULT_GUARDIAN_REVIEW_DEADLINE_MS } from "../../ports/guardian.js"
 import type { ApprovalResolutionWriter } from "../session/approval-resolution.js"
+import type { AskResolutionWriter } from "../session/ask-resolution.js"
+import type { AskBroker } from "../../ports/ask-broker.js"
+import type { AskUserAnswer, AskUserQuestion } from "../../ports/ask-user.js"
 import { hasModelBashAuthority, toolIdempotencyKey, type ToolExecutor } from "../../ports/tool-executor.js"
 import type { ToolFailureLoopGuardDecision } from "./tool-failure-loop-guard.js"
 import { observeToolFailure } from "./tool-failure-loop-guard.js"
 import { judgeModelToolCall, modelToolEffectOf, type PermissionDenialCode, type PermissionSurfaces } from "./permission-judgment.js"
 import { ApprovalRequiredError } from "./approval-required-error.js"
+import { AskExpiredError } from "./ask-expired-error.js"
 import { deniedReasons } from "./denial-reasons.js"
 import type { TransientEventPublisher } from "./transient-events.js"
 import { traceAttributesFromToolMetadata, type TraceSink } from "../../ports/trace-sink.js"
@@ -56,6 +60,13 @@ export interface ToolTurnExecutorDependencies {
   readonly approval: ApprovalBroker
   readonly approvalResolution: ApprovalResolutionWriter
   readonly permissionSurfaces: PermissionSurfaces
+  /**
+   * Durable ask boundary. When both this and `askResolution` are injected
+   * the executor owns the ask_user lifecycle (canonical AskUser events);
+   * otherwise the tool keeps asking through its host-injected callback.
+   */
+  readonly ask?: AskBroker
+  readonly askResolution?: AskResolutionWriter
   /** Answers auto-mode asks; absent means every auto ask converges guardian_denied. */
   readonly guardian?: Guardian
   /** Aborts in-flight guardian reviews when session security changes. */
@@ -109,6 +120,9 @@ export interface ExecuteToolCallsInput {
 }
 
 export type ToolInteractionOutcome = "answered" | "declined" | "rejected"
+
+/** Errors whose tool result ends the run instead of feeding the model another turn. */
+export type ToolTerminalError = ApprovalRequiredError | AskExpiredError
 
 /**
  * Marker stamped into a duplicate's reused preparation when it converges on
@@ -272,8 +286,8 @@ export class ToolTurnExecutor {
       readonly kind: "settled"
       readonly stopAfter: boolean
       readonly settle: () => Promise<void>
-      /** Terminal judgment denial: the run must end once this member's facts are durable. */
-      readonly terminalAfter?: ApprovalRequiredError
+      /** Terminal denial (judgment or expired ask): the run must end once this member's facts are durable. */
+      readonly terminalAfter?: ToolTerminalError
     }
     interface ReuseWaitOutcome {
       /** Duplicate of an earlier same-batch call; reuses its committed result. */
@@ -694,7 +708,7 @@ export class ToolTurnExecutor {
       let terminalDenial = false
       // Every authorization denial settles through one fact sequence: a
       // failed trace, the committed denied result, then the model-facing entry.
-      const settledDenial = (denied: ToolResult, terminalAfter?: ApprovalRequiredError): SettledOutcome => ({
+      const settledDenial = (denied: ToolResult, terminalAfter?: ToolTerminalError): SettledOutcome => ({
         kind: "settled",
         stopAfter: terminalAfter !== undefined,
         ...(terminalAfter !== undefined ? { terminalAfter } : {}),
@@ -1008,6 +1022,93 @@ export class ToolTurnExecutor {
         )
       }
 
+      // Durable ask lifecycle: when an ask answerer is injected the executor,
+      // not the tool, owns the question cycle so the canonical AskUser events
+      // exist before any execution fact. The canonical fence then holds and a
+      // remote answer (or the restart sweep) becomes just another event.
+      let askAnswers: AskUserAnswer[] | undefined
+      if (this.deps.ask !== undefined && this.deps.askResolution !== undefined && modelToolEffectOf(toolUse.name) === "interaction") {
+        const askQuestions = parseAskQuestions(toolInput)
+        if (askQuestions !== undefined) {
+          const existingAskRequested = [...knownEvents]
+            .reverse()
+            .find(
+              (event): event is Extract<AgentEvent, { type: "AskUserRequested" }> =>
+                event.type === "AskUserRequested" &&
+                event.payload.runId === options.run &&
+                event.payload.turn === options.turn &&
+                event.payload.toolUseId === toolUse.id,
+            )
+          const askRequested =
+            existingAskRequested ??
+            (this.deps.makeEvent(
+              options.input.sessionId,
+              revision++,
+              "AskUserRequested",
+              {
+                runId: options.run,
+                turn: options.turn,
+                toolUseId: toolUse.id,
+                name: toolUse.name,
+                questions: askQuestions,
+              },
+              options.nextTrace,
+            ) as Extract<AgentEvent, { type: "AskUserRequested" }>)
+          if (!existingAskRequested) await appendEvent(askRequested)
+
+          let askResolved = [...knownEvents]
+            .reverse()
+            .find(
+              (event): event is Extract<AgentEvent, { type: "AskUserResolved" }> =>
+                event.type === "AskUserResolved" &&
+                event.payload.runId === options.run &&
+                event.payload.turn === options.turn &&
+                event.payload.toolUseId === toolUse.id,
+            )
+          if (askResolved === undefined) {
+            const outcome = await this.deps.ask.request({
+              sessionId: options.input.sessionId,
+              runId: options.run,
+              turn: options.turn,
+              toolUseId: toolUse.id,
+              name: toolUse.name,
+              questions: askQuestions,
+              signal: options.input.signal,
+            })
+            if (options.input.signal?.aborted) throw abortError()
+            const recorded = await this.deps.askResolution.record({
+              sessionId: options.input.sessionId,
+              runId: options.run,
+              turn: options.turn,
+              toolUseId: toolUse.id,
+              outcome: outcome.outcome,
+              ...(outcome.outcome === "answered" ? { answers: outcome.answers } : {}),
+              ...(outcome.outcome === "chat" && outcome.answers !== undefined ? { contextAnswers: outcome.answers } : {}),
+            })
+            askResolved = recorded.event
+            // The service owns persistence/publication; advance this turn's
+            // cursor to the canonical event before writing the following
+            // lifecycle facts, merging any foreign commits in between.
+            options.nextTrace(askResolved.eventId)
+            await mergeForeignUpTo(askResolved.revision)
+            if (!knownEvents.some((event) => event.eventId === askResolved?.eventId)) knownEvents.push(askResolved)
+            revision = Math.max(revision, askResolved.revision + 1)
+          }
+          if (askResolved.payload.outcome === "expired") {
+            // Restart-expiry convergence: the user never answered and the
+            // sweep closed the ask. The call must not execute unattended.
+            return settledDenial(
+              {
+                content: `tool ${toolUse.name} not executed (interaction_expired: the question expired before it was answered)`,
+                isError: true,
+              },
+              new AskExpiredError(toolUse.name),
+            )
+          }
+          askAnswers = answersForToolCall(askQuestions, askResolved.payload)
+        }
+      }
+
       const toolAttemptId = nextToolAttemptId(knownEvents, options.run, options.turn, toolUse.id)
       const inputCursor = reduceCanonicalSession(knownEvents).activeHead
       if (inputCursor === undefined) throw new Error("Cannot start a tool attempt without an active history head")
@@ -1099,6 +1200,10 @@ export class ToolTurnExecutor {
         ...(judgment.decision === "allow" ? { judgmentDecision: "allow" as const } : {}),
         ...(securityBoundPreparation.cwd === undefined ? {} : { cwd: securityBoundPreparation.cwd }),
         preSpawnGate: spawnGate,
+        // A durably answered ask replaces the interactive callback: the tool
+        // formats the canonical resolution instead of re-asking the surface
+        // that already answered.
+        ...(askAnswers === undefined ? {} : { askUser: async () => askAnswers! }),
       }
       // The dispatch gate holds its serial section only while it re-reads
       // canonical security and initiates execution; completion is awaited
@@ -1251,7 +1356,7 @@ export class ToolTurnExecutor {
           (
             outcome,
           ): outcome is SettledOutcome & {
-            terminalAfter: ApprovalRequiredError
+            terminalAfter: ToolTerminalError
           } => outcome.kind === "settled" && outcome.terminalAfter !== undefined,
         )
         if (failures.length > 0) throw failures[0]
@@ -1501,6 +1606,78 @@ function nextToolAttemptId(events: readonly AgentEvent[], run: RunId, turn: numb
 
 function toolRequestFingerprint(name: string, input: unknown): string {
   return `tool:${name}:${stableJson(input)}`
+}
+
+/**
+ * Strictly read the ask_user question set from a model tool input. Anything
+ * that does not parse returns undefined so the durable ask cycle is skipped
+ * and the tool's own schema validation surfaces the bad input instead.
+ */
+function parseAskQuestions(input: unknown): AskUserQuestion[] | undefined {
+  if (typeof input !== "object" || input === null) return undefined
+  const questionsValue = (input as { questions?: unknown }).questions
+  if (!Array.isArray(questionsValue) || questionsValue.length === 0) return undefined
+  const questions: AskUserQuestion[] = []
+  for (const entry of questionsValue) {
+    if (typeof entry !== "object" || entry === null) return undefined
+    const record = entry as Record<string, unknown>
+    if (typeof record.question !== "string" || record.question.trim().length === 0) return undefined
+    if (record.header !== undefined && (typeof record.header !== "string" || record.header.length === 0)) return undefined
+    if (record.multiSelect !== undefined && typeof record.multiSelect !== "boolean") return undefined
+    if (!Array.isArray(record.options) || record.options.length === 0) return undefined
+    const labels = new Set<string>()
+    const options: { label: string; description?: string }[] = []
+    for (const optionEntry of record.options) {
+      if (typeof optionEntry !== "object" || optionEntry === null) return undefined
+      const option = optionEntry as Record<string, unknown>
+      if (typeof option.label !== "string" || option.label.trim().length === 0) return undefined
+      if (labels.has(option.label)) return undefined
+      if (option.description !== undefined && typeof option.description !== "string") return undefined
+      labels.add(option.label)
+      options.push({ label: option.label, ...(option.description === undefined ? {} : { description: option.description }) })
+    }
+    questions.push({
+      question: record.question,
+      ...(record.header === undefined ? {} : { header: record.header }),
+      ...(record.multiSelect === undefined ? {} : { multiSelect: record.multiSelect }),
+      options,
+    })
+  }
+  return questions
+}
+
+/**
+ * Map a durable ask resolution onto the answer rows the tool's callback
+ * contract expects: answered rows replay verbatim, chat keeps one clarifying
+ * row, declined hands the tool an empty answer set (its own decline rule).
+ */
+function answersForToolCall(
+  questions: readonly AskUserQuestion[],
+  payload: Extract<AgentEvent, { type: "AskUserResolved" }>["payload"],
+): AskUserAnswer[] {
+  if (payload.outcome === "answered") {
+    return (payload.answers ?? []).map((row) => ({
+      header: row.header,
+      selected: [...row.selected],
+      ...(row.freeText === undefined ? {} : { freeText: row.freeText }),
+    }))
+  }
+  if (payload.outcome === "chat") {
+    const byIndex = new Map((payload.contextAnswers ?? []).map((row) => [row.questionIndex, row]))
+    return [
+      ...questions.map((question, index) => {
+        const answer = byIndex.get(index)
+        return {
+          header: question.header ?? question.question.slice(0, 12),
+          selected: [...(answer?.selected ?? [])],
+          ...(answer?.freeText === undefined ? {} : { freeText: answer.freeText }),
+          questionIndex: index,
+        }
+      }),
+      { header: questions[0]?.header ?? questions[0]?.question.slice(0, 12) ?? "", selected: [], action: "chat" as const },
+    ]
+  }
+  return []
 }
 
 type ToolDenial =

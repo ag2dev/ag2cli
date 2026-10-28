@@ -112,6 +112,37 @@ export const OPENAI_ENDPOINT_DESCRIPTORS: readonly OpenAIEndpointDescriptor[] = 
     supportsStreamUsage: true,
     requiresToolResultName: false,
   },
+  {
+    // Kimi K2.x toggles reasoning with the same {type} object the zai
+    // dialect uses; K3 ignores it in favor of reasoning_effort.
+    name: "moonshot",
+    matchers: [
+      { kind: "hostname", value: "api.moonshot.ai" },
+      { kind: "hostname", value: "api.moonshot.cn" },
+    ],
+    maxTokensField: "max_tokens",
+    supportsReasoningEffort: true,
+    thinkingRequestFormat: "zai",
+    reasoningReplay: "strip",
+    assistantEmptyContent: "null",
+    parseThinkTags: true,
+    visibleReasoningDetailTypes: [],
+    supportsStreamUsage: true,
+    requiresToolResultName: false,
+  },
+  {
+    name: "xai",
+    matchers: [{ kind: "hostname", value: "api.x.ai" }],
+    maxTokensField: "max_tokens",
+    supportsReasoningEffort: false,
+    thinkingRequestFormat: "none",
+    reasoningReplay: "strip",
+    assistantEmptyContent: "null",
+    parseThinkTags: true,
+    visibleReasoningDetailTypes: [],
+    supportsStreamUsage: true,
+    requiresToolResultName: false,
+  },
 ]
 
 export const GENERIC_OPENAI_DESCRIPTOR: OpenAIEndpointDescriptor = {

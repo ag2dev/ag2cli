@@ -86,57 +86,6 @@ export interface ChildTaskSettleAssembly {
   readonly notify: (sessionId: SessionId, text: string) => Promise<unknown>
 }
 
-/**
- * Recovery reason pinned by D-E1-8: a cancelled task whose owner died with
- * the process is honest attribution, not a task-side failure.
- */
-export const CHILD_TASK_RECOVERY_REASON = "process restarted"
-
-export interface OrphanedChildTaskRecoveryDeps {
-  /** Candidate sessions in this host's durable scope. */
-  readonly sessions: () => Promise<readonly SessionId[]>
-  /**
-   * Registry face for one session; undefined (or a rejection) skips that
-   * session — recovery is a best-effort observability correction and must
-   * not block host startup.
-   */
-  readonly registryFor: (sessionId: SessionId) => Promise<BackgroundTaskRegistry | undefined>
-  /**
-   * Serial point sharing the host's `"child-task"` section. Absent when the
-   * section's owner does not exist yet (serve workspace runtimes are lazy);
-   * startup there is writer-exclusive anyway, and each registry serializes
-   * its own session appends.
-   */
-  readonly serialPoint?: PolicySerialPoint
-}
-
-/**
- * Host-startup orphan recovery (D-E1-8): every durable agent-type task
- * without a terminal was owned by a previous process — spawns only reach a
- * runner through server command routing, which cannot exist before the
- * host build returns — so each lands one cancelled terminal carrying the
- * restart reason. Idempotent by construction: registry cancel is a no-op
- * on terminal states. Non-agent tasks stay untouched; their executor
- * world remains fail-closed.
- */
-export async function recoverOrphanedChildTasks(deps: OrphanedChildTaskRecoveryDeps): Promise<void> {
-  for (const id of await deps.sessions()) {
-    const registry = await deps.registryFor(id).catch(() => undefined)
-    if (registry === undefined) continue
-    const tasks = await registry.list(id).catch(() => undefined)
-    if (tasks === undefined) continue
-    for (const task of tasks) {
-      if (task.type !== "agent") continue
-      if (task.status !== "queued" && task.status !== "running") continue
-      // A crash can strand a child between Created and Started, so both
-      // non-terminal agent statuses are orphans, not just running ones.
-      const cancel = (): Promise<unknown> => registry.cancel(id, task.id, CHILD_TASK_RECOVERY_REASON)
-      const guarded = (): Promise<unknown> => cancel().catch(() => undefined)
-      await (deps.serialPoint?.critical(id, `child-task:${task.id}`, "child-task", guarded) ?? guarded())
-    }
-  }
-}
-
 export interface ChildTaskSettleProjector {
   /**
    * Runner `onChildSettled` seam: silent until `install` ran. The returned

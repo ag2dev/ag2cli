@@ -123,14 +123,22 @@ export interface WebSocketConnectOptions extends AppServerClientOptions {
   readonly createWebSocket?: (url: string) => WebSocketLike
 }
 
-export function connectWebSocketAppServer(url: string, options: WebSocketConnectOptions = {}): Promise<JsonRpcAppServerClient> {
+export async function connectWebSocketAppServerTransport(
+  url: string,
+  options: Pick<WebSocketConnectOptions, "createWebSocket"> & { readonly signal?: AbortSignal } = {},
+): Promise<WebSocketAppServerTransport> {
+  options.signal?.throwIfAborted()
   const socket = options.createWebSocket?.(url) ?? (new WebSocket(url) as unknown as WebSocketLike)
-  if (socket.readyState === WEBSOCKET_OPEN)
-    return Promise.resolve(new JsonRpcAppServerClient(new WebSocketAppServerTransport(socket), options))
-  return new Promise<JsonRpcAppServerClient>((resolve, reject) => {
+  if (socket.readyState === WEBSOCKET_OPEN) return new WebSocketAppServerTransport(socket)
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      cleanup()
+      socket.close(1000, "Connection aborted")
+      reject(new DOMException("The operation was aborted", "AbortError"))
+    }
     const onOpen = (): void => {
       cleanup()
-      resolve(new JsonRpcAppServerClient(new WebSocketAppServerTransport(socket), options))
+      resolve()
     }
     const onError = (): void => {
       cleanup()
@@ -144,11 +152,19 @@ export function connectWebSocketAppServer(url: string, options: WebSocketConnect
       socket.removeEventListener("open", onOpen)
       socket.removeEventListener("error", onError)
       socket.removeEventListener("close", onClose)
+      options.signal?.removeEventListener("abort", onAbort)
     }
     socket.addEventListener("open", onOpen)
     socket.addEventListener("error", onError)
     socket.addEventListener("close", onClose)
+    options.signal?.addEventListener("abort", onAbort, { once: true })
   })
+  return new WebSocketAppServerTransport(socket)
+}
+
+export async function connectWebSocketAppServer(url: string, options: WebSocketConnectOptions = {}): Promise<JsonRpcAppServerClient> {
+  const transport = await connectWebSocketAppServerTransport(url, options)
+  return new JsonRpcAppServerClient(transport, options)
 }
 
 function isMessageEvent(value: unknown): value is WebSocketMessageEvent {

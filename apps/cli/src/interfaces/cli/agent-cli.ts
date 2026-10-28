@@ -1,5 +1,5 @@
 import type { HeadlessOutputFormat } from "../../config/output-format.js"
-import type { SessionPermissionMode } from "@ag2cli/core/session/session-security.js"
+import type { PublicPermissionModeValue } from "@ag2cli/app-server-protocol/dto/snapshot.js"
 import type { InvocationName } from "./unified-cli.js"
 
 export interface AgentCliOptions {
@@ -11,7 +11,7 @@ export interface AgentCliOptions {
   maxTurns?: number
   timeoutMs?: number
   /** Session permission mode override; omitted leaves canonical state unchanged. */
-  permissionMode?: SessionPermissionMode
+  permissionMode?: PublicPermissionModeValue
   /** Explicit headless capability source; never discovered implicitly. */
   skillDir?: string
   promptFromStdin?: boolean
@@ -27,19 +27,20 @@ interface SessionRewindCliOptions {
 
 export type SessionAction =
   "create" | "list" | "get" | "events" | "resume" | "fork" | "archive" | "delete" | "checkpoints" | "preview-rewind" | "rewind"
-export type AgentHelpTopic =
-  "agent" | "plan" | "run" | "serve" | "pair" | "version" | "capabilities" | "session" | "inspect" | "observe" | "trace"
+export type AgentHelpTopic = "agent" | "run" | "serve" | "pair" | "version" | "capabilities" | "session" | "inspect" | "observe" | "trace"
 
 export type AgentCliCommand =
   | { readonly type: "help"; readonly topic?: AgentHelpTopic }
   | ({ readonly type: "version" } & Pick<AgentCliOptions, "format" | "requestId">)
   | ({ readonly type: "capabilities" } & Pick<AgentCliOptions, "format" | "requestId">)
   | ({ readonly type: "serve" } & Pick<AgentCliOptions, "configPath"> & { readonly workspaceRoots?: readonly string[] })
-  | ({ readonly type: "pair"; readonly endpoint: string; readonly clientKind?: PairingClientKind; readonly ttlMs?: number } & Pick<
-      AgentCliOptions,
-      "configPath" | "format" | "requestId" | "timeoutMs"
-    >)
-  | ({ readonly type: "plan"; readonly goal: string } & AgentCliOptions)
+  | ({
+      readonly type: "pair"
+      readonly endpoint: string
+      readonly hostId: string
+      readonly clientKind?: PairingClientKind
+      readonly ttlMs?: number
+    } & Pick<AgentCliOptions, "configPath" | "format" | "requestId" | "timeoutMs">)
   | ({ readonly type: "run"; readonly goal: string } & AgentCliOptions)
   | ({ readonly type: "inspect"; readonly sessionId: string } & Pick<AgentCliOptions, "format" | "requestId" | "timeoutMs">)
   | ({ readonly type: "trace"; readonly sessionId: string } & Pick<AgentCliOptions, "format" | "requestId" | "timeoutMs">)
@@ -77,13 +78,10 @@ export function parseAgentArgs(argv: readonly string[], options?: { invocationNa
     if (hasHelpFlag(rest)) return { type: "help", topic: "pair" }
     return { type: "pair", ...parsePairArgs(rest) }
   }
-  if (command === "plan" || command === "run") {
-    if (hasHelpFlag(rest)) return { type: "help", topic: command }
-    const parsed = parseGoalArgs(rest, `${invocationName} ${command} <goal | -> [options]`)
-    if (command === "plan" && (parsed.skillDir !== undefined || parsed.permissionMode !== undefined || parsed.maxTurns !== undefined)) {
-      throw new Error("agent plan does not load skills and accepts no execution options; use agent run for capability configuration")
-    }
-    return { type: command, ...parsed }
+  if (command === "run") {
+    if (hasHelpFlag(rest)) return { type: "help", topic: "run" }
+    const parsed = parseGoalArgs(rest, `${invocationName} run <goal | -> [options]`)
+    return { type: "run", ...parsed }
   }
   if (command === "trace" || command === "inspect" || command === "observe") {
     if (hasHelpFlag(rest)) return { type: "help", topic: command }
@@ -95,7 +93,6 @@ export function parseAgentArgs(argv: readonly string[], options?: { invocationNa
 }
 
 export const AGENT_HELP = `Usage:
-  agent plan <goal | -> [options]
   agent run <goal | -> [options]
   agent serve [--config <path>] [--workspace <path> ...]
   agent pair <ws://... | wss://...> [options]
@@ -116,7 +113,7 @@ options:
   --json                     alias for --format json
   --max-turns <n>            maximum turns (agent run only)
   --timeout-ms <n>           request timeout (run, resume, pair and session reads)
-  --permission-mode <mode>   manual|accept-edits|plan|full-access|auto (agent run only; a full-access session refuses unflagged run/plan, auto requires a configured guardian)
+  --permission-mode <mode>   manual|accept-edits|plan|full-access|auto (agent run only; a full-access session refuses an unflagged resume, auto requires a configured guardian)
   --skill-dir <path>         explicitly load a skills directory (run/resume only)
   --request-id <id>          request id
   --expected-revision <n>   run rewind only if the session is unchanged
@@ -129,10 +126,6 @@ stdout carries results or JSONL events; text-format errors and diagnostics go to
 
 const COMMAND_HELP: Readonly<Record<AgentHelpTopic, string>> = {
   agent: AGENT_HELP,
-  plan: `Usage: agent plan <goal | -> [options]
-
-Produces a read-only plan without tools, file edits or Bash. Use - to read the full prompt from stdin.
-  Options: --config, --session, --cwd, --format, --json, --timeout-ms, --request-id.`,
   run: `Usage: agent run <goal | -> [options]
 
 Runs one non-interactive agent run.
@@ -144,7 +137,8 @@ Options: --config, --session, --cwd, --format, --json, --max-turns, --timeout-ms
   pair: `Usage: agent pair <ws://... | wss://...> [options]
 
 Connects to a running serve and creates a short-lived single-use connection link. Requires device:admin credentials via AG2CLI_SERVER_TOKEN; no local runtime is started.
-Options: --connect, --client tui|web|mobile|desktop, --ttl-ms, --config, --format, --json, --timeout-ms, --request-id.`,
+The expected Host ID is required so the operator token is sent only after the Host proof is verified.
+Options: --host-id <id>, --connect, --client tui|web|mobile|desktop, --ttl-ms, --config, --format, --json, --timeout-ms, --request-id.`,
   version: "Usage: agent version [--format text|json|jsonl] [--json] [--request-id <id>]",
   capabilities: "Usage: agent capabilities [--format text|json|jsonl] [--json] [--request-id <id>]",
   session: `Usage: agent session create|list|get|events|resume|fork|archive|delete|checkpoints|preview-rewind|rewind [session-id] [checkpoint-id]
@@ -259,6 +253,7 @@ function parseConfigOnly(args: readonly string[]): Pick<AgentCliOptions, "config
 
 function parsePairArgs(args: readonly string[]): {
   endpoint: string
+  hostId: string
   clientKind?: PairingClientKind
   ttlMs?: number
   configPath?: string
@@ -267,6 +262,7 @@ function parsePairArgs(args: readonly string[]): {
   timeoutMs?: number
 } {
   let endpoint: string | undefined
+  let hostId: string | undefined
   let clientKind: PairingClientKind | undefined
   let ttlMs: number | undefined
   let configPath: string | undefined
@@ -285,6 +281,9 @@ function parsePairArgs(args: readonly string[]): {
     if (parsed.name === "connect") {
       if (endpoint !== undefined) throw new Error("--connect may only be given once")
       endpoint = requireValue(parsed.name, parsed.value)
+    } else if (parsed.name === "host-id") {
+      if (hostId !== undefined) throw new Error("--host-id may only be given once")
+      hostId = requireValue(parsed.name, parsed.value)
     } else if (parsed.name === "client") {
       clientKind = parsePairingClientKind(parsed.value)
     } else if (parsed.name === "ttl-ms") {
@@ -304,8 +303,10 @@ function parsePairArgs(args: readonly string[]): {
     endpoint = positionals[0]
   }
   if (endpoint === undefined) throw new Error("Usage: agent pair <ws://... | wss://...> [options]")
+  if (hostId === undefined) throw new Error("agent pair requires --host-id to verify the expected App Server Host")
   return {
     endpoint,
+    hostId,
     ...(clientKind === undefined ? {} : { clientKind }),
     ...(ttlMs === undefined ? {} : { ttlMs }),
     ...(configPath === undefined ? {} : { configPath }),
@@ -381,7 +382,6 @@ function hasHelpFlag(args: readonly string[]): boolean {
 function parseHelpTopic(value: string): AgentHelpTopic {
   if (
     value === "agent" ||
-    value === "plan" ||
     value === "run" ||
     value === "serve" ||
     value === "pair" ||
@@ -498,7 +498,7 @@ function parseNonNegativeInteger(name: string, value: string | undefined): numbe
   return parsed
 }
 
-function parsePermissionMode(value: string | undefined): SessionPermissionMode {
+function parsePermissionMode(value: string | undefined): PublicPermissionModeValue {
   if (value === "manual" || value === "accept-edits" || value === "plan" || value === "full-access" || value === "auto") return value
   throw new Error("--permission-mode must be manual, accept-edits, plan, full-access or auto")
 }

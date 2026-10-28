@@ -4,7 +4,8 @@
  * dialect is the stable part we can safely identify from a URL.
  */
 
-export type OpenAICompatibilityName = "generic" | "openai" | "deepseek" | "qwen" | "openrouter" | "together" | "zai" | "llama.cpp"
+export type OpenAICompatibilityName =
+  "generic" | "openai" | "deepseek" | "qwen" | "openrouter" | "together" | "zai" | "llama.cpp" | "moonshot" | "xai"
 
 export type OpenAIThinkingRequestFormat = "none" | "openai" | "deepseek" | "qwen" | "openrouter" | "together" | "zai"
 

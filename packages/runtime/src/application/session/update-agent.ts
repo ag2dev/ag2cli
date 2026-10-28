@@ -4,6 +4,7 @@ import { replaySession } from "@ag2cli/core/session/session-snapshot.js"
 import { DEFAULT_SESSION_PERMISSION_MODE } from "@ag2cli/core/session/session-security.js"
 import type { EventStore } from "../../ports/event-store.js"
 import type { AgentProfileResolver } from "../../ports/agent-profile.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { commandIdempotencyConflictError, resolveCommandIdempotency, type CommandIdempotencyFamily } from "./command-idempotency.js"
 import { appendSessionEventsIfRevision } from "./revision-conflict.js"
 import type { SessionAuthority } from "./session-authority.js"
@@ -37,12 +38,12 @@ export interface UpdateSessionAgentDependencies {
   /** Canonical composition-time workspace used when the first event is created. */
   readonly workspaceRoot?: string
   readonly identity: { nextEventId(): string; now(): string }
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 /** Persist the selected main-session agent as canonical session state. */
 export class UpdateSessionAgentUseCase {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
 
   constructor(private readonly deps: UpdateSessionAgentDependencies) {}
 
@@ -53,19 +54,7 @@ export class UpdateSessionAgentUseCase {
       if (this.deps.agents === undefined) throw new Error("The current session agent directory is not configured; cannot switch agents")
       if (!this.deps.agents.resolve(name)) throw new Error(`Unknown agent: ${name}`)
     }
-    const key = input.sessionId.toString()
-    const previous = this.pending.get(key)
-    const operation = (previous ?? Promise.resolve()).then(() => this.executeNow(input, name))
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(key, tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(key) === tracked) this.pending.delete(key)
-    }
+    return this.lane.run(input.sessionId.toString(), () => this.executeNow(input, name))
   }
 
   private async executeNow(input: UpdateSessionAgentInput, agentName: string | undefined): Promise<UpdateSessionAgentResult> {

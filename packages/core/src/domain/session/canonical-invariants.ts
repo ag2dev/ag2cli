@@ -20,6 +20,9 @@ type ToolFacts = {
   approvalRequested: boolean
   approvalOwnedBy?: "guardian"
   approvalResolved: boolean
+  askRequested: boolean
+  askResolved: boolean
+  askQuestions?: readonly { header: string; multiSelect: boolean; labels: readonly string[] }[]
   executionStarted: boolean
   executionEventId?: string
 }
@@ -184,8 +187,23 @@ export function validateCanonicalSession(events: readonly AgentEvent[]): void {
       case "ToolCallPrepared":
       case "ToolApprovalRequested":
       case "ToolApprovalResolved":
+      case "AskUserRequested":
       case "ToolCallExecutionStarted": {
         const run = requireRunningRun(runs, event.payload.runId, event.type)
+        validateRunEvent(run, event)
+        break
+      }
+      case "AskUserResolved": {
+        // The restart sweep converges a dangling ask only after its run
+        // ended; answerer outcomes stay run-scoped.
+        const run = requireRun(runs, event.payload.runId, event.type)
+        if (event.payload.outcome === "expired") {
+          if (run.status === "running") {
+            throw new Error(`AskUserResolved.expired requires an ended run: ${event.payload.runId}`)
+          }
+        } else if (run.status !== "running") {
+          throw new Error(`${event.type} cannot be written to a Run that has already ended: ${event.payload.runId}`)
+        }
         validateRunEvent(run, event)
         break
       }
@@ -220,7 +238,14 @@ function validateRunEvent(
   event: Extract<
     AgentEvent,
     {
-      type: "ToolCallRequested" | "ToolCallPrepared" | "ToolApprovalRequested" | "ToolApprovalResolved" | "ToolCallExecutionStarted"
+      type:
+        | "ToolCallRequested"
+        | "ToolCallPrepared"
+        | "ToolApprovalRequested"
+        | "ToolApprovalResolved"
+        | "AskUserRequested"
+        | "AskUserResolved"
+        | "ToolCallExecutionStarted"
     }
   >,
 ): void {
@@ -233,6 +258,8 @@ function validateRunEvent(
         name: event.payload.name,
         approvalRequested: false,
         approvalResolved: false,
+        askRequested: false,
+        askResolved: false,
         executionStarted: false,
       })
       break
@@ -380,6 +407,111 @@ function validateRunEvent(
       tool.approvalDecision = event.payload.decision
       break
     }
+    case "AskUserRequested": {
+      const tool = requireTool(run, event.payload.toolUseId, event.type)
+      if (tool.askRequested) throw new Error(`AskUserRequested must not be repeated: ${event.payload.toolUseId}`)
+      if (event.payload.name !== tool.name) throw new Error(`AskUserRequested tool name does not match: ${event.payload.toolUseId}`)
+      if (event.payload.questions.length === 0) {
+        throw new Error(`AskUserRequested must include at least one question: ${event.payload.toolUseId}`)
+      }
+      const askQuestions: { header: string; multiSelect: boolean; labels: readonly string[] }[] = []
+      for (const question of event.payload.questions) {
+        if (question.question.trim().length === 0) {
+          throw new Error(`AskUserRequested question text must not be empty: ${event.payload.toolUseId}`)
+        }
+        if (question.options.length === 0) {
+          throw new Error(`AskUserRequested question must include at least one option: ${event.payload.toolUseId}`)
+        }
+        const labels = new Set<string>()
+        for (const option of question.options) {
+          if (option.label.trim().length === 0) {
+            throw new Error(`AskUserRequested option labels must not be empty: ${event.payload.toolUseId}`)
+          }
+          if (labels.has(option.label)) {
+            throw new Error(`AskUserRequested option labels must be unique per question: ${event.payload.toolUseId}`)
+          }
+          labels.add(option.label)
+        }
+        askQuestions.push({
+          header: question.header ?? question.question.slice(0, 12),
+          multiSelect: question.multiSelect ?? false,
+          labels: [...labels],
+        })
+      }
+      tool.askRequested = true
+      tool.askQuestions = askQuestions
+      break
+    }
+    case "AskUserResolved": {
+      const tool = requireTool(run, event.payload.toolUseId, event.type)
+      if (!tool.askRequested) throw new Error(`AskUserResolved is missing AskUserRequested: ${event.payload.toolUseId}`)
+      if (tool.askResolved) throw new Error(`AskUserResolved must not be repeated: ${event.payload.toolUseId}`)
+      if (event.payload.resolvedBy !== undefined && event.payload.resolvedBy !== "system") {
+        throw new Error(`AskUserResolved.resolvedBy is invalid: ${event.payload.toolUseId}`)
+      }
+      // Only the restart-expiry sweep answers as the system; every human
+      // outcome arrives without attribution.
+      if ((event.payload.resolvedBy === "system") !== (event.payload.outcome === "expired")) {
+        throw new Error(`AskUserResolved.resolvedBy=system and outcome=expired must appear together: ${event.payload.toolUseId}`)
+      }
+      if (event.payload.outcome === "answered") {
+        if (event.payload.answers === undefined) {
+          throw new Error(`AskUserResolved.answered must include answers: ${event.payload.toolUseId}`)
+        }
+        if (event.payload.answers.length !== tool.askQuestions?.length) {
+          throw new Error(`AskUserResolved answers must cover every question exactly once: ${event.payload.toolUseId}`)
+        }
+        for (const [index, row] of event.payload.answers.entries()) {
+          const question = tool.askQuestions[index]!
+          if (row.questionIndex !== undefined && row.questionIndex !== index) {
+            throw new Error(`AskUserResolved answer question index does not match the question: ${event.payload.toolUseId}`)
+          }
+          if (row.header !== question.header) {
+            throw new Error(`AskUserResolved answer header does not match the question: ${event.payload.toolUseId}`)
+          }
+          const hasText = row.freeText?.trim().length !== undefined && row.freeText.trim().length > 0
+          if (row.selected.length === 0 && !hasText) {
+            throw new Error(`AskUserResolved answers must not be empty: ${event.payload.toolUseId}`)
+          }
+          if (!question.multiSelect && ((hasText && row.selected.length > 0) || (!hasText && row.selected.length !== 1))) {
+            throw new Error(`AskUserResolved single-select answers must pick one option or freeText: ${event.payload.toolUseId}`)
+          }
+          if (row.selected.some((label) => !question.labels.includes(label))) {
+            throw new Error(`AskUserResolved selected labels must be offered options: ${event.payload.toolUseId}`)
+          }
+          if (new Set(row.selected).size !== row.selected.length) {
+            throw new Error(`AskUserResolved selected labels must not repeat: ${event.payload.toolUseId}`)
+          }
+        }
+      } else if (event.payload.answers !== undefined) {
+        throw new Error(`AskUserResolved.answers requires outcome=answered: ${event.payload.toolUseId}`)
+      }
+      if (event.payload.outcome === "chat" && event.payload.contextAnswers !== undefined) {
+        const seen = new Set<number>()
+        for (const row of event.payload.contextAnswers) {
+          const question = tool.askQuestions?.[row.questionIndex]
+          if (question === undefined || seen.has(row.questionIndex)) {
+            throw new Error(`AskUserResolved chat context has an unknown or repeated question index: ${event.payload.toolUseId}`)
+          }
+          if (row.header !== question.header)
+            throw new Error(`AskUserResolved chat context header does not match question: ${event.payload.toolUseId}`)
+          if (row.selected.some((label) => !question.labels.includes(label)) || new Set(row.selected).size !== row.selected.length) {
+            throw new Error(`AskUserResolved chat context has an invalid selection: ${event.payload.toolUseId}`)
+          }
+          const hasText = row.freeText?.trim().length !== undefined && row.freeText.trim().length > 0
+          if (row.selected.length === 0 && !hasText)
+            throw new Error(`AskUserResolved chat context row is empty: ${event.payload.toolUseId}`)
+          if (!question.multiSelect && (row.selected.length > 1 || (hasText && row.selected.length > 0))) {
+            throw new Error(`AskUserResolved chat context violates single-select rules: ${event.payload.toolUseId}`)
+          }
+          seen.add(row.questionIndex)
+        }
+      } else if (event.payload.contextAnswers !== undefined) {
+        throw new Error(`AskUserResolved.contextAnswers requires outcome=chat: ${event.payload.toolUseId}`)
+      }
+      tool.askResolved = true
+      break
+    }
     case "ToolCallExecutionStarted": {
       const tool = requireTool(run, event.payload.toolUseId, event.type)
       if (event.payload.dispatchId.trim().length === 0 || event.payload.requestFingerprint.trim().length === 0) {
@@ -406,6 +538,11 @@ function validateRunEvent(
       // requested, execution requires an approved resolution.
       if (tool.approvalRequested && (!tool.approvalResolved || tool.approvalDecision !== "approved")) {
         throw new Error(`ToolCallExecutionStarted requires an approved approval result: ${event.payload.toolUseId}`)
+      }
+      // A durable ask binds the answers the tool executes with; execution
+      // only starts once the interaction has a canonical outcome.
+      if (tool.askRequested && !tool.askResolved) {
+        throw new Error(`ToolCallExecutionStarted requires a resolved ask result: ${event.payload.toolUseId}`)
       }
       if (tool.name === "bash") {
         if (event.payload.execution === undefined) {

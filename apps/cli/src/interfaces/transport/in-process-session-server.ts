@@ -15,6 +15,8 @@ import type { PolicySerialPoint } from "@ag2cli/runtime/ports/policy-serial-poin
 import type { PermissionSurfaces } from "@ag2cli/runtime/application/execution/permission-judgment.js"
 import { ExecuteShellUseCase } from "@ag2cli/runtime/application/execution/execute-shell.js"
 import { ApprovalResolutionService } from "@ag2cli/runtime/application/session/approval-resolution.js"
+import { AskResolutionService } from "@ag2cli/runtime/application/session/ask-resolution.js"
+import { AskExpirySweepUseCase } from "@ag2cli/runtime/application/session/ask-expiry-sweep.js"
 import { CompactSessionUseCase } from "@ag2cli/runtime/application/session/compact-session.js"
 import { UpdateSessionContextWindowUseCase } from "@ag2cli/runtime/application/session/context-window.js"
 import { UpdateSessionGoalUseCase } from "@ag2cli/runtime/application/session/update-goal.js"
@@ -24,6 +26,10 @@ import { UpdateSessionPermissionUseCase } from "@ag2cli/runtime/application/sess
 import { RewindSessionUseCase } from "@ag2cli/runtime/application/session/rewind-session.js"
 import { BackgroundTaskRegistry } from "@ag2cli/runtime/application/task/task-registry.js"
 import { BackgroundTaskManager } from "@ag2cli/runtime/application/task/background-task-manager.js"
+import { ShellBackgroundTaskExecutor } from "@ag2cli/runtime/application/task/shell-task-executor.js"
+import { cancelOrphanedAgentTasks } from "@ag2cli/runtime/application/task/orphaned-task-recovery.js"
+import { OrderedLane } from "@ag2cli/runtime/concurrency/ordered-lane.js"
+import { SingleFlight } from "@ag2cli/runtime/concurrency/single-flight.js"
 import {
   EnqueueSessionNotificationUseCase,
   type EnqueueSessionNotificationResult,
@@ -34,6 +40,7 @@ import type { BackgroundTaskExecutor } from "@ag2cli/runtime/ports/background-ta
 import type { AgentProfileResolver } from "@ag2cli/runtime/ports/agent-profile.js"
 import type { ToolExecutor } from "@ag2cli/runtime/ports/tool-executor.js"
 import type { ApprovalBroker } from "@ag2cli/runtime/ports/approval-broker.js"
+import type { AskBroker } from "@ag2cli/runtime/ports/ask-broker.js"
 import { isInvalidatingApprovalBroker } from "@ag2cli/runtime/ports/approval-broker.js"
 import type { Guardian, GuardianWaitRegistry } from "@ag2cli/runtime/ports/guardian.js"
 import type { SessionCatalog } from "@ag2cli/runtime/ports/session-catalog.js"
@@ -45,15 +52,16 @@ import type { RuntimeEnvironment } from "@ag2cli/runtime/ports/environment.js"
 import type { WorkspacePolicyFactory, WorkspaceScopeDigest } from "@ag2cli/runtime/ports/workspace.js"
 import { applySessionEvent, emptySessionSnapshot, replaySession, type SessionSnapshot } from "@ag2cli/core/session/session-snapshot.js"
 import type { SessionSnapshotStore, StoredSessionSnapshot } from "@ag2cli/runtime/ports/session-snapshot-store.js"
-import type { SessionCommand, SessionCommandResult } from "@ag2cli/protocol/session-command.js"
+import type { SessionCommand, SessionCommandResult } from "@ag2cli/session-protocol/session-command.js"
 import type {
   SessionClient,
   SessionEventListener,
   SessionTransientEventListener,
   SessionExecuteOptions,
   SessionServer,
+  SessionSubscriptionHandle,
   SessionSubscriptionOptions,
-} from "@ag2cli/client/session-client.js"
+} from "@ag2cli/session-client/session-client.js"
 import { SessionCommandRouter } from "./session-command-router.js"
 import { SessionSubscriptionHub } from "@ag2cli/runtime/application/session/session-subscription.js"
 import { SessionCommandCoordinator } from "@ag2cli/runtime/application/session/session-coordinator.js"
@@ -87,6 +95,12 @@ export interface SessionServerDependencies {
     readonly tools: ToolExecutor
     readonly shellTools?: ToolExecutor
     readonly approval: ApprovalBroker
+    /**
+     * Durable ask_user surface. Present only on hosts whose clients answer
+     * remotely (serve); a host with a local interactive surface keeps its
+     * askUser callback and must not inject a broker.
+     */
+    readonly ask?: AskBroker
     readonly contextBuilder?: ContextBuilder
     readonly agentProfiles?: AgentProfileResolver
     readonly compactor?: ContextCompactor
@@ -146,6 +160,10 @@ export class InProcessSessionServer implements SessionServer {
   private readonly taskManager: BackgroundTaskManager
   /** Host-side notification seam; appends pending canonical inputs. */
   private readonly notificationUseCase: EnqueueSessionNotificationUseCase
+  /** First-serve convergence for asks left dangling by an ended run. */
+  private readonly askExpirySweep?: AskExpirySweepUseCase
+  /** Single-flight per session: the first touch converges, later touches join it. */
+  private readonly convergences = new SingleFlight<string>()
   /** The one per-host policy serial point; composition shares it for child tasks. */
   readonly policySerialPoint: PolicySerialPoint
   private readonly subscriptionHub = new SessionSubscriptionHub()
@@ -155,7 +173,7 @@ export class InProcessSessionServer implements SessionServer {
   private readonly transientSequences = new Map<string, number>()
   private readonly transientSnapshots = new Map<string, TransientStreamEvent[]>()
   private readonly snapshots = new Map<string, StoredSessionSnapshot>()
-  private readonly snapshotPending = new Map<string, Promise<void>>()
+  private readonly snapshotPending = new OrderedLane<string>()
   private readonly observability: ObservabilityPolicy
   private readonly traceSink?: TraceStore
   private readonly commandRouter: SessionCommandRouter
@@ -169,17 +187,13 @@ export class InProcessSessionServer implements SessionServer {
       eventStore: deps.eventStore,
       authority: this.authority,
       identity: deps.identity,
-      onEventsAppended: (events) => this.publishEvents(events),
+      onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
     })
     this.notificationUseCase = new EnqueueSessionNotificationUseCase({
       eventStore: deps.eventStore,
       authority: this.authority,
       identity: deps.identity,
-      onEventsAppended: (events) => this.publishEvents(events),
-    })
-    this.taskManager = new BackgroundTaskManager(this.taskRegistry, deps.backgroundTaskExecutor, undefined, {
-      ...(deps.execution?.executionReservation === undefined ? {} : { executionReservation: deps.execution.executionReservation }),
-      ...(deps.execution?.reservationOwnerId === undefined ? {} : { reservationOwnerId: deps.execution.reservationOwnerId }),
+      onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
     })
     this.useCase = new CreatePlanUseCase({
       ...deps,
@@ -187,19 +201,19 @@ export class InProcessSessionServer implements SessionServer {
       authority: this.authority,
       ...(deps.executionReservation === undefined ? {} : { executionReservation: deps.executionReservation }),
       ...(deps.reservationOwnerId === undefined ? {} : { reservationOwnerId: deps.reservationOwnerId }),
-      onEventsAppended: (events) => this.publishEvents(events),
+      onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
     })
     this.contextWindowUseCase = new UpdateSessionContextWindowUseCase({
       eventStore: deps.eventStore,
       authority: this.authority,
       identity: deps.identity,
-      onEventsAppended: (events) => this.publishEvents(events),
+      onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
     })
     this.goalUseCase = new UpdateSessionGoalUseCase({
       eventStore: deps.eventStore,
       authority: this.authority,
       identity: deps.identity,
-      onEventsAppended: (events) => this.publishEvents(events),
+      onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
     })
     this.agentUseCase = new UpdateSessionAgentUseCase({
       eventStore: deps.eventStore,
@@ -207,7 +221,7 @@ export class InProcessSessionServer implements SessionServer {
       agents: deps.agentProfiles,
       workspaceRoot: deps.workspaceRoot,
       identity: deps.identity,
-      onEventsAppended: (events) => this.publishEvents(events),
+      onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
     })
     // The canonical tool-turn judgment owns permission policy; the approval
     // broker below is only the interactive surface, passed through unwrapped.
@@ -217,11 +231,27 @@ export class InProcessSessionServer implements SessionServer {
           authority: this.authority,
           identity: deps.execution.identity,
           broker: deps.execution.approval,
-          onEventsAppended: (events) => this.publishEvents(events),
+          onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
         })
       : undefined
-    const onSecurityEventsAppended = (events: readonly AgentEvent[]): void => {
-      this.publishEvents(events)
+    // A broker injected without an execution layer has no executor to wake,
+    // so the ask surface follows the execution half; a host without one keeps
+    // every ask on its local askUser callback and refuses remote resolution.
+    const askResolution =
+      deps.execution?.ask === undefined
+        ? undefined
+        : new AskResolutionService({
+            eventStore: deps.eventStore,
+            authority: this.authority,
+            identity: deps.execution.identity,
+            broker: deps.execution.ask,
+            onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
+          })
+    if (askResolution !== undefined) {
+      this.askExpirySweep = new AskExpirySweepUseCase({ eventStore: deps.eventStore, sweeper: askResolution })
+    }
+    const onSecurityEventsAppended = (events: readonly AgentEvent[], replayed: boolean): void => {
+      this.publishEvents(events, replayed)
       const securityChange = events.find(
         (event) =>
           event.type === "SessionPermissionModeSet" ||
@@ -229,14 +259,13 @@ export class InProcessSessionServer implements SessionServer {
           event.type === "SessionAdditionalDirectoryAdded",
       )
       if (securityChange !== undefined) {
-        // Invalidate first so a pending ask can never resolve under the old
-        // policy, then abort model attempts bound to the old revision; tool
-        // processes keep running and commit their results normally.
+        // Invalidate pending interactions before they can resolve under the
+        // old policy. In-flight model calls may finish, but every resulting
+        // tool call is judged against the latest canonical security state.
         const broker = deps.execution?.approval
         if (broker !== undefined && isInvalidatingApprovalBroker(broker)) broker.invalidatePending(securityChange.sessionId)
         const guardianWaits = deps.execution?.guardianWaits
         if (guardianWaits !== undefined) guardianWaits.invalidate(securityChange.sessionId, securityChange.payload.policyRevision)
-        this.runUseCase?.abortModelAttemptsForPolicyChange(securityChange.sessionId)
         deps.onSecurityChange?.(securityChange.sessionId, securityChange.payload.policyRevision)
       }
     }
@@ -268,7 +297,7 @@ export class InProcessSessionServer implements SessionServer {
       identity: deps.identity,
       ...(deps.execution?.executionReservation === undefined ? {} : { executionReservation: deps.execution.executionReservation }),
       ...(deps.execution?.reservationOwnerId === undefined ? {} : { reservationOwnerId: deps.execution.reservationOwnerId }),
-      onEventsAppended: (events) => this.publishEvents(events),
+      onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
     })
     if (deps.execution?.compactor) {
       this.compactUseCase = new CompactSessionUseCase({
@@ -279,7 +308,7 @@ export class InProcessSessionServer implements SessionServer {
         observability: this.observability,
         ...(deps.execution?.executionReservation === undefined ? {} : { executionReservation: deps.execution.executionReservation }),
         ...(deps.execution?.reservationOwnerId === undefined ? {} : { reservationOwnerId: deps.execution.reservationOwnerId }),
-        onEventsAppended: (events) => this.publishEvents(events),
+        onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
       })
     }
     if (deps.execution) {
@@ -289,13 +318,14 @@ export class InProcessSessionServer implements SessionServer {
         approval: deps.execution.approval,
         permissionSurfaces: deps.execution.permissionSurfaces,
         approvalResolution: approvalResolution!,
+        ...(askResolution === undefined ? {} : { askResolution }),
         eventStore: deps.eventStore,
         authority: this.authority,
         traceSink: this.traceSink,
         observability: this.observability,
         ...(deps.execution.executionReservation === undefined ? {} : { executionReservation: deps.execution.executionReservation }),
         ...(deps.execution.reservationOwnerId === undefined ? {} : { reservationOwnerId: deps.execution.reservationOwnerId }),
-        onEventsAppended: (events) => this.publishEvents(events),
+        onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
         onTransientEvent: (event) => this.publishTransientEvent(event),
       })
       this.shellUseCase = new ExecuteShellUseCase({
@@ -306,10 +336,26 @@ export class InProcessSessionServer implements SessionServer {
         eventStore: deps.eventStore,
         authority: this.authority,
         traceSink: this.traceSink,
-        onEventsAppended: (events) => this.publishEvents(events),
+        onEventsAppended: (events, replayed) => this.publishEvents(events, replayed),
         onTransientEvent: (event) => this.publishTransientEvent(event),
       })
     }
+    // The shell use case already serializes per session and fences its own
+    // execution reservation; wrapping it in the manager's coordination
+    // reservation would self-conflict the session's single writer, so the
+    // shell fallback executor runs uncoordinated. An assembly-injected
+    // executor keeps full coordination.
+    this.taskManager = new BackgroundTaskManager(
+      this.taskRegistry,
+      deps.backgroundTaskExecutor ?? (this.shellUseCase === undefined ? undefined : new ShellBackgroundTaskExecutor(this.shellUseCase)),
+      undefined,
+      deps.backgroundTaskExecutor === undefined
+        ? undefined
+        : {
+            ...(deps.execution?.executionReservation === undefined ? {} : { executionReservation: deps.execution.executionReservation }),
+            ...(deps.execution?.reservationOwnerId === undefined ? {} : { reservationOwnerId: deps.execution.reservationOwnerId }),
+          },
+    )
     this.commandRouter = new SessionCommandRouter({
       eventStore: deps.eventStore,
       catalog: deps.catalog,
@@ -325,6 +371,7 @@ export class InProcessSessionServer implements SessionServer {
       agent: this.agentUseCase,
       taskManager: this.taskManager,
       approvalResolution,
+      ...(askResolution === undefined ? {} : { askResolution }),
       traceSink: this.traceSink,
       observability: this.observability,
       defaultMaxTurns: deps.defaultMaxTurns,
@@ -338,13 +385,15 @@ export class InProcessSessionServer implements SessionServer {
   }
 
   async execute(id: SessionId, command: SessionCommand, options?: SessionExecuteOptions): Promise<SessionCommandResult> {
+    // Convergence sits ahead of dispatch so a read never observes the
+    // pre-convergence stream and a write never races the recovered loop.
+    await this.convergenceFor(id)
     return this.commandCoordinator.execute(id, command, options, (nextId, nextCommand, nextOptions) =>
       this.commandRouter.execute(nextId, nextCommand, nextOptions),
     )
   }
 
   async close(): Promise<void> {
-    this.commandCoordinator.clear()
     await this.authority.close()
     this.subscriptionHub.close()
     this.transientSnapshots.clear()
@@ -362,8 +411,29 @@ export class InProcessSessionServer implements SessionServer {
     await this.deps.close?.()
   }
 
-  async recoverUnfinishedRuns(): Promise<void> {
-    await this.runUseCase?.recoverUnfinishedRuns()
+  /**
+   * Single-flight convergence for one session's restart residue. The first
+   * touch creates the body; concurrent touches join the in-flight promise.
+   * A resolved body stays so convergence runs once per session per server;
+   * a rejected body deletes its entry so the next touch retries.
+   */
+  private convergenceFor(id: SessionId): Promise<void> {
+    return this.convergences.join(id.toString(), () => this.convergeSession(id))
+  }
+
+  /**
+   * Settle what a dead process left on the canonical stream: cancel
+   * orphaned agent tasks, expire asks whose runs already ended, then
+   * schedule the interrupted run's resume. Cancels run first so the scan
+   * cannot reap tasks the recovered run spawns live; the resume itself is
+   * fire-and-forget and the stream stays the only user-visible state.
+   * Read-only hosts (no execution layer) never converge.
+   */
+  private async convergeSession(id: SessionId): Promise<void> {
+    if (this.runUseCase === undefined) return
+    await cancelOrphanedAgentTasks({ registry: this.taskRegistry, sessionId: id, serialPoint: this.policySerialPoint })
+    await this.askExpirySweep?.execute(id)
+    await this.runUseCase.recoverSessionRuns(id)
   }
 
   /**
@@ -372,12 +442,22 @@ export class InProcessSessionServer implements SessionServer {
    * a composition-only injection point for child-settle projections — not
    * a public protocol command, and it never starts a run by itself.
    */
-  async enqueueHostNotification(sessionId: SessionId, text: string): Promise<EnqueueSessionNotificationResult> {
-    return await this.notificationUseCase.execute({ sessionId, text })
+  async enqueueHostNotification(id: SessionId, text: string): Promise<EnqueueSessionNotificationResult> {
+    return await this.notificationUseCase.execute({ sessionId: id, text })
   }
 
-  subscribe(id: SessionId, afterRevision: number, listener: SessionEventListener, options?: SessionSubscriptionOptions): () => void {
-    return this.subscriptionHub.subscribe(id, afterRevision, listener, options)
+  subscribe(
+    id: SessionId,
+    afterRevision: number,
+    listener: SessionEventListener,
+    options?: SessionSubscriptionOptions,
+  ): SessionSubscriptionHandle {
+    // The listener is installed before the kick so it observes the
+    // convergence events; the kick is never awaited and its failure is
+    // retried by the next command touch.
+    const unsubscribe = this.subscriptionHub.subscribe(id, afterRevision, listener, options)
+    void this.convergenceFor(id).catch(() => {})
+    return { unsubscribe, installed: Promise.resolve() }
   }
 
   subscribeTransient(id: SessionId, listener: SessionTransientEventListener): () => void {
@@ -429,32 +509,21 @@ export class InProcessSessionServer implements SessionServer {
     return snapshot
   }
 
-  private async publishEvents(events: readonly AgentEvent[]): Promise<void> {
+  private async publishEvents(events: readonly AgentEvent[], replayed = false): Promise<void> {
     const id = events[0]?.sessionId
     if (!id) return
     await this.advanceSnapshot(events)
-    emitEventsToTelemetry(this.deps.telemetry, this.observability, events)
+    // Replay delivery is at-least-once; only telemetry counting must skip it.
+    if (!replayed) emitEventsToTelemetry(this.deps.telemetry, this.observability, events)
     this.clearCompletedTransient(events)
     this.subscriptionHub.publishDurable(events)
   }
 
   /** Advance the in-memory and durable read model without affecting the write outcome. */
-  private async advanceSnapshot(events: readonly AgentEvent[]): Promise<void> {
+  private advanceSnapshot(events: readonly AgentEvent[]): Promise<void> {
     const first = events[0]
-    if (!first) return
-    const key = first.sessionId.toString()
-    const previous = this.snapshotPending.get(key) ?? Promise.resolve()
-    const operation = previous.then(() => this.advanceSnapshotNow(events))
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.snapshotPending.set(key, tracked)
-    try {
-      await operation
-    } finally {
-      if (this.snapshotPending.get(key) === tracked) this.snapshotPending.delete(key)
-    }
+    if (!first) return Promise.resolve()
+    return this.snapshotPending.run(first.sessionId.toString(), () => this.advanceSnapshotNow(events))
   }
 
   private async advanceSnapshotNow(events: readonly AgentEvent[]): Promise<void> {
@@ -567,7 +636,8 @@ class InProcessSessionClient implements SessionClient {
   }
 
   subscribe(afterRevision: number, listener: SessionEventListener, options?: SessionSubscriptionOptions): () => void {
-    return this.server.subscribe(this.id, afterRevision, listener, options)
+    const handle = this.server.subscribe(this.id, afterRevision, listener, options)
+    return () => handle.unsubscribe()
   }
 
   subscribeTransient(listener: SessionTransientEventListener): () => void {

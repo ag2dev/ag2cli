@@ -1,34 +1,152 @@
 import { z, ZodError, type ZodType } from "zod"
 import {
   APP_SERVER_METHODS,
+  APP_SERVER_NOTIFICATION_METHODS,
   APP_SERVER_PROTOCOL_VERSION,
   APP_SERVER_SCOPES,
-  isSessionCommandActionType,
-  PERMISSION_MODES,
-  PERMISSION_RULE_BEHAVIORS,
-  TASK_TYPES,
   type AppServerClientInfo,
   type AppServerDeviceRecord,
-  type AppServerDeviceRegistration,
   type AppServerDeviceChallenge,
+  type AppServerHostProofPurpose,
   type AppServerMethod,
-  type AppServerPairingChallenge,
+  type AppServerNotificationMethod,
+  type AppServerPairCreateParams,
+  type AppServerPairCreateResult,
+  type AppServerPairPreviewParams,
+  type AppServerPairPreviewResult,
+  type AppServerPairClaimParams,
+  type AppServerPairClaimResult,
   type AppServerScope,
-  type AppServerGoalUpdate,
-  type AppServerPermissionMode,
-  type AppServerPermissionRule,
-  type AppServerPermissionRuleBehavior,
-  type AppServerTaskType,
-  type AppServerSessionCommandAction,
-  type SessionHistoryCursor,
-  type InteractionLeaseScope,
-  type SessionCommandParams,
   type JsonValue,
+  type ServerDescribeResult,
   type ServerInitializeResult,
   type ServerInitializeParams,
+  type ServerPreflightParams,
+  type ServerPreflightResult,
 } from "./types.js"
 import { isJsonValue } from "./json-rpc.js"
-import { isAppServerDeviceSignature, isValidAppServerDeviceChallenge } from "./device-proof.js"
+import {
+  decodeBase64Url,
+  isAppServerDeviceChallenge,
+  isAppServerDevicePublicKey,
+  isAppServerDeviceSignature,
+  isValidAppServerDeviceChallenge,
+} from "./device-proof.js"
+import {
+  decodeAppServerHostProofSignature,
+  decodeAppServerHostPublicKey,
+  isAppServerHostId,
+  isAppServerHostProofPurpose,
+  isValidAppServerHostProofNonce,
+} from "./host-proof.js"
+import {
+  booleanSchema,
+  freeformStringArraySchema,
+  nonEmptyStringArraySchema,
+  nonEmptyStringSchema,
+  nonNegativeIntegerSchema,
+  positiveIntegerSchema,
+} from "./dto/primitives.js"
+import { isKnownPublicSessionEventType, publicSessionEventEnvelopeSchema, publicSessionEventSchema } from "./dto/events.js"
+import { appServerCapabilitiesSchema } from "./dto/capabilities.js"
+import {
+  sessionArchiveParamsSchema,
+  sessionArchiveResultSchema,
+  sessionCreateParamsSchema,
+  sessionDeleteParamsSchema,
+  sessionDeleteResultSchema,
+  sessionForkParamsSchema,
+  sessionGetParamsSchema,
+  sessionGetResultSchema,
+  sessionListParamsSchema,
+  sessionListResultSchema,
+  sessionSnapshotResultSchema,
+} from "./dto/catalog-methods.js"
+import {
+  sessionAttachParamsSchema,
+  sessionAttachResultSchema,
+  sessionDetachParamsSchema,
+  sessionDetachResultSchema,
+  sessionReplayParamsSchema,
+  sessionReplayResultSchema,
+  sessionResyncParamsSchema,
+  sessionResyncResultSchema,
+  sessionSnapshotMethodParamsSchema,
+  sessionSnapshotMethodResultSchema,
+} from "./dto/recovery-methods.js"
+import {
+  sessionCancelInputParamsSchema,
+  sessionCancelInputResultSchema,
+  sessionCancelRunParamsSchema,
+  sessionCancelRunResultSchema,
+  sessionMessagesParamsSchema,
+  sessionMessagesResultSchema,
+  sessionResolveInteractionParamsSchema,
+  sessionResolveInteractionResultSchema,
+  sessionSteerParamsSchema,
+  sessionSteerResultSchema,
+  sessionSubmitParamsSchema,
+  sessionSubmitResultSchema,
+} from "./dto/write-methods.js"
+import {
+  sessionGetPermissionPolicyParamsSchema,
+  sessionGetPermissionPolicyResultSchema,
+  sessionSetPermissionModeParamsSchema,
+  sessionSetPermissionRulesParamsSchema,
+} from "./dto/policy.js"
+import {
+  workspaceDiffParamsSchema,
+  workspaceDiffResultSchema,
+  workspaceReadFileParamsSchema,
+  workspaceReadFileResultSchema,
+} from "./dto/workspace.js"
+import {
+  sessionCreateTaskParamsSchema,
+  sessionCreateTaskResultSchema,
+  sessionListTasksParamsSchema,
+  sessionListTasksResultSchema,
+  sessionCancelTaskParamsSchema,
+  sessionCancelTaskResultSchema,
+  sessionGetTaskLogsParamsSchema,
+  sessionGetTaskLogsResultSchema,
+  sessionExecuteShellParamsSchema,
+  sessionExecuteShellResultSchema,
+  sessionExecuteUserShellParamsSchema,
+  sessionExecuteUserShellResultSchema,
+} from "./dto/task-methods.js"
+import {
+  sessionCompactParamsSchema,
+  sessionCompactResultSchema,
+  sessionAddDirectoryParamsSchema,
+  sessionAddDirectoryResultSchema,
+  sessionSetContextWindowParamsSchema,
+  sessionSetContextWindowResultSchema,
+  sessionClearContextWindowParamsSchema,
+  sessionClearContextWindowResultSchema,
+  sessionSelectAgentParamsSchema,
+  sessionSelectAgentResultSchema,
+  sessionUpdateGoalParamsSchema,
+  sessionUpdateGoalResultSchema,
+} from "./dto/session-action-methods.js"
+import {
+  sessionListCheckpointsParamsSchema,
+  sessionListCheckpointsResultSchema,
+  sessionPreviewRewindParamsSchema,
+  sessionPreviewRewindResultSchema,
+  sessionRewindParamsSchema,
+  sessionRewindResultSchema,
+} from "./dto/rewind-methods.js"
+import {
+  interactionLeaseUpdatedNotificationParamsSchema,
+  presenceUpdatedNotificationParamsSchema,
+  sessionResyncRequiredNotificationParamsSchema,
+  sessionTransientNotificationParamsSchema,
+  type AppServerSessionEventNotificationParams,
+  type InteractionLeaseUpdatedNotificationParams,
+  type PresenceUpdatedNotificationParams,
+  type SessionResyncRequiredNotificationParams,
+  type SessionTransientNotificationParams,
+} from "./dto/notifications.js"
 
 export class AppServerProtocolError extends Error {
   readonly kind: string
@@ -80,59 +198,18 @@ function zodParse<T>(schema: ZodType<T, z.ZodTypeDef, unknown>, value: unknown, 
   }
 }
 
-export function nonEmptyStringSchema(name: string): ZodType<string> {
-  return z
-    .string({
-      invalid_type_error: `${name} must be a non-empty string`,
-      required_error: `${name} must be a non-empty string`,
-    })
-    .refine((value) => value.trim().length > 0, {
-      message: `${name} must be a non-empty string`,
-    })
-}
-
-export function nonNegativeIntegerSchema(name: string): ZodType<number> {
-  return z
-    .number({
-      invalid_type_error: `${name} must be a non-negative integer`,
-      required_error: `${name} must be a non-negative integer`,
-    })
-    .refine((value) => Number.isSafeInteger(value) && value >= 0, {
-      message: `${name} must be a non-negative integer`,
-    })
-}
-
-export function positiveIntegerSchema(name: string): ZodType<number> {
-  return z
-    .number({
-      invalid_type_error: `${name} must be a positive integer`,
-      required_error: `${name} must be a positive integer`,
-    })
-    .refine((value) => Number.isSafeInteger(value) && value >= 1, {
-      message: `${name} must be a positive integer`,
-    })
-}
-
-export function booleanSchema(name: string): ZodType<boolean> {
-  return z.boolean({ invalid_type_error: `${name} must be a boolean` })
-}
-
-/** Rejects empty-string items, e.g. for `capabilities`. */
-export function nonEmptyStringArraySchema(name: string): ZodType<string[], z.ZodTypeDef, unknown> {
-  return z
-    .array(z.unknown(), { invalid_type_error: `${name} must be a non-empty string array` })
-    .refine((items) => items.every((item) => typeof item === "string" && item.trim().length > 0), {
-      message: `${name} must be a non-empty string array`,
-    })
-    .transform((items) => items as string[])
-}
-
-/** Unlike {@link nonEmptyStringArraySchema}, `session.submit`/`session.plan`'s free-form
- * `context`/`fileReferences` arrays have always allowed empty-string entries. */
-export function freeformStringArraySchema(name: string): z.ZodType<readonly string[]> {
-  return z.array(z.string({ invalid_type_error: `${name} must be a string array` }), {
-    invalid_type_error: `${name} must be a string array`,
-  })
+// The shared building blocks below are defined in `dto/primitives.js` with
+// Zod-native constraints (`.min()`/`.int()`/`.regex()`) so JSON Schema
+// generation preserves them; per-field error messages are unchanged. They are
+// re-exported here because method params schemas and external consumers have
+// historically imported them from this module.
+export {
+  nonEmptyStringSchema,
+  nonNegativeIntegerSchema,
+  positiveIntegerSchema,
+  booleanSchema,
+  nonEmptyStringArraySchema,
+  freeformStringArraySchema,
 }
 
 export function parseNonEmptyString(value: unknown, name: string): string {
@@ -147,13 +224,14 @@ function parsePositiveInteger(value: unknown, name: string): number {
   return zodParse(positiveIntegerSchema(name), value)
 }
 
-export function asRecord(value: unknown, name: string): Record<string, unknown> {
+export function asRecord(value: unknown, name: string, errorKind = "invalid_params"): Record<string, unknown> {
   return zodParse(
     z.record(z.string(), z.unknown(), {
       invalid_type_error: `${name} must be an object`,
       required_error: `${name} must be an object`,
     }),
     value,
+    errorKind,
   )
 }
 
@@ -161,8 +239,8 @@ export const scopeSchema = z.enum(APP_SERVER_SCOPES as unknown as readonly [AppS
   message: "scope is invalid",
 })
 
-function parseScopes(value: unknown): readonly AppServerScope[] {
-  const scopes = zodParse(z.array(scopeSchema, { invalid_type_error: "requestedScopes must be an array" }), value)
+function parseScopes(value: unknown, errorKind = "invalid_params", fieldName = "requestedScopes"): readonly AppServerScope[] {
+  const scopes = zodParse(z.array(scopeSchema, { invalid_type_error: `${fieldName} must be an array` }), value, errorKind)
   return [...new Set(scopes)]
 }
 
@@ -178,6 +256,11 @@ function parseClientKind(value: unknown, name: string): AppServerClientInfo["cli
 
 export function parseServerInitializeParams(value: unknown): ServerInitializeParams {
   const record = asRecord(value, "server.initialize.params")
+  rejectUnknownFields(
+    record,
+    ["appServerProtocolVersion", "hostId", "client", "auth", "requestedScopes", "clientCapabilities", "recovery"],
+    "server.initialize.params",
+  )
   if (record.appServerProtocolVersion !== APP_SERVER_PROTOCOL_VERSION) {
     throw new AppServerProtocolError(
       "protocol_version_mismatch",
@@ -185,20 +268,119 @@ export function parseServerInitializeParams(value: unknown): ServerInitializePar
       { details: { supported: APP_SERVER_PROTOCOL_VERSION } },
     )
   }
+  const hostId = parseNonEmptyString(record.hostId, "hostId")
+  if (!isAppServerHostId(hostId)) throw new AppServerProtocolError("invalid_params", "hostId has an invalid format")
   const client = parseClientInfo(record.client)
-  const device = record.device === undefined ? undefined : parseDevice(record.device)
+  const auth = parseServerInitializeAuth(record.auth)
   const requestedScopes = record.requestedScopes === undefined ? undefined : parseScopes(record.requestedScopes)
+  const clientCapabilities =
+    record.clientCapabilities === undefined ? undefined : zodParse(appServerCapabilitiesSchema, record.clientCapabilities, "invalid_params")
   const recovery = record.recovery === undefined ? undefined : parseRecovery(record.recovery)
-  const serverFingerprint =
-    record.serverFingerprint === undefined ? undefined : parseNonEmptyString(record.serverFingerprint, "serverFingerprint")
   return {
     appServerProtocolVersion: APP_SERVER_PROTOCOL_VERSION,
+    hostId,
     client,
-    ...(device === undefined ? {} : { device }),
+    auth,
     ...(requestedScopes === undefined ? {} : { requestedScopes }),
-    ...(serverFingerprint === undefined ? {} : { serverFingerprint }),
+    ...(clientCapabilities === undefined ? {} : { clientCapabilities }),
     ...(recovery === undefined ? {} : { recovery }),
   }
+}
+
+function parseServerInitializeAuth(value: unknown): ServerInitializeParams["auth"] {
+  const record = asRecord(value, "server.initialize.params.auth")
+  if (record.type === "device") {
+    rejectUnknownFields(record, ["type", "device"], "server.initialize.params.auth")
+    const device = asRecord(record.device, "server.initialize.params.auth.device")
+    rejectUnknownFields(device, ["deviceId", "credential", "challenge", "signature"], "server.initialize.params.auth.device")
+    const parsed = {
+      deviceId: parseNonEmptyString(device.deviceId, "deviceId"),
+      credential: parseNonEmptyString(device.credential, "credential"),
+      challenge: parseNonEmptyString(device.challenge, "challenge"),
+      signature: parseNonEmptyString(device.signature, "signature"),
+    }
+    if (!isEncoded32ByteToken(parsed.credential, "ag2cli-device.")) {
+      throw new AppServerProtocolError("invalid_params", "credential has an invalid format")
+    }
+    if (!isAppServerDeviceChallenge(parsed.challenge)) throw new AppServerProtocolError("invalid_params", "challenge has an invalid format")
+    if (!isAppServerDeviceSignature(parsed.signature)) throw new AppServerProtocolError("invalid_params", "signature has an invalid format")
+    return { type: "device", device: parsed }
+  }
+  if (record.type === "operator") {
+    rejectUnknownFields(record, ["type", "bearerToken"], "server.initialize.params.auth")
+    return { type: "operator", bearerToken: parseNonEmptyString(record.bearerToken, "bearerToken") }
+  }
+  throw new AppServerProtocolError("invalid_params", "auth.type must be device or operator")
+}
+
+export function parseServerPreflightParams(value: unknown): ServerPreflightParams {
+  const record = asRecord(value, "server.preflight.params")
+  rejectUnknownFields(record, ["nonce", "purpose"], "server.preflight.params")
+  const nonce = parseNonEmptyString(record.nonce, "nonce")
+  if (!isValidAppServerHostProofNonce(nonce)) {
+    throw new AppServerProtocolError("invalid_params", "nonce has an invalid format")
+  }
+  return {
+    nonce,
+    purpose: parseHostProofPurpose(record.purpose, "invalid_params"),
+  }
+}
+
+export function parseServerPreflightResult(value: unknown): ServerPreflightResult {
+  const record = zodParse(
+    z.record(z.string(), z.unknown(), {
+      invalid_type_error: "server.preflight.result must be an object",
+      required_error: "server.preflight.result must be an object",
+    }),
+    value,
+    "invalid_result",
+  )
+  rejectUnknownFields(
+    record,
+    ["hostId", "hostPublicKey", "nonce", "purpose", "expiresAt", "signature", "deviceChallenge", "deviceChallengeExpiresAt"],
+    "server.preflight.result",
+    "invalid_result",
+  )
+  const hostId = parseResultNonEmptyString(record.hostId, "hostId")
+  const hostPublicKey = parseResultNonEmptyString(record.hostPublicKey, "hostPublicKey")
+  const nonce = parseResultNonEmptyString(record.nonce, "nonce")
+  const purpose = parseHostProofPurpose(record.purpose, "invalid_result")
+  const expiresAt = parseResultNonNegativeInteger(record.expiresAt, "expiresAt")
+  const signature = parseResultNonEmptyString(record.signature, "signature")
+  const deviceChallenge =
+    record.deviceChallenge === undefined ? undefined : parseResultNonEmptyString(record.deviceChallenge, "deviceChallenge")
+  const deviceChallengeExpiresAt =
+    record.deviceChallengeExpiresAt === undefined
+      ? undefined
+      : parseResultNonNegativeInteger(record.deviceChallengeExpiresAt, "deviceChallengeExpiresAt")
+
+  if (!isAppServerHostId(hostId)) throw new AppServerProtocolError("invalid_result", "hostId has an invalid format")
+  if (decodeAppServerHostPublicKey(hostPublicKey) === undefined) {
+    throw new AppServerProtocolError("invalid_result", "hostPublicKey has an invalid format")
+  }
+  if (!isValidAppServerHostProofNonce(nonce)) throw new AppServerProtocolError("invalid_result", "nonce has an invalid format")
+  if (decodeAppServerHostProofSignature(signature) === undefined) {
+    throw new AppServerProtocolError("invalid_result", "signature has an invalid format")
+  }
+  const common = { hostId, hostPublicKey, nonce, expiresAt, signature }
+  if (purpose === "device-connect") {
+    if (deviceChallenge === undefined || deviceChallengeExpiresAt === undefined) {
+      throw new AppServerProtocolError("invalid_result", "device-connect preflight requires a device challenge and expiry")
+    }
+    if (!isValidAppServerHostProofNonce(deviceChallenge)) {
+      throw new AppServerProtocolError("invalid_result", "deviceChallenge has an invalid format")
+    }
+    return { ...common, purpose, deviceChallenge, deviceChallengeExpiresAt }
+  }
+  if (deviceChallenge !== undefined || deviceChallengeExpiresAt !== undefined) {
+    throw new AppServerProtocolError("invalid_result", "only device-connect preflight may include a device challenge")
+  }
+  return { ...common, purpose }
+}
+
+function parseHostProofPurpose(value: unknown, errorKind: string): AppServerHostProofPurpose {
+  if (typeof value === "string" && isAppServerHostProofPurpose(value)) return value
+  throw new AppServerProtocolError(errorKind, "purpose is invalid")
 }
 
 const clientInfoSchema = z.object({
@@ -210,6 +392,7 @@ const clientInfoSchema = z.object({
 
 function parseClientInfo(value: unknown): AppServerClientInfo {
   const record = asRecord(value, "server.initialize.params.client")
+  rejectUnknownFields(record, ["clientId", "clientKind", "name", "version", "capabilities"], "server.initialize.params.client")
   const parsed = zodParse(clientInfoSchema, record)
   return {
     clientId: parsed.clientId,
@@ -220,23 +403,9 @@ function parseClientInfo(value: unknown): AppServerClientInfo {
   }
 }
 
-function parseDevice(value: unknown): NonNullable<ServerInitializeParams["device"]> {
-  const record = asRecord(value, "server.initialize.params.device")
-  const deviceId = parseNonEmptyString(record.deviceId, "device.deviceId")
-  const challenge = record.challenge === undefined ? undefined : parseNonEmptyString(record.challenge, "device.challenge")
-  const signature = record.signature === undefined ? undefined : parseNonEmptyString(record.signature, "device.signature")
-  if (signature !== undefined && !isAppServerDeviceSignature(signature)) {
-    throw new AppServerProtocolError("invalid_params", "device.signature has an invalid format")
-  }
-  return {
-    deviceId,
-    ...(challenge === undefined ? {} : { challenge }),
-    ...(signature === undefined ? {} : { signature }),
-  }
-}
-
 function parseRecovery(value: unknown): NonNullable<ServerInitializeParams["recovery"]> {
   const record = asRecord(value, "server.initialize.params.recovery")
+  rejectUnknownFields(record, ["sessionId", "afterRevision"], "server.initialize.params.recovery")
   const sessionId = record.sessionId === undefined ? undefined : parseNonEmptyString(record.sessionId, "recovery.sessionId")
   const afterRevision =
     record.afterRevision === undefined ? undefined : parseNonNegativeInteger(record.afterRevision, "recovery.afterRevision")
@@ -247,7 +416,7 @@ function parseRecovery(value: unknown): NonNullable<ServerInitializeParams["reco
 }
 
 export function parseServerInitializeResult(value: unknown): ServerInitializeResult {
-  const record = asRecord(value, "server.initialize.result")
+  const record = asRecord(value, "server.initialize.result", "invalid_result")
   if (record.appServerProtocolVersion !== APP_SERVER_PROTOCOL_VERSION) {
     throw new AppServerProtocolError(
       "protocol_version_mismatch",
@@ -255,27 +424,52 @@ export function parseServerInitializeResult(value: unknown): ServerInitializeRes
       { details: { supported: APP_SERVER_PROTOCOL_VERSION } },
     )
   }
-  const server = asRecord(record.server, "server.initialize.result.server")
-  const connection = asRecord(record.connection, "server.initialize.result.connection")
-  const host = record.host === undefined ? undefined : asRecord(record.host, "server.initialize.result.host")
+  const server = asRecord(record.server, "server.initialize.result.server", "invalid_result")
+  rejectUnknownFields(server, ["name", "version", "hostId", "protocolVersion"], "server.initialize.result.server", "invalid_result")
+  if (server.protocolVersion !== APP_SERVER_PROTOCOL_VERSION) {
+    throw new AppServerProtocolError(
+      "protocol_version_mismatch",
+      `Server descriptor protocol major version is unsupported: ${String(server.protocolVersion)}`,
+      { details: { supported: APP_SERVER_PROTOCOL_VERSION } },
+    )
+  }
+  const hostId = parseResultNonEmptyString(server.hostId, "server.hostId")
+  if (!isAppServerHostId(hostId)) throw new AppServerProtocolError("invalid_result", "server.hostId has an invalid format")
+  const connection = asRecord(record.connection, "server.initialize.result.connection", "invalid_result")
+  rejectUnknownFields(connection, ["connectionId", "deviceId", "scopes"], "server.initialize.result.connection", "invalid_result")
+  const host = record.host === undefined ? undefined : asRecord(record.host, "server.initialize.result.host", "invalid_result")
   const profile = host?.profile
   if (host !== undefined && profile !== "durable" && profile !== "ephemeral") {
     throw new AppServerProtocolError("invalid_result", "server.initialize.result.host.profile is invalid")
+  }
+  rejectUnknownFields(
+    record,
+    ["appServerProtocolVersion", "server", "connection", "capabilities", "host"],
+    "server.initialize.result",
+    "invalid_result",
+  )
+  if (host !== undefined) {
+    rejectUnknownFields(
+      host,
+      ["profile", "workspaceRoot", "workspaces", "configurationFingerprint", "workspaceFingerprint", "securityFingerprint"],
+      "server.initialize.result.host",
+      "invalid_result",
+    )
   }
   return {
     appServerProtocolVersion: APP_SERVER_PROTOCOL_VERSION,
     server: {
       name: parseResultNonEmptyString(server.name, "server.name"),
       version: parseResultNonEmptyString(server.version, "server.version"),
-      fingerprint: parseResultNonEmptyString(server.fingerprint, "server.fingerprint"),
+      hostId,
       protocolVersion: APP_SERVER_PROTOCOL_VERSION,
     },
     connection: {
       connectionId: parseResultNonEmptyString(connection.connectionId, "connection.connectionId"),
-      deviceId: parseResultNonEmptyString(connection.deviceId, "connection.deviceId"),
-      scopes: parseScopes(connection.scopes),
+      ...(connection.deviceId === undefined ? {} : { deviceId: parseResultNonEmptyString(connection.deviceId, "connection.deviceId") }),
+      scopes: parseScopes(connection.scopes, "invalid_result", "connection.scopes"),
     },
-    capabilities: zodParse(nonEmptyStringArraySchema("capabilities"), record.capabilities, "invalid_result"),
+    capabilities: zodParse(appServerCapabilitiesSchema, record.capabilities, "invalid_result"),
     ...(host === undefined
       ? {}
       : {
@@ -321,33 +515,148 @@ export function parseServerInitializeResult(value: unknown): ServerInitializeRes
   }
 }
 
+export function parseServerDescribeResult(value: unknown): ServerDescribeResult {
+  const record = asRecord(value, "server.describe.result", "invalid_result")
+  rejectUnknownFields(record, ["server", "capabilities"], "server.describe.result", "invalid_result")
+  const server = asRecord(record.server, "server.describe.result.server", "invalid_result")
+  rejectUnknownFields(server, ["name", "version", "hostId", "protocolVersion"], "server.describe.result.server", "invalid_result")
+  if (server.protocolVersion !== APP_SERVER_PROTOCOL_VERSION) {
+    throw new AppServerProtocolError(
+      "protocol_version_mismatch",
+      `Server descriptor protocol major version is unsupported: ${String(server.protocolVersion)}`,
+      { details: { supported: APP_SERVER_PROTOCOL_VERSION } },
+    )
+  }
+  const hostId = parseResultNonEmptyString(server.hostId, "server.hostId")
+  if (!isAppServerHostId(hostId)) throw new AppServerProtocolError("invalid_result", "server.hostId has an invalid format")
+  return {
+    server: {
+      name: parseResultNonEmptyString(server.name, "server.name"),
+      version: parseResultNonEmptyString(server.version, "server.version"),
+      hostId,
+      protocolVersion: APP_SERVER_PROTOCOL_VERSION,
+    },
+    capabilities: zodParse(appServerCapabilitiesSchema, record.capabilities, "invalid_result"),
+  }
+}
+
 function parseResultNonEmptyString(value: unknown, name: string): string {
   return zodParse(nonEmptyStringSchema(name), value, "invalid_result")
+}
+
+function parseResultNonNegativeInteger(value: unknown, name: string): number {
+  return zodParse(nonNegativeIntegerSchema(name), value, "invalid_result")
 }
 
 // ---------------------------------------------------------------------------
 // pairing / device
 // ---------------------------------------------------------------------------
 
-const pairingTokenSchema = nonEmptyStringSchema("pairingToken").refine((value) => /^ag2cli-pairing\.[A-Za-z0-9_-]{43}$/u.test(value), {
-  message: "pairingToken has an invalid format",
-})
+const pairingTokenSchema = nonEmptyStringSchema("pairingToken")
+  .refine((value) => /^ag2cli-pairing\.[A-Za-z0-9_-]{43}$/u.test(value), {
+    message: "pairingToken has an invalid format",
+  })
+  .refine((value) => isEncoded32ByteToken(value, "ag2cli-pairing."), { message: "pairingToken has an invalid format" })
 
-export function parseAppServerPairingChallenge(value: unknown): AppServerPairingChallenge {
-  const record = asRecord(value, "pairing.start.result")
-  const pairingToken = zodParse(pairingTokenSchema, record.pairingToken, "invalid_result")
-  const scopes = parseScopes(record.scopes)
-  if (scopes.length === 0) throw new AppServerProtocolError("invalid_result", "pairing.start.result.scopes must not be empty")
-  const expiresAt = parseResultNonEmptyString(record.expiresAt, "expiresAt")
-  if (Number.isNaN(Date.parse(expiresAt))) throw new AppServerProtocolError("invalid_result", "expiresAt must be a valid date")
-  return { pairingToken, scopes, expiresAt }
+function isEncoded32ByteToken(value: string, prefix: string): boolean {
+  if (!value.startsWith(prefix)) return false
+  return decodeBase64Url(value.slice(prefix.length))?.byteLength === 32
 }
 
-export function parseAppServerDeviceRegistration(value: unknown): AppServerDeviceRegistration {
-  const record = asRecord(value, "pairing.claim.result")
+const PAIRING_SCOPES = new Set<AppServerScope>([
+  "session:read",
+  "session:write",
+  "approval:write",
+  "shell:execute",
+  "session:policy",
+  "workspace:read",
+])
+
+function parsePairingScopes(value: unknown, errorKind = "invalid_params"): readonly AppServerScope[] {
+  const scopes = parseScopes(value, errorKind, "scopes")
+  if (scopes.length === 0 || scopes.some((scope) => !PAIRING_SCOPES.has(scope))) {
+    throw new AppServerProtocolError(errorKind, "scopes must contain only pairable scopes")
+  }
+  return scopes
+}
+
+function parsePairingExpiry(value: unknown, errorKind: string): string {
+  const expiresAt = errorKind === "invalid_result" ? parseResultNonEmptyString(value, "expiresAt") : parseNonEmptyString(value, "expiresAt")
+  if (!Number.isFinite(Date.parse(expiresAt))) throw new AppServerProtocolError(errorKind, "expiresAt must be a valid date")
+  return expiresAt
+}
+
+export function parsePairCreateParams(value: unknown): AppServerPairCreateParams {
+  const record = asRecord(value, "pair.create.params")
+  rejectUnknownFields(record, ["scopes", "ttlMs"], "pair.create.params")
+  const scopes = parsePairingScopes(record.scopes)
+  const ttlMs = record.ttlMs === undefined ? undefined : parsePositiveInteger(record.ttlMs, "ttlMs")
+  if (ttlMs !== undefined && (ttlMs < 30_000 || ttlMs > 600_000)) {
+    throw new AppServerProtocolError("invalid_params", "ttlMs must be between 30000 and 600000")
+  }
+  return { scopes, ...(ttlMs === undefined ? {} : { ttlMs }) }
+}
+
+export function parsePairPreviewParams(value: unknown): AppServerPairPreviewParams {
+  const record = asRecord(value, "pair.preview.params")
+  rejectUnknownFields(record, ["pairingToken"], "pair.preview.params")
+  return { pairingToken: zodParse(pairingTokenSchema, record.pairingToken) }
+}
+
+export function parsePairClaimParams(value: unknown): AppServerPairClaimParams {
+  const record = asRecord(value, "pair.claim.params")
+  rejectUnknownFields(record, ["pairingToken", "name", "clientKind", "publicKey"], "pair.claim.params")
+  if (record.clientKind !== "mobile" && record.clientKind !== "web") {
+    throw new AppServerProtocolError("invalid_params", "clientKind must be web or mobile")
+  }
+  const publicKey = parseNonEmptyString(record.publicKey, "publicKey")
+  if (!isAppServerDevicePublicKey(publicKey)) throw new AppServerProtocolError("invalid_params", "publicKey has an invalid format")
   return {
-    device: parseDeviceRecord(record.device),
-    credential: parseResultNonEmptyString(record.credential, "credential"),
+    pairingToken: zodParse(pairingTokenSchema, record.pairingToken),
+    name: parseNonEmptyString(record.name, "name"),
+    clientKind: record.clientKind,
+    publicKey,
+  }
+}
+
+export function parseAppServerPairCreateResult(value: unknown): AppServerPairCreateResult {
+  const record = asRecord(value, "pair.create.result", "invalid_result")
+  rejectUnknownFields(record, ["pairingToken", "hostId", "scopes", "expiresAt"], "pair.create.result", "invalid_result")
+  const hostId = parseResultNonEmptyString(record.hostId, "hostId")
+  if (!isAppServerHostId(hostId)) throw new AppServerProtocolError("invalid_result", "hostId has an invalid format")
+  const pairingToken = zodParse(pairingTokenSchema, record.pairingToken, "invalid_result")
+  const scopes = parsePairingScopes(record.scopes, "invalid_result")
+  const expiresAt = parsePairingExpiry(record.expiresAt, "invalid_result")
+  return { pairingToken, hostId, scopes, expiresAt }
+}
+
+export function parseAppServerPairPreviewResult(value: unknown): AppServerPairPreviewResult {
+  const record = asRecord(value, "pair.preview.result", "invalid_result")
+  rejectUnknownFields(record, ["hostId", "scopes", "expiresAt"], "pair.preview.result", "invalid_result")
+  const hostId = parseResultNonEmptyString(record.hostId, "hostId")
+  if (!isAppServerHostId(hostId)) throw new AppServerProtocolError("invalid_result", "hostId has an invalid format")
+  return {
+    hostId,
+    scopes: parsePairingScopes(record.scopes, "invalid_result"),
+    expiresAt: parsePairingExpiry(record.expiresAt, "invalid_result"),
+  }
+}
+
+export function parseAppServerPairClaimResult(value: unknown): AppServerPairClaimResult {
+  const record = asRecord(value, "pair.claim.result", "invalid_result")
+  rejectUnknownFields(record, ["device", "credential"], "pair.claim.result", "invalid_result")
+  const credential = parseResultNonEmptyString(record.credential, "credential")
+  if (!isEncoded32ByteToken(credential, "ag2cli-device.")) {
+    throw new AppServerProtocolError("invalid_result", "credential has an invalid format")
+  }
+  const device = parseDeviceRecord(record.device)
+  parsePairingScopes(device.scopes, "invalid_result")
+  if (device.publicKey !== undefined && !isAppServerDevicePublicKey(device.publicKey)) {
+    throw new AppServerProtocolError("invalid_result", "device.publicKey has an invalid format")
+  }
+  return {
+    device,
+    credential,
   }
 }
 
@@ -367,22 +676,21 @@ function parseDeviceRecord(value: unknown): AppServerDeviceRecord {
 }
 
 export function parseAppServerDeviceChallenge(value: unknown): AppServerDeviceChallenge {
-  const record = asRecord(value, "pairing.challenge.result")
+  const record = asRecord(value, "server.preflight.deviceChallenge", "invalid_result")
+  rejectUnknownFields(record, ["challenge", "hostId", "expiresAt"], "server.preflight.deviceChallenge", "invalid_result")
   const challenge = parseResultNonEmptyString(record.challenge, "challenge")
-  const deviceId = parseResultNonEmptyString(record.deviceId, "deviceId")
-  const serverFingerprint = parseResultNonEmptyString(record.serverFingerprint, "serverFingerprint")
-  const expiresAt = parseResultNonEmptyString(record.expiresAt, "expiresAt")
+  const hostId = parseResultNonEmptyString(record.hostId, "hostId")
+  const expiresAt = parseResultNonNegativeInteger(record.expiresAt, "expiresAt")
   if (
     !isValidAppServerDeviceChallenge({
-      deviceId,
       challenge,
-      serverFingerprint,
+      hostId,
       expiresAt,
     })
   ) {
-    throw new AppServerProtocolError("invalid_result", "pairing.challenge.result has an invalid structure")
+    throw new AppServerProtocolError("invalid_result", "server.preflight.deviceChallenge has an invalid structure")
   }
-  return { deviceId, challenge, serverFingerprint, expiresAt }
+  return { challenge, hostId, expiresAt }
 }
 
 export function parseDeviceRevokeParams(value: unknown): {
@@ -396,166 +704,84 @@ export function parseDeviceRevokeParams(value: unknown): {
 // session.* read/write methods
 // ---------------------------------------------------------------------------
 
-export function parseSessionListParams(value: unknown): {
-  readonly includeArchived: boolean
-} {
-  const record = value === undefined ? {} : asRecord(value, "session.list.params")
-  const includeArchived =
-    record.includeArchived === undefined ? undefined : zodParse(booleanSchema("includeArchived"), record.includeArchived)
-  return { includeArchived: includeArchived === true }
+export function parseSessionListParams(value: unknown): import("./types.js").SessionListParams {
+  return zodParse(sessionListParamsSchema, value)
 }
 
 export function parseSessionCreateParams(value: unknown): import("./types.js").SessionCreateParams {
-  const record = asRecord(value, "session.create.params")
-  return {
-    ...(record.sessionId === undefined ? {} : { sessionId: parseNonEmptyString(record.sessionId, "sessionId") }),
-    workspaceId: parseNonEmptyString(record.workspaceId, "workspaceId"),
-    ...(record.title === undefined ? {} : { title: parseNonEmptyString(record.title, "title") }),
-  }
+  return zodParse(sessionCreateParamsSchema, value)
 }
 
 export function parseSessionGetParams(value: unknown): import("./types.js").SessionGetParams {
-  const record = asRecord(value, "session.get.params")
-  const includeArchived =
-    record.includeArchived === undefined ? undefined : zodParse(booleanSchema("includeArchived"), record.includeArchived)
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
-    ...(includeArchived === undefined ? {} : { includeArchived }),
-  }
-}
-
-/** Fixed single-scope lease reference shared by `session.fork`/`session.archive`/
- * `session.delete` (see {@link import("./types.js").SessionControlLeaseRef}). */
-function parseSessionControlLease(value: unknown, name: string): import("./types.js").SessionControlLeaseRef {
-  const record = asRecord(value, name)
-  rejectUnknownFields(record, ["scope", "generation"], name)
-  if (record.scope !== undefined && record.scope !== "session-control") {
-    throw new AppServerProtocolError("invalid_params", `${name}.scope must be session-control`)
-  }
-  return {
-    scope: "session-control",
-    generation: parseNonNegativeInteger(record.generation, `${name}.generation`),
-  }
+  return zodParse(sessionGetParamsSchema, value)
 }
 
 export function parseSessionForkParams(value: unknown): import("./types.js").SessionForkParams {
-  const record = asRecord(value, "session.fork.params")
-  const cursor = record.cursor === undefined ? undefined : parseSessionHistoryCursor(record.cursor, "cursor")
-  return {
-    sourceSessionId: parseNonEmptyString(record.sourceSessionId, "sourceSessionId"),
-    ...(record.targetSessionId === undefined
-      ? {}
-      : {
-          targetSessionId: parseNonEmptyString(record.targetSessionId, "targetSessionId"),
-        }),
-    ...(cursor === undefined ? {} : { cursor }),
-    ...(record.title === undefined ? {} : { title: parseNonEmptyString(record.title, "title") }),
-    ...(record.lease === undefined
-      ? {}
-      : {
-          lease: parseSessionControlLease(record.lease, "session.fork.lease"),
-        }),
-  }
-}
-
-function parseSessionHistoryCursor(value: unknown, name: string): SessionHistoryCursor {
-  const record = asRecord(value, `session.fork.${name}`)
-  rejectUnknownFields(record, ["sessionId", "branchId", "nodeId", "physicalRevision", "recordHash"], `session.fork.${name}`)
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, `${name}.sessionId`),
-    branchId: parseNonEmptyString(record.branchId, `${name}.branchId`),
-    nodeId: parseNonEmptyString(record.nodeId, `${name}.nodeId`),
-    physicalRevision: parsePositiveInteger(record.physicalRevision, `${name}.physicalRevision`),
-    recordHash: parseNonEmptyString(record.recordHash, `${name}.recordHash`),
-  }
+  return zodParse(sessionForkParamsSchema, value)
 }
 
 export function parseSessionArchiveParams(value: unknown): import("./types.js").SessionArchiveParams {
-  const record = asRecord(value, "session.archive.params")
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
-    ...(record.lease === undefined
-      ? {}
-      : {
-          lease: parseSessionControlLease(record.lease, "session.archive.lease"),
-        }),
-  }
+  return zodParse(sessionArchiveParamsSchema, value)
 }
 
 export function parseSessionDeleteParams(value: unknown): import("./types.js").SessionDeleteParams {
-  const record = asRecord(value, "session.delete.params")
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
-    ...(record.lease === undefined
-      ? {}
-      : {
-          lease: parseSessionControlLease(record.lease, "session.delete.lease"),
-        }),
-  }
+  return zodParse(sessionDeleteParamsSchema, value)
+}
+
+export function parseSessionListResult(value: unknown): import("./types.js").SessionListResult {
+  return zodParse(sessionListResultSchema, value, "invalid_result")
+}
+
+export function parseSessionCreateResult(value: unknown): import("./types.js").SessionSnapshotResult {
+  return zodParse(sessionSnapshotResultSchema, value, "invalid_result")
+}
+
+export function parseSessionGetResult(value: unknown): import("./types.js").SessionGetResult {
+  return zodParse(sessionGetResultSchema, value, "invalid_result")
+}
+
+export function parseSessionForkResult(value: unknown): import("./types.js").SessionSnapshotResult {
+  return zodParse(sessionSnapshotResultSchema, value, "invalid_result")
+}
+
+export function parseSessionArchiveResult(value: unknown): import("./types.js").SessionArchiveResult {
+  return zodParse(sessionArchiveResultSchema, value, "invalid_result")
+}
+
+export function parseSessionDeleteResult(value: unknown): import("./types.js").SessionDeleteResult {
+  return zodParse(sessionDeleteResultSchema, value, "invalid_result")
 }
 
 export function parseSessionAttachParams(value: unknown): import("./types.js").SessionAttachParams {
-  const record = asRecord(value, "session.attach.params")
-  const includeTransient =
-    record.includeTransient === undefined ? undefined : zodParse(booleanSchema("includeTransient"), record.includeTransient)
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
-    ...(record.afterRevision === undefined
-      ? {}
-      : {
-          afterRevision: parseNonNegativeInteger(record.afterRevision, "afterRevision"),
-        }),
-    ...(includeTransient === undefined ? {} : { includeTransient }),
-  }
+  return zodParse(sessionAttachParamsSchema, value)
+}
+
+export function parseSessionAttachResult(value: unknown): import("./types.js").SessionAttachResult {
+  return zodParse(sessionAttachResultSchema, value, "invalid_result")
 }
 
 export function parseSessionDetachParams(value: unknown): import("./types.js").SessionDetachParams {
-  const record = asRecord(value, "session.detach.params")
-  return { sessionId: parseNonEmptyString(record.sessionId, "sessionId") }
+  return zodParse(sessionDetachParamsSchema, value)
 }
 
-export function parseSessionSnapshotParams(value: unknown): import("./types.js").SessionSnapshotParams {
-  const record = asRecord(value, "session.snapshot.params")
-  return { sessionId: parseNonEmptyString(record.sessionId, "sessionId") }
+export function parseSessionDetachResult(value: unknown): import("./types.js").SessionDetachResult {
+  return zodParse(sessionDetachResultSchema, value, "invalid_result")
 }
 
-/** `session.submit`'s partial map of scope generations the caller currently holds. */
-function parseSubmitLease(value: unknown): Partial<Record<InteractionLeaseScope, number>> {
-  const record = asRecord(value, "lease")
-  rejectUnknownFields(record, ["composer", "session-control"], "lease")
-  const result: Partial<Record<InteractionLeaseScope, number>> = {}
-  if (record.composer !== undefined) result.composer = parseNonNegativeInteger(record.composer, "lease.composer")
-  if (record["session-control"] !== undefined) {
-    result["session-control"] = parseNonNegativeInteger(record["session-control"], "lease.session-control")
-  }
-  return result
+export function parseSessionSnapshotParams(value: unknown): import("./types.js").SessionSnapshotMethodParams {
+  return zodParse(sessionSnapshotMethodParamsSchema, value)
+}
+
+export function parseSessionSnapshotMethodResult(value: unknown): import("./types.js").SessionSnapshotMethodResult {
+  return zodParse(sessionSnapshotMethodResultSchema, value, "invalid_result")
 }
 
 export function parseSessionSubmitParams(value: unknown): import("./types.js").SessionSubmitParams {
-  const record = asRecord(value, "session.submit.params")
-  rejectRetiredPermissionKeys(record, "session.submit.params")
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
-    commandId: parseNonEmptyString(record.commandId, "commandId"),
-    text: parseNonEmptyString(record.text, "text"),
-    ...(record.context === undefined
-      ? {}
-      : {
-          context: zodParse(freeformStringArraySchema("context"), record.context),
-        }),
-    ...(record.fileReferences === undefined
-      ? {}
-      : {
-          fileReferences: zodParse(freeformStringArraySchema("fileReferences"), record.fileReferences),
-        }),
-    ...(record.workspace === undefined ? {} : { workspace: parseNonEmptyString(record.workspace, "workspace") }),
-    ...(record.expectedRevision === undefined
-      ? {}
-      : {
-          expectedRevision: parseNonNegativeInteger(record.expectedRevision, "expectedRevision"),
-        }),
-    ...(record.lease === undefined ? {} : { lease: parseSubmitLease(record.lease) }),
-  }
+  return zodParse(sessionSubmitParamsSchema, value)
+}
+
+export function parseSessionSubmitResult(value: unknown): import("./types.js").SessionSubmitResult {
+  return zodParse(sessionSubmitResultSchema, value, "invalid_result")
 }
 
 /** `session.plan`'s lease reference is fixed to the `composer` scope. */
@@ -597,27 +823,224 @@ export function parseSessionPlanParams(value: unknown): import("./types.js").Ses
 }
 
 export function parseSessionReplayParams(value: unknown): import("./types.js").SessionReplayParams {
-  const record = asRecord(value, "session.replay.params")
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
-    ...(record.afterRevision === undefined
-      ? {}
-      : {
-          afterRevision: parseNonNegativeInteger(record.afterRevision, "afterRevision"),
-        }),
-  }
+  return zodParse(sessionReplayParamsSchema, value)
+}
+
+export function parseSessionReplayResult(value: unknown): import("./types.js").SessionReplayResult {
+  return zodParse(sessionReplayResultSchema, value, "invalid_result")
 }
 
 export function parseSessionResyncParams(value: unknown): import("./types.js").SessionResyncParams {
-  const record = asRecord(value, "session.resync.params")
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
-    ...(record.afterRevision === undefined
-      ? {}
-      : {
-          afterRevision: parseNonNegativeInteger(record.afterRevision, "afterRevision"),
-        }),
-  }
+  return zodParse(sessionResyncParamsSchema, value)
+}
+
+export function parseSessionResyncResult(value: unknown): import("./types.js").SessionResyncResult {
+  return zodParse(sessionResyncResultSchema, value, "invalid_result")
+}
+
+export function parseSessionSteerParams(value: unknown): import("./types.js").SessionSteerParams {
+  return zodParse(sessionSteerParamsSchema, value)
+}
+
+export function parseSessionSteerResult(value: unknown): import("./types.js").SessionSteerResult {
+  return zodParse(sessionSteerResultSchema, value, "invalid_result")
+}
+
+export function parseSessionCancelRunParams(value: unknown): import("./types.js").SessionCancelRunParams {
+  return zodParse(sessionCancelRunParamsSchema, value)
+}
+
+export function parseSessionCancelRunResult(value: unknown): import("./types.js").SessionCancelRunResult {
+  return zodParse(sessionCancelRunResultSchema, value, "invalid_result")
+}
+
+export function parseSessionCancelInputParams(value: unknown): import("./types.js").SessionCancelInputParams {
+  return zodParse(sessionCancelInputParamsSchema, value)
+}
+
+export function parseSessionCancelInputResult(value: unknown): import("./types.js").SessionCancelInputResult {
+  return zodParse(sessionCancelInputResultSchema, value, "invalid_result")
+}
+
+export function parseSessionMessagesParams(value: unknown): import("./types.js").SessionMessagesParams {
+  return zodParse(sessionMessagesParamsSchema, value)
+}
+
+export function parseSessionResolveInteractionParams(value: unknown): import("./types.js").SessionResolveInteractionParams {
+  return zodParse(sessionResolveInteractionParamsSchema, value)
+}
+
+export function parseSessionResolveInteractionResult(value: unknown): import("./types.js").SessionResolveInteractionResult {
+  return zodParse(sessionResolveInteractionResultSchema, value, "invalid_result")
+}
+
+export function parseSessionGetPermissionPolicyParams(value: unknown): import("./types.js").SessionGetPermissionPolicyParams {
+  return zodParse(sessionGetPermissionPolicyParamsSchema, value)
+}
+
+/** Reads and writes share one result parser: the full policy document. */
+export function parseSessionPermissionPolicyResult(value: unknown): import("./types.js").SessionGetPermissionPolicyResult {
+  return zodParse(sessionGetPermissionPolicyResultSchema, value, "invalid_result")
+}
+
+export function parseSessionSetPermissionModeParams(value: unknown): import("./types.js").SessionSetPermissionModeParams {
+  return zodParse(sessionSetPermissionModeParamsSchema, value)
+}
+
+export function parseSessionSetPermissionRulesParams(value: unknown): import("./types.js").SessionSetPermissionRulesParams {
+  return zodParse(sessionSetPermissionRulesParamsSchema, value)
+}
+
+export function parseWorkspaceDiffParams(value: unknown): import("./types.js").WorkspaceDiffParams {
+  return zodParse(workspaceDiffParamsSchema, value)
+}
+
+export function parseWorkspaceDiffResult(value: unknown): import("./types.js").WorkspaceDiffResult {
+  return zodParse(workspaceDiffResultSchema, value, "invalid_result")
+}
+
+export function parseWorkspaceReadFileParams(value: unknown): import("./types.js").WorkspaceReadFileParams {
+  return zodParse(workspaceReadFileParamsSchema, value)
+}
+
+export function parseWorkspaceReadFileResult(value: unknown): import("./types.js").WorkspaceReadFileResult {
+  return zodParse(workspaceReadFileResultSchema, value, "invalid_result")
+}
+
+export function parseSessionCreateTaskParams(value: unknown): import("./types.js").SessionCreateTaskParams {
+  return zodParse(sessionCreateTaskParamsSchema, value)
+}
+
+export function parseSessionCompactParams(value: unknown): import("./types.js").SessionCompactParams {
+  return zodParse(sessionCompactParamsSchema, value)
+}
+
+export function parseSessionCompactResult(value: unknown): import("./types.js").SessionCompactResult {
+  return zodParse(sessionCompactResultSchema, value, "invalid_result")
+}
+
+export function parseSessionAddDirectoryParams(value: unknown): import("./types.js").SessionAddDirectoryParams {
+  return zodParse(sessionAddDirectoryParamsSchema, value)
+}
+
+export function parseSessionAddDirectoryResult(value: unknown): import("./types.js").SessionAddDirectoryResult {
+  return zodParse(sessionAddDirectoryResultSchema, value, "invalid_result")
+}
+
+export function parseSessionSetContextWindowParams(value: unknown): import("./types.js").SessionSetContextWindowParams {
+  return zodParse(sessionSetContextWindowParamsSchema, value)
+}
+
+export function parseSessionSetContextWindowResult(value: unknown): import("./types.js").SessionSetContextWindowResult {
+  return zodParse(sessionSetContextWindowResultSchema, value, "invalid_result")
+}
+
+export function parseSessionClearContextWindowParams(value: unknown): import("./types.js").SessionClearContextWindowParams {
+  return zodParse(sessionClearContextWindowParamsSchema, value)
+}
+
+export function parseSessionClearContextWindowResult(value: unknown): import("./types.js").SessionClearContextWindowResult {
+  return zodParse(sessionClearContextWindowResultSchema, value, "invalid_result")
+}
+
+export function parseSessionSelectAgentParams(value: unknown): import("./types.js").SessionSelectAgentParams {
+  return zodParse(sessionSelectAgentParamsSchema, value)
+}
+
+export function parseSessionSelectAgentResult(value: unknown): import("./types.js").SessionSelectAgentResult {
+  return zodParse(sessionSelectAgentResultSchema, value, "invalid_result")
+}
+
+export function parseSessionUpdateGoalParams(value: unknown): import("./types.js").SessionUpdateGoalParams {
+  return zodParse(sessionUpdateGoalParamsSchema, value)
+}
+
+export function parseSessionUpdateGoalResult(value: unknown): import("./types.js").SessionUpdateGoalResult {
+  return zodParse(sessionUpdateGoalResultSchema, value, "invalid_result")
+}
+
+export function parseSessionListCheckpointsParams(value: unknown): import("./types.js").SessionListCheckpointsParams {
+  return zodParse(sessionListCheckpointsParamsSchema, value)
+}
+
+export function parseSessionListCheckpointsResult(value: unknown): import("./types.js").SessionListCheckpointsResult {
+  return zodParse(sessionListCheckpointsResultSchema, value, "invalid_result")
+}
+
+export function parseSessionPreviewRewindParams(value: unknown): import("./types.js").SessionPreviewRewindParams {
+  return zodParse(sessionPreviewRewindParamsSchema, value)
+}
+
+export function parseSessionPreviewRewindResult(value: unknown): import("./types.js").SessionPreviewRewindResult {
+  return zodParse(sessionPreviewRewindResultSchema, value, "invalid_result")
+}
+
+export function parseSessionRewindParams(value: unknown): import("./types.js").SessionRewindParams {
+  return zodParse(sessionRewindParamsSchema, value)
+}
+
+export function parseSessionRewindResult(value: unknown): import("./types.js").SessionRewindResult {
+  // Cross-field rule: `error` is a fact of failure and travels only with
+  // failed statuses. This refinement is a runtime-only guard — superRefine
+  // does not survive the zod-to-json-schema export in schema.ts.
+  const schema = sessionRewindResultSchema.superRefine((result, ctx) => {
+    const failed = result.status === "failed" || result.status === "already_failed"
+    if (failed && result.error === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "session.rewind.result.error is required for a failed rewind" })
+    }
+    if (!failed && result.error !== undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "session.rewind.result.error is only valid for a failed rewind" })
+    }
+  })
+  return zodParse(schema, value, "invalid_result")
+}
+
+export function parseSessionCreateTaskResult(value: unknown): import("./types.js").SessionCreateTaskResult {
+  return zodParse(sessionCreateTaskResultSchema, value, "invalid_result")
+}
+
+export function parseSessionListTasksParams(value: unknown): import("./types.js").SessionListTasksParams {
+  return zodParse(sessionListTasksParamsSchema, value)
+}
+
+export function parseSessionListTasksResult(value: unknown): import("./types.js").SessionListTasksResult {
+  return zodParse(sessionListTasksResultSchema, value, "invalid_result")
+}
+
+export function parseSessionCancelTaskParams(value: unknown): import("./types.js").SessionCancelTaskParams {
+  return zodParse(sessionCancelTaskParamsSchema, value)
+}
+
+export function parseSessionCancelTaskResult(value: unknown): import("./types.js").SessionCancelTaskResult {
+  return zodParse(sessionCancelTaskResultSchema, value, "invalid_result")
+}
+
+export function parseSessionGetTaskLogsParams(value: unknown): import("./types.js").SessionGetTaskLogsParams {
+  return zodParse(sessionGetTaskLogsParamsSchema, value)
+}
+
+export function parseSessionGetTaskLogsResult(value: unknown): import("./types.js").SessionGetTaskLogsResult {
+  return zodParse(sessionGetTaskLogsResultSchema, value, "invalid_result")
+}
+
+export function parseSessionExecuteShellParams(value: unknown): import("./types.js").SessionExecuteShellParams {
+  return zodParse(sessionExecuteShellParamsSchema, value)
+}
+
+export function parseSessionExecuteShellResult(value: unknown): import("./types.js").SessionExecuteShellResult {
+  return zodParse(sessionExecuteShellResultSchema, value, "invalid_result")
+}
+
+export function parseSessionExecuteUserShellParams(value: unknown): import("./types.js").SessionExecuteUserShellParams {
+  return zodParse(sessionExecuteUserShellParamsSchema, value)
+}
+
+export function parseSessionExecuteUserShellResult(value: unknown): import("./types.js").SessionExecuteUserShellResult {
+  return zodParse(sessionExecuteUserShellResultSchema, value, "invalid_result")
+}
+
+export function parseSessionMessagesResult(value: unknown): import("./types.js").SessionMessagesResult {
+  return zodParse(sessionMessagesResultSchema, value, "invalid_result")
 }
 
 export function parseSessionTraceParams(value: unknown): import("./types.js").SessionTraceParams {
@@ -631,26 +1054,6 @@ export function parseSessionModelCallsParams(value: unknown): import("./types.js
   return {
     sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
     ...(includePayload === undefined ? {} : { includePayload }),
-  }
-}
-
-export function parseSessionResolveApprovalParams(value: unknown): import("./types.js").SessionResolveApprovalParams {
-  const record = asRecord(value, "session.resolveApproval.params")
-  const decision = zodParse(
-    z.enum(["approved", "denied"], {
-      message: "decision must be approved or denied",
-    }),
-    record.decision,
-  )
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "sessionId"),
-    runId: parseNonEmptyString(record.runId, "runId"),
-    turn: parseNonNegativeInteger(record.turn, "turn"),
-    toolUseId: parseNonEmptyString(record.toolUseId, "toolUseId"),
-    preparedEventId: parseNonEmptyString(record.preparedEventId, "preparedEventId"),
-    expectedScopeRevision: parseNonNegativeInteger(record.expectedScopeRevision, "expectedScopeRevision"),
-    expectedPolicyRevision: parseNonNegativeInteger(record.expectedPolicyRevision, "expectedPolicyRevision"),
-    decision,
   }
 }
 
@@ -679,290 +1082,16 @@ export function requireLeaseGeneration(params: import("./types.js").InteractionP
   return params.leaseGeneration
 }
 
-// ---------------------------------------------------------------------------
-// session.command action discriminated union
-// ---------------------------------------------------------------------------
-
-export const permissionModeSchema = z.enum(
-  PERMISSION_MODES as unknown as readonly [AppServerPermissionMode, ...AppServerPermissionMode[]],
-  {
-    message: "session.command.action.mode is invalid",
-  },
-)
-function parsePermissionRules(value: unknown, name: string): readonly AppServerPermissionRule[] {
-  if (!Array.isArray(value)) throw new AppServerProtocolError("invalid_params", `${name} must be an array`)
-  const rulesSchema = z.object({
-    // Ingest bound mirrored from core's SESSION_PERMISSION_RULE_NAME_MAX (128);
-    // this package deliberately carries no @ag2cli/core dependency, so the
-    // protocol test pins the literal against drift.
-    name: z
-      .string({
-        invalid_type_error: `${name}[].name must be a non-empty string`,
-        required_error: `${name}[].name must be a non-empty string`,
-      })
-      .refine((value) => value.trim().length > 0, { message: `${name}[].name must be a non-empty string` })
-      .refine((value) => value.trim().length <= 128, { message: `${name}[].name must be 1 to 128 characters long` }),
-    behavior: z.enum(
-      PERMISSION_RULE_BEHAVIORS as unknown as readonly [AppServerPermissionRuleBehavior, ...AppServerPermissionRuleBehavior[]],
-      {
-        message: `${name}[].behavior is invalid`,
-      },
-    ),
-  })
-  // First release: only Deny(bash) is a legal bash permission rule. This
-  // refinement is a runtime-only guard — superRefine does not survive the
-  // zod-to-json-schema export in schema.ts.
-  const schema = rulesSchema.superRefine((rule, ctx) => {
-    if (rule.name.trim() === "bash" && rule.behavior !== "deny") {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${name}[]: bash rules only support behavior deny (allow/ask are rejected)` })
-    }
-  })
-  return value.map((item, index) => {
-    try {
-      return schema.parse(item)
-    } catch (error) {
-      if (error instanceof ZodError) {
-        throw new AppServerProtocolError("invalid_params", (error.issues[0]?.message ?? error.message).replace("[]", `[${index}]`))
-      }
-      throw error
-    }
-  })
-}
-
-function parseGoalUpdate(value: unknown): AppServerGoalUpdate {
-  const update = asRecord(value, "session.command.action.update")
-  if (update.action === "set")
-    return {
-      action: "set",
-      text: parseNonEmptyString(update.text, "session.command.action.update.text"),
-    }
-  if (update.action === "clear" || update.action === "pause" || update.action === "resume") return { action: update.action }
-  throw new AppServerProtocolError("invalid_params", "session.command.action.update.action is invalid")
-}
-
-function parseArgv(value: unknown): readonly string[] {
-  const message = "session.command.action.argv must be a non-empty string array"
-  return zodParse(
-    z
-      .array(z.string({ invalid_type_error: message }), {
-        invalid_type_error: message,
-      })
-      .min(1, { message }),
-    value,
-  )
-}
-
-function parseCreateTaskAction(record: Record<string, unknown>): Extract<AppServerSessionCommandAction, { readonly type: "createTask" }> {
-  const taskType = zodParse(
-    z.enum(TASK_TYPES as unknown as readonly [AppServerTaskType, ...AppServerTaskType[]], {
-      message: "session.command.action.taskType is invalid",
-    }),
-    record.taskType,
-  )
-  const argv = record.argv === undefined ? undefined : parseArgv(record.argv)
-  return {
-    type: "createTask",
-    taskType,
-    title: parseNonEmptyString(record.title, "session.command.action.title"),
-    ...(record.prompt === undefined
-      ? {}
-      : {
-          prompt: parseNonEmptyString(record.prompt, "session.command.action.prompt"),
-        }),
-    ...(argv === undefined ? {} : { argv }),
-    ...(record.intervalMs === undefined
-      ? {}
-      : {
-          intervalMs: parsePositiveInteger(record.intervalMs, "session.command.action.intervalMs"),
-        }),
-    ...(record.maxRuns === undefined
-      ? {}
-      : {
-          maxRuns: parsePositiveInteger(record.maxRuns, "session.command.action.maxRuns"),
-        }),
-    ...(record.workspace === undefined
-      ? {}
-      : {
-          workspace: parseNonEmptyString(record.workspace, "session.command.action.workspace"),
-        }),
-    ...(record.parentRunId === undefined
-      ? {}
-      : {
-          parentRunId: parseNonEmptyString(record.parentRunId, "session.command.action.parentRunId"),
-        }),
-  }
-}
-
-function parseSessionCommandAction(value: unknown): AppServerSessionCommandAction {
-  const record = asRecord(value, "session.command.action")
-  rejectRetiredPermissionKeys(record, "session.command.action")
-  const rawType = parseNonEmptyString(record.type, "session.command.action.type")
-  if (!isSessionCommandActionType(rawType)) {
-    throw new AppServerProtocolError("invalid_params", `Unknown session.command action: ${rawType}`)
-  }
-  const type = rawType
-  switch (type) {
-    case "addDirectory":
-      return {
-        type,
-        directory: parseNonEmptyString(record.directory, "session.command.action.directory"),
-        ...(record.workspaceRoot === undefined
-          ? {}
-          : {
-              workspaceRoot: parseNonEmptyString(record.workspaceRoot, "session.command.action.workspaceRoot"),
-            }),
-        ...(record.expectedScopeRevision === undefined
-          ? {}
-          : {
-              expectedScopeRevision: parseNonNegativeInteger(record.expectedScopeRevision, "session.command.action.expectedScopeRevision"),
-            }),
-      }
-    case "setPermissionMode": {
-      const mode = zodParse(permissionModeSchema, record.mode, "invalid_params") as AppServerPermissionMode
-      return {
-        type,
-        mode,
-        ...(record.expectedPolicyRevision === undefined
-          ? {}
-          : {
-              expectedPolicyRevision: parseNonNegativeInteger(
-                record.expectedPolicyRevision,
-                "session.command.action.expectedPolicyRevision",
-              ),
-            }),
-      }
-    }
-    case "setPermissionRules":
-      return {
-        type,
-        rules: parsePermissionRules(record.rules, "session.command.action.rules"),
-        ...(record.expectedPolicyRevision === undefined
-          ? {}
-          : {
-              expectedPolicyRevision: parseNonNegativeInteger(
-                record.expectedPolicyRevision,
-                "session.command.action.expectedPolicyRevision",
-              ),
-            }),
-      }
-    case "compact": {
-      const instructions =
-        record.instructions === undefined ? undefined : parseNonEmptyString(record.instructions, "session.command.action.instructions")
-      if (instructions !== undefined && instructions.length > 4_096) {
-        throw new AppServerProtocolError("invalid_params", "instructions must not exceed 4096 characters")
-      }
-      return { type, ...(instructions === undefined ? {} : { instructions }) }
-    }
-    case "setContextWindow":
-      return {
-        type,
-        contextWindow: parsePositiveInteger(record.contextWindow, "session.command.action.contextWindow"),
-      }
-    case "clearContextWindow":
-      return { type }
-    case "setAgent":
-      return {
-        type,
-        ...(record.agentName === undefined
-          ? {}
-          : {
-              agentName: parseNonEmptyString(record.agentName, "session.command.action.agentName"),
-            }),
-      }
-    case "updateGoal":
-      return { type, update: parseGoalUpdate(record.update) }
-    case "createTask":
-      return parseCreateTaskAction(record)
-    case "listTasks":
-      return { type }
-    case "cancelTask":
-      return {
-        type,
-        taskId: parseNonEmptyString(record.taskId, "session.command.action.taskId"),
-        ...(record.reason === undefined
-          ? {}
-          : {
-              reason: parseNonEmptyString(record.reason, "session.command.action.reason"),
-            }),
-      }
-    case "listCheckpoints":
-      return { type }
-    case "previewRewind":
-    case "rewind":
-      return {
-        type,
-        checkpointId: parseNonEmptyString(record.checkpointId, "session.command.action.checkpointId"),
-      }
-    case "steer":
-      return {
-        type,
-        runId: parseNonEmptyString(record.runId, "session.command.action.runId"),
-        text: parseNonEmptyString(record.text, "session.command.action.text"),
-      }
-    case "cancelInput":
-      return {
-        type,
-        inputId: parseNonEmptyString(record.inputId, "session.command.action.inputId"),
-        ...(record.reason === undefined
-          ? {}
-          : {
-              reason: parseNonEmptyString(record.reason, "session.command.action.reason"),
-            }),
-      }
-    case "executeShell":
-      return {
-        type,
-        argv: parseArgv(record.argv),
-        ...(record.cwd === undefined
-          ? {}
-          : {
-              cwd: parseNonEmptyString(record.cwd, "session.command.action.cwd"),
-            }),
-        ...(record.timeoutMs === undefined
-          ? {}
-          : {
-              timeoutMs: parsePositiveInteger(record.timeoutMs, "session.command.action.timeoutMs"),
-            }),
-      }
-    case "executeUserShell":
-      return {
-        type,
-        command: parseNonEmptyString(record.command, "session.command.action.command"),
-        ...(record.cwd === undefined
-          ? {}
-          : {
-              cwd: parseNonEmptyString(record.cwd, "session.command.action.cwd"),
-            }),
-        ...(record.timeoutMs === undefined
-          ? {}
-          : {
-              timeoutMs: parsePositiveInteger(record.timeoutMs, "session.command.action.timeoutMs"),
-            }),
-      }
-  }
-}
-
-function parseLease(value: unknown): {
-  readonly scope: InteractionLeaseScope
-  readonly generation: number
-} {
-  const record = asRecord(value, "session.command.lease")
-  rejectUnknownFields(record, ["scope", "generation"], "session.command.lease")
-  const scope = record.scope
-  if (scope !== "composer" && scope !== "session-control") {
-    throw new AppServerProtocolError("invalid_params", "session.command.lease.scope must be composer or session-control")
-  }
-  return {
-    scope,
-    generation: parseNonNegativeInteger(record.generation, "session.command.lease.generation"),
-  }
-}
-
-function rejectUnknownFields(record: Record<string, unknown>, allowed: readonly string[], name: string): void {
+function rejectUnknownFields(
+  record: Record<string, unknown>,
+  allowed: readonly string[],
+  name: string,
+  errorKind = "invalid_params",
+): void {
   const allowedFields = new Set(allowed)
   const unknownField = Object.keys(record).find((field) => !allowedFields.has(field))
   if (unknownField !== undefined) {
-    throw new AppServerProtocolError("invalid_params", `${name}.${unknownField} is an unknown field`)
+    throw new AppServerProtocolError(errorKind, `${name}.${unknownField} is an unknown field`)
   }
 }
 
@@ -981,22 +1110,6 @@ function rejectRetiredPermissionKeys(record: Record<string, unknown>, name: stri
   }
 }
 
-export function parseSessionCommandParams(value: unknown): SessionCommandParams {
-  const record = asRecord(value, "session.command.params")
-  rejectRetiredPermissionKeys(record, "session.command.params")
-  const commandId = parseNonEmptyString(record.commandId, "session.command.commandId")
-  const expectedRevision =
-    record.expectedRevision === undefined ? undefined : parseNonNegativeInteger(record.expectedRevision, "session.command.expectedRevision")
-  const lease = record.lease === undefined ? undefined : parseLease(record.lease)
-  return {
-    sessionId: parseNonEmptyString(record.sessionId, "session.command.sessionId"),
-    commandId,
-    action: parseSessionCommandAction(record.action),
-    ...(expectedRevision === undefined ? {} : { expectedRevision }),
-    ...(lease === undefined ? {} : { lease }),
-  }
-}
-
 export type AppServerMethodParamParser = (value: unknown) => unknown
 
 /**
@@ -1007,6 +1120,7 @@ export type AppServerMethodParamParser = (value: unknown) => unknown
  * acquire/takeover do not.
  */
 export const APP_SERVER_METHOD_PARAM_PARSERS: Readonly<Record<AppServerMethod, AppServerMethodParamParser | undefined>> = {
+  "server.preflight": parseServerPreflightParams,
   "server.initialize": parseServerInitializeParams,
   "server.describe": undefined,
   "server.health": undefined,
@@ -1019,11 +1133,25 @@ export const APP_SERVER_METHOD_PARAM_PARSERS: Readonly<Record<AppServerMethod, A
   "session.attach": parseSessionAttachParams,
   "session.detach": parseSessionDetachParams,
   "session.snapshot": parseSessionSnapshotParams,
-  "session.command": parseSessionCommandParams,
   "session.plan": parseSessionPlanParams,
+  "session.compact": parseSessionCompactParams,
+  "session.addDirectory": parseSessionAddDirectoryParams,
+  "session.setContextWindow": parseSessionSetContextWindowParams,
+  "session.clearContextWindow": parseSessionClearContextWindowParams,
+  "session.selectAgent": parseSessionSelectAgentParams,
+  "session.updateGoal": parseSessionUpdateGoalParams,
+  "session.listCheckpoints": parseSessionListCheckpointsParams,
+  "session.previewRewind": parseSessionPreviewRewindParams,
+  "session.rewind": parseSessionRewindParams,
   "session.submit": parseSessionSubmitParams,
-  "session.cancel": undefined,
-  "session.resolveApproval": parseSessionResolveApprovalParams,
+  "session.steer": parseSessionSteerParams,
+  "session.cancelRun": parseSessionCancelRunParams,
+  "session.cancelInput": parseSessionCancelInputParams,
+  "session.messages": parseSessionMessagesParams,
+  "session.resolveInteraction": parseSessionResolveInteractionParams,
+  "session.getPermissionPolicy": parseSessionGetPermissionPolicyParams,
+  "session.setPermissionMode": parseSessionSetPermissionModeParams,
+  "session.setPermissionRules": parseSessionSetPermissionRulesParams,
   "session.replay": parseSessionReplayParams,
   "session.trace": parseSessionTraceParams,
   "session.modelCalls": parseSessionModelCallsParams,
@@ -1040,8 +1168,133 @@ export const APP_SERVER_METHOD_PARAM_PARSERS: Readonly<Record<AppServerMethod, A
     return params
   },
   "interaction.takeover": (value) => parseInteractionRequest(value, "interaction.takeover"),
+  "pair.create": parsePairCreateParams,
+  "pair.preview": parsePairPreviewParams,
+  "pair.claim": parsePairClaimParams,
   "device.list": undefined,
   "device.revoke": parseDeviceRevokeParams,
+  "workspace.diff": parseWorkspaceDiffParams,
+  "workspace.readFile": parseWorkspaceReadFileParams,
+  "session.createTask": parseSessionCreateTaskParams,
+  "session.listTasks": parseSessionListTasksParams,
+  "session.cancelTask": parseSessionCancelTaskParams,
+  "session.getTaskLogs": parseSessionGetTaskLogsParams,
+  "session.executeShell": parseSessionExecuteShellParams,
+  "session.executeUserShell": parseSessionExecuteUserShellParams,
+}
+
+/** Client-side result parsers, one per method with a registered result schema
+ * (`APP_SERVER_METHOD_RESULT_SCHEMAS`); keep both maps in lockstep. */
+export const APP_SERVER_METHOD_RESULT_PARSERS: Readonly<Record<string, (value: unknown) => unknown>> = {
+  "server.initialize": parseServerInitializeResult,
+  "server.describe": parseServerDescribeResult,
+  "server.preflight": parseServerPreflightResult,
+  "pair.create": parseAppServerPairCreateResult,
+  "pair.preview": parseAppServerPairPreviewResult,
+  "pair.claim": parseAppServerPairClaimResult,
+  "session.list": parseSessionListResult,
+  "session.create": parseSessionCreateResult,
+  "session.get": parseSessionGetResult,
+  "session.fork": parseSessionForkResult,
+  "session.archive": parseSessionArchiveResult,
+  "session.delete": parseSessionDeleteResult,
+  "session.attach": parseSessionAttachResult,
+  "session.detach": parseSessionDetachResult,
+  "session.snapshot": parseSessionSnapshotMethodResult,
+  "session.replay": parseSessionReplayResult,
+  "session.resync": parseSessionResyncResult,
+  "session.submit": parseSessionSubmitResult,
+  "session.steer": parseSessionSteerResult,
+  "session.cancelRun": parseSessionCancelRunResult,
+  "session.cancelInput": parseSessionCancelInputResult,
+  "session.messages": parseSessionMessagesResult,
+  "session.resolveInteraction": parseSessionResolveInteractionResult,
+  "session.getPermissionPolicy": parseSessionPermissionPolicyResult,
+  "session.setPermissionMode": parseSessionPermissionPolicyResult,
+  "session.setPermissionRules": parseSessionPermissionPolicyResult,
+  "workspace.diff": parseWorkspaceDiffResult,
+  "workspace.readFile": parseWorkspaceReadFileResult,
+  "session.createTask": parseSessionCreateTaskResult,
+  "session.listTasks": parseSessionListTasksResult,
+  "session.cancelTask": parseSessionCancelTaskResult,
+  "session.getTaskLogs": parseSessionGetTaskLogsResult,
+  "session.executeShell": parseSessionExecuteShellResult,
+  "session.executeUserShell": parseSessionExecuteUserShellResult,
+  "session.compact": parseSessionCompactResult,
+  "session.addDirectory": parseSessionAddDirectoryResult,
+  "session.setContextWindow": parseSessionSetContextWindowResult,
+  "session.clearContextWindow": parseSessionClearContextWindowResult,
+  "session.selectAgent": parseSessionSelectAgentResult,
+  "session.updateGoal": parseSessionUpdateGoalResult,
+  "session.listCheckpoints": parseSessionListCheckpointsResult,
+  "session.previewRewind": parseSessionPreviewRewindResult,
+  "session.rewind": parseSessionRewindResult,
+}
+
+// ---------------------------------------------------------------------------
+// Notification params parsers.
+// ---------------------------------------------------------------------------
+
+/**
+ * `session.event` is the one notification with a dual-state parse: a known
+ * `type` must satisfy its strict variant (a malformed payload is a wire
+ * violation), while an unknown `type` is tolerated as envelope + raw payload
+ * so clients can skip unknown informational events without dropping the
+ * connection.
+ */
+export function parseSessionEventNotificationParams(value: unknown): AppServerSessionEventNotificationParams {
+  const record = asRecord(value, "session.event.params")
+  rejectUnknownFields(record, ["event"], "session.event.params")
+  const event = record.event
+  if (event === undefined) throw new AppServerProtocolError("invalid_params", "session.event.params.event is required")
+  const strict = publicSessionEventSchema.safeParse(event)
+  if (strict.success) return { event: strict.data }
+  if (isKnownPublicSessionEventType((event as { type?: unknown }).type)) {
+    throw new AppServerProtocolError("invalid_params", strict.error.issues[0]?.message ?? "session.event.event is invalid")
+  }
+  const envelope = zodParse(publicSessionEventEnvelopeSchema, event, "invalid_params")
+  return { envelope, raw: assertJsonValue(event, "session.event.params.event") }
+}
+
+export function parseSessionTransientNotificationParams(value: unknown): SessionTransientNotificationParams {
+  return zodParse(sessionTransientNotificationParamsSchema, value, "invalid_params")
+}
+
+export function parseSessionResyncRequiredNotificationParams(value: unknown): SessionResyncRequiredNotificationParams {
+  return zodParse(sessionResyncRequiredNotificationParamsSchema, value, "invalid_params")
+}
+
+export function parsePresenceUpdatedNotificationParams(value: unknown): PresenceUpdatedNotificationParams {
+  return zodParse(presenceUpdatedNotificationParamsSchema, value, "invalid_params")
+}
+
+export function parseInteractionLeaseUpdatedNotificationParams(value: unknown): InteractionLeaseUpdatedNotificationParams {
+  return zodParse(interactionLeaseUpdatedNotificationParamsSchema, value, "invalid_params")
+}
+
+export type AppServerNotificationParamParser = (value: unknown) => unknown
+
+/**
+ * The single runtime-parser registry for notification params. Every v1
+ * notification has a concrete shape, so no entry may stay `undefined`.
+ */
+export const APP_SERVER_NOTIFICATION_PARAM_PARSERS: Readonly<Record<AppServerNotificationMethod, AppServerNotificationParamParser>> = {
+  "session.event": parseSessionEventNotificationParams,
+  "session.transient": parseSessionTransientNotificationParams,
+  "session.resyncRequired": parseSessionResyncRequiredNotificationParams,
+  "presence.updated": parsePresenceUpdatedNotificationParams,
+  "interaction.lease.updated": parseInteractionLeaseUpdatedNotificationParams,
+}
+
+export function parseAppServerNotificationParams(method: string, value: unknown): unknown {
+  if (!(APP_SERVER_NOTIFICATION_METHODS as readonly string[]).includes(method)) {
+    throw new AppServerProtocolError("method_not_found", `${method} is not an App Server notification`)
+  }
+  const parser = APP_SERVER_NOTIFICATION_PARAM_PARSERS[method as AppServerNotificationMethod]
+  if (parser === undefined) {
+    throw new AppServerProtocolError("invalid_params", `${method} has no v1 notification parser`)
+  }
+  return parser(value)
 }
 
 // ---------------------------------------------------------------------------

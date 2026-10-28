@@ -1,4 +1,5 @@
 import type { BrowserDeviceIdentity } from "./pairing"
+import { isAppServerHostId } from "@ag2cli/app-server-protocol/host-proof.js"
 
 const DATABASE_NAME = "ag2cli.web"
 const DATABASE_VERSION = 1
@@ -9,7 +10,7 @@ interface StoredBrowserDeviceIdentity {
   readonly deviceId: string
   readonly publicKey: string
   readonly privateKey: CryptoKey
-  readonly serverFingerprint?: string
+  readonly hostId: string
 }
 
 export interface BrowserDeviceIdentityStore {
@@ -119,6 +120,8 @@ function toBrowserDeviceIdentity(value: unknown): BrowserDeviceIdentity | undefi
   if (
     typeof record.credential !== "string" ||
     typeof record.deviceId !== "string" ||
+    typeof record.hostId !== "string" ||
+    !isAppServerHostId(record.hostId) ||
     typeof record.publicKey !== "string" ||
     record.privateKey === undefined
   ) {
@@ -129,6 +132,6 @@ function toBrowserDeviceIdentity(value: unknown): BrowserDeviceIdentity | undefi
     deviceId: record.deviceId,
     publicKey: record.publicKey,
     privateKey: record.privateKey,
-    ...(record.serverFingerprint === undefined ? {} : { serverFingerprint: record.serverFingerprint }),
+    hostId: record.hostId,
   }
 }

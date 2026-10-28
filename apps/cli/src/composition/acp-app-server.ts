@@ -2,11 +2,12 @@ import { createPendingApprovalBroker } from "@ag2cli/runtime/ports/approval-brok
 import type { JsonRpcAppServerClient } from "@ag2cli/app-server-client/client.js"
 import type { RuntimeConfig } from "../config/runtime.js"
 import { drainChildAgents, type ChildAgentRunner } from "../capabilities/execution/child-agent-runner.js"
-import { buildAgentServerHost } from "./agent-host.js"
+import { buildAgentServerHost, type AgentServerHostConnection } from "./agent-host.js"
 import { pickModelClient } from "./model-client.js"
 
 export interface EphemeralAppServer {
   readonly client: JsonRpcAppServerClient
+  readonly initializeLocal: AgentServerHostConnection["initializeLocal"]
   /**
    * Turn-scoped async drain: bounds waiting for the invocation's running
    * children, then cancels the remainder. The Host close keeps its own
@@ -40,6 +41,7 @@ export async function connectEphemeralAppServer(runtimeConfig: RuntimeConfig): P
   const connection = host.createConnection()
   return {
     client: connection.client,
+    initializeLocal: connection.initializeLocal,
     async drainChildAgents(budgetMs) {
       if (runner === undefined) return
       await drainChildAgents(runner, budgetMs)

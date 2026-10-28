@@ -1,4 +1,5 @@
 import { createNotification, createRequest, isResponse, parseEncodedMessage } from "@ag2cli/app-server-protocol/json-rpc.js"
+import { type AppServerErrorCode, isAppServerErrorCode } from "@ag2cli/app-server-protocol/error-codes.js"
 import {
   type JsonRpcId,
   type JsonRpcMessage,
@@ -9,6 +10,13 @@ import {
   type ServerInitializeResult,
 } from "@ag2cli/app-server-protocol/types.js"
 import { assertJsonValue, parseServerInitializeResult } from "@ag2cli/app-server-protocol/validation.js"
+import {
+  callProtocol,
+  type ProtocolCallOptions,
+  type ProtocolMethod,
+  type ProtocolMethodParams,
+  type ProtocolMethodResults,
+} from "./protocol-methods.js"
 
 export interface AppServerTransport {
   send(message: JsonRpcMessage): void | Promise<void>
@@ -34,17 +42,50 @@ export type AppServerCloseListener = (error?: Error) => void
 
 export class AppServerRpcError extends Error {
   readonly code: number
-  readonly kind?: string
+  readonly kind?: AppServerErrorCode
+  readonly rawKind?: string
+  readonly origin: "server" | "local"
   readonly retryable: boolean
   readonly details?: JsonValue
 
-  constructor(response: Extract<JsonRpcResponse, { error: unknown }>) {
+  constructor(response: Extract<JsonRpcResponse, { error: unknown }>, origin: "server" | "local" = "server") {
     super(response.error.message)
     this.name = "AppServerRpcError"
     this.code = response.error.code
-    this.kind = response.error.data?.code
+    this.origin = origin
+    const rawKind = response.error.data?.code
+    this.kind = isAppServerErrorCode(rawKind) ? rawKind : undefined
+    if (!isAppServerErrorCode(rawKind)) this.rawKind = rawKind
     this.retryable = response.error.data?.retryable ?? false
     this.details = response.error.data?.details
+  }
+
+  /**
+   * Synthesize a catalog error locally (e.g. a result that fails protocol
+   * parsing). `origin: "local"` keeps it distinguishable from the same code
+   * sent by a server.
+   */
+  static local(
+    kind: AppServerErrorCode,
+    message: string,
+    data?: { readonly retryable?: boolean; readonly details?: JsonValue },
+  ): AppServerRpcError {
+    return new AppServerRpcError(
+      {
+        jsonrpc: "2.0",
+        id: "local",
+        error: {
+          code: -32602,
+          message,
+          data: {
+            code: kind,
+            ...(data?.retryable === undefined ? {} : { retryable: data.retryable }),
+            ...(data?.details === undefined ? {} : { details: data.details }),
+          },
+        },
+      },
+      "local",
+    )
   }
 }
 
@@ -126,6 +167,15 @@ export class JsonRpcAppServerClient implements AppServerRpcClient {
     })
   }
 
+  /** Typed, registry-validated call surface for every non-interaction protocol method. */
+  callProtocol<M extends ProtocolMethod>(
+    method: M,
+    params: ProtocolMethodParams[M],
+    options?: ProtocolCallOptions,
+  ): Promise<ProtocolMethodResults[M]> {
+    return callProtocol(this, method, params, options)
+  }
+
   notify(method: string, params?: JsonValue): void {
     if (this.closed) throw new AppServerClientError("client_closed", "App Server client is closed")
     const sent = this.transport.send(createNotification(method, params))
@@ -134,7 +184,12 @@ export class JsonRpcAppServerClient implements AppServerRpcClient {
 
   async initialize(params: ServerInitializeParams, options: { readonly signal?: AbortSignal } = {}): Promise<ServerInitializeResult> {
     const result = await this.request("server.initialize", assertJsonValue(params, "server.initialize.params"), options)
-    return parseServerInitializeResult(result)
+    const parsed = parseServerInitializeResult(result)
+    if (parsed.server.hostId !== params.hostId) {
+      this.close(1008, "Initialize Host mismatch")
+      throw new Error("server.initialize descriptor Host ID does not match the requested Host")
+    }
+    return parsed
   }
 
   onNotification(listener: AppServerNotificationListener): () => void {

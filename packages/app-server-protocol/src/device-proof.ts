@@ -5,7 +5,7 @@ export const APP_SERVER_DEVICE_SIGNATURE_PREFIX = "ag2cli-p256-signature."
 export const APP_SERVER_DEVICE_CHALLENGE_PREFIX = "ag2cli-challenge."
 
 export interface AppServerDeviceProofMessageInput {
-  readonly serverFingerprint: string
+  readonly hostId: string
   readonly challenge: string
   readonly deviceId: string
   readonly clientId: string
@@ -18,7 +18,7 @@ export interface AppServerDeviceProofMessageInput {
  * reproduce the exact bytes without depending on object-key ordering.
  */
 export function createAppServerDeviceProofMessage(input: AppServerDeviceProofMessageInput): string {
-  return JSON.stringify(["ag2cli-device-proof.v1", input.serverFingerprint, input.challenge, input.deviceId, input.clientId])
+  return JSON.stringify(["ag2cli-device-proof.v1", input.hostId, input.challenge, input.deviceId, input.clientId])
 }
 
 export function encodeBase64Url(bytes: Uint8Array): string {
@@ -65,29 +65,30 @@ export function decodeBase64Url(value: string): Uint8Array | undefined {
 }
 
 export function isAppServerDevicePublicKey(value: string): boolean {
-  return hasEncodedPrefix(value, APP_SERVER_DEVICE_PUBLIC_KEY_PREFIX)
+  if (!value.startsWith(APP_SERVER_DEVICE_PUBLIC_KEY_PREFIX)) return false
+  const encoded = value.slice(APP_SERVER_DEVICE_PUBLIC_KEY_PREFIX.length)
+  if (encoded.length > MAX_PUBLIC_KEY_BASE64URL_LENGTH) return false
+  const decoded = decodeBase64Url(encoded)
+  return decoded !== undefined && decoded.byteLength > 0 && decoded.byteLength <= MAX_PUBLIC_KEY_DER_SIZE
 }
 
 export function isAppServerDeviceSignature(value: string): boolean {
-  return hasEncodedPrefix(value, APP_SERVER_DEVICE_SIGNATURE_PREFIX)
+  const encoded = value.startsWith(APP_SERVER_DEVICE_SIGNATURE_PREFIX) ? value.slice(APP_SERVER_DEVICE_SIGNATURE_PREFIX.length) : ""
+  return encoded.length === 86 && decodeBase64Url(encoded)?.byteLength === 64
 }
 
 export function isAppServerDeviceChallenge(value: string): boolean {
-  return hasEncodedPrefix(value, APP_SERVER_DEVICE_CHALLENGE_PREFIX)
+  const encoded = value.startsWith(APP_SERVER_DEVICE_CHALLENGE_PREFIX) ? value.slice(APP_SERVER_DEVICE_CHALLENGE_PREFIX.length) : ""
+  return encoded.length === 43 && decodeBase64Url(encoded)?.byteLength === 32
 }
 
 export function isValidAppServerDeviceChallenge(value: AppServerDeviceChallenge): boolean {
   return (
     isAppServerDeviceChallenge(value.challenge) &&
-    value.deviceId.trim().length > 0 &&
-    value.serverFingerprint.trim().length > 0 &&
-    !Number.isNaN(Date.parse(value.expiresAt))
+    isValidHostId(value.hostId) &&
+    Number.isSafeInteger(value.expiresAt) &&
+    value.expiresAt >= 0
   )
-}
-
-function hasEncodedPrefix(value: string, prefix: string): boolean {
-  const encoded = value.startsWith(prefix) ? value.slice(prefix.length) : ""
-  return encoded.length > 0 && decodeBase64Url(encoded) !== undefined
 }
 
 function base64Value(value: string): number | undefined {
@@ -95,4 +96,12 @@ function base64Value(value: string): number | undefined {
   return index < 0 ? undefined : index
 }
 
+function isValidHostId(value: string): boolean {
+  if (!value.startsWith("ag2cli-host.v1.")) return false
+  const encoded = value.slice("ag2cli-host.v1.".length)
+  return encoded.length === 43 && decodeBase64Url(encoded)?.byteLength === 32
+}
+
 const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+const MAX_PUBLIC_KEY_DER_SIZE = 256
+const MAX_PUBLIC_KEY_BASE64URL_LENGTH = Math.ceil((MAX_PUBLIC_KEY_DER_SIZE * 8) / 6)

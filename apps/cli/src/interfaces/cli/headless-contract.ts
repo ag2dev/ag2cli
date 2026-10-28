@@ -15,14 +15,13 @@ export const HEADLESS_PROTOCOL_VERSION = 1 as const
  */
 export const HEADLESS_CAPABILITIES = {
   protocolVersion: HEADLESS_PROTOCOL_VERSION,
-  commands: ["plan", "run", "serve", "pair", "inspect", "trace", "observe", "session"],
+  commands: ["run", "serve", "pair", "inspect", "trace", "observe", "session"],
   outputFormats: ["text", "json", "jsonl"],
   permissionModes: ["manual", "accept-edits", "plan", "full-access", "auto"],
   transports: ["in-process", "app-server-ws", "acp-stdio"],
 } as const
 
-export type HeadlessCommand =
-  "help" | "version" | "capabilities" | "serve" | "pair" | "plan" | "run" | "inspect" | "trace" | "observe" | "session"
+export type HeadlessCommand = "help" | "version" | "capabilities" | "serve" | "pair" | "run" | "inspect" | "trace" | "observe" | "session"
 
 export type HeadlessErrorCode =
   | "USAGE_ERROR"

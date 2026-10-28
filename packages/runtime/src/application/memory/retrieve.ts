@@ -36,8 +36,8 @@ const STOP_WORDS = new Set([
   "for",
 ])
 
-/** Tokenize English words and individual CJK characters. */
-function tokenize(text: string): string[] {
+/** Tokenize English words and individual CJK characters. Shared by memory retrieval and session history search. */
+export function tokenize(text: string): string[] {
   const lower = text.toLowerCase()
   // English words.
   const enWords = lower.match(/[a-z][a-z0-9_-]{1,}/g) ?? []

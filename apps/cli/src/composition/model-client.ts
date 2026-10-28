@@ -6,13 +6,40 @@ import type { AssistantMessage, Message } from "@ag2cli/core/message.js"
 import { isGuardianConfigured, loadRuntimeConfig, type RuntimeConfig } from "../config/runtime.js"
 import { createLlmGuardian } from "../capabilities/guardian/llm-guardian.js"
 
+/** Warn on stderr when a model is not in the catalog; the call itself still proceeds with default limits. */
+function reportModelMiss(miss: { protocol: string; provider?: string; modelId: string }): void {
+  const where = miss.provider === undefined ? miss.protocol : miss.provider
+  process.stderr.write(`ag2cli: model ${miss.modelId} not in catalog (${where}); falling back to default limits\n`)
+}
+
+export interface ModelClientCompositionOptions {
+  /** Pass null for interactive surfaces that must keep diagnostics inside their own UI. */
+  readonly onModelMiss?: ((miss: { protocol: string; provider?: string; modelId: string }) => void) | null
+}
+
+/** The provider adapter cannot be assembled because credentials or model are unset. */
+export class ModelConfigurationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "ModelConfigurationError"
+  }
+}
+
+function modelMissReporter(options: ModelClientCompositionOptions) {
+  return options.onModelMiss === undefined ? reportModelMiss : (options.onModelMiss ?? undefined)
+}
+
 /**
  * Load only the selected provider adapter for the new composition root.
  *
  * Provider SDKs are intentionally dynamic imports here. The profile entrypoint
  * should not statically pull every provider implementation into its bundle.
  */
-export async function pickModelClient(config: RuntimeConfig = loadRuntimeConfig()): Promise<ModelClient> {
+export async function pickModelClient(
+  config: RuntimeConfig = loadRuntimeConfig(),
+  options: ModelClientCompositionOptions = {},
+): Promise<ModelClient> {
+  const onModelMiss = modelMissReporter(options)
   if (config.provider.protocol === "openai") {
     const { OpenAIModelClient } = await import("../infrastructure/model/openai-client.js")
     const baseURL = config.provider.openaiBaseURL ?? config.provider.baseURL
@@ -23,6 +50,7 @@ export async function pickModelClient(config: RuntimeConfig = loadRuntimeConfig(
         baseURL,
         apiKey,
         model,
+        ...(onModelMiss === undefined ? {} : { onModelMiss }),
         ...(config.provider.contextWindow === undefined ? {} : { contextWindow: config.provider.contextWindow }),
         ...(config.provider.compatibility === undefined ? {} : { compatibility: config.provider.compatibility }),
         thinking: config.provider.thinking,
@@ -30,7 +58,9 @@ export async function pickModelClient(config: RuntimeConfig = loadRuntimeConfig(
         ...(config.provider.maxTokens === undefined ? {} : { maxTokens: config.provider.maxTokens }),
       })
     }
-    throw new Error("OpenAI configuration is missing: set AG2CLI_BASE_URL, AG2CLI_API_KEY, and AG2CLI_MODEL (or AG2CLI_OPENAI_*)")
+    throw new ModelConfigurationError(
+      "OpenAI configuration is missing: set AG2CLI_BASE_URL, AG2CLI_API_KEY, and AG2CLI_MODEL (or AG2CLI_OPENAI_*)",
+    )
   }
   const { AnthropicModelClient } = await import("../infrastructure/model/anthropic-client.js")
   if (config.provider.baseURL && config.provider.apiKey && config.provider.model) {
@@ -38,10 +68,12 @@ export async function pickModelClient(config: RuntimeConfig = loadRuntimeConfig(
       baseURL: config.provider.baseURL,
       apiKey: config.provider.apiKey,
       model: config.provider.model,
+      ...(onModelMiss === undefined ? {} : { onModelMiss }),
       ...(config.provider.contextWindow === undefined ? {} : { contextWindow: config.provider.contextWindow }),
+      ...(config.provider.maxTokens === undefined ? {} : { maxTokens: config.provider.maxTokens }),
     })
   }
-  throw new Error("Anthropic protocol configuration is missing: set AG2CLI_BASE_URL, AG2CLI_API_KEY, and AG2CLI_MODEL")
+  throw new ModelConfigurationError("Anthropic protocol configuration is missing: set AG2CLI_BASE_URL, AG2CLI_API_KEY, and AG2CLI_MODEL")
 }
 
 /**
@@ -49,8 +81,12 @@ export async function pickModelClient(config: RuntimeConfig = loadRuntimeConfig(
  * An unresolved credential keeps the guardian unconfigured rather than failing.
  * Composition owns the reviewer's model client; the capability stays pure.
  */
-export async function pickGuardian(config: RuntimeConfig = loadRuntimeConfig()): Promise<Guardian | undefined> {
+export async function pickGuardian(
+  config: RuntimeConfig = loadRuntimeConfig(),
+  options: ModelClientCompositionOptions = {},
+): Promise<Guardian | undefined> {
   if (!isGuardianConfigured(config)) return undefined
+  const onModelMiss = modelMissReporter(options)
   const guardian = config.guardian!
   const implementation = guardian.implementation
   const modelClient =
@@ -61,7 +97,7 @@ export async function pickGuardian(config: RuntimeConfig = loadRuntimeConfig()):
               baseURL: implementation.baseURL,
               apiKey: guardian.apiKey!,
               model: implementation.model,
-              ...(implementation.maxOutputTokens === undefined ? {} : { maxTokens: implementation.maxOutputTokens }),
+              ...(onModelMiss === undefined ? {} : { onModelMiss }),
             }),
         )
       : await import("../infrastructure/model/anthropic-client.js").then(
@@ -70,7 +106,7 @@ export async function pickGuardian(config: RuntimeConfig = loadRuntimeConfig()):
               baseURL: implementation.baseURL,
               apiKey: guardian.apiKey!,
               model: implementation.model,
-              ...(implementation.maxOutputTokens === undefined ? {} : { maxTokens: implementation.maxOutputTokens }),
+              ...(onModelMiss === undefined ? {} : { onModelMiss }),
             }),
         )
   return createLlmGuardian(

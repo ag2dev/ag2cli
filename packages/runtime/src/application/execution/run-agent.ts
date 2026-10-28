@@ -5,8 +5,10 @@ import { EMPTY_MODEL_RESPONSE_FALLBACK, type RunResult } from "@ag2cli/core/exec
 import type { Message, ContentBlock } from "@ag2cli/core/message.js"
 import type { ToolResult } from "@ag2cli/core/tool-facts.js"
 import type { ApprovalBroker } from "../../ports/approval-broker.js"
+import type { AskBroker } from "../../ports/ask-broker.js"
 import type { Guardian, GuardianDeadlineTimer, GuardianWaitRegistry } from "../../ports/guardian.js"
 import type { EventStore } from "../../ports/event-store.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import type { ExecutionModelProvider } from "../../ports/execution-model-provider.js"
 import { restrictTools, type ToolExecutor } from "../../ports/tool-executor.js"
 import type { AgentProfile, AgentProfileResolver } from "../../ports/agent-profile.js"
@@ -19,8 +21,11 @@ import type { ObservabilityPolicy } from "../../ports/observability.js"
 import { TransientEventPublisher } from "./transient-events.js"
 import { ToolTurnExecutor, type AgentEventFactory } from "./tool-turn-executor.js"
 import { ApprovalRequiredError } from "./approval-required-error.js"
+import { AskExpiredError } from "./ask-expired-error.js"
+import { RunNotActiveError } from "./run-not-active.js"
 import { projectModelTools, type PermissionSurfaces } from "./permission-judgment.js"
 import type { ApprovalResolutionWriter } from "../session/approval-resolution.js"
+import type { AskResolutionWriter } from "../session/ask-resolution.js"
 import { estimateRequestUsage } from "../context/compact.js"
 import { createToolFailureLoopGuardState } from "./tool-failure-loop-guard.js"
 import { modelMessagesForRequest } from "../prompt/assembly.js"
@@ -89,12 +94,29 @@ export interface CancelInputResult {
   readonly status: InputCancellationStatus
 }
 
+export interface CancelRunInput {
+  readonly sessionId: SessionId
+  readonly commandId: string
+  readonly runId: RunId
+  readonly reason?: string
+}
+
+export type RunCancellationStatus = "requested" | "already_terminal" | "not_found"
+
+export interface CancelRunResult {
+  readonly runId: RunId
+  readonly status: RunCancellationStatus
+}
+
 export interface QueueRunInputResult {
   readonly inputId: string
 }
 
 export interface RunAdmission extends QueueRunInputResult {
-  readonly runId: RunId
+  /** The run this admission is bound to: the run a prompt started, or the run
+   * a queued prompt was accepted behind. A session-level fifo prompt carries
+   * none until a run consumes it. */
+  readonly runId?: RunId
   readonly queued: boolean
 }
 
@@ -123,11 +145,7 @@ interface ActiveModelAttempt {
   readonly branchId: string
   readonly inputCursor: import("@ag2cli/core/events/event.js").HistoryCursor
   readonly requestFingerprint: string
-  readonly boundPolicyRevision: number
 }
-
-/** Durable reason for a run ended because a policy change invalidated its in-flight model work. */
-const POLICY_ABORT_REASON = "session policy changed; the in-flight model request was invalidated"
 
 export const START_RUN_FAMILY: CommandIdempotencyFamily<StartRunFingerprint> = {
   family: "start_run",
@@ -204,6 +222,13 @@ export interface RunAgentDependencies {
   readonly tools: ToolExecutor
   readonly approval: ApprovalBroker
   readonly approvalResolution: ApprovalResolutionWriter
+  /**
+   * Ask answerer and durable writer. When both are present the executor owns
+   * the ask_user lifecycle (canonical AskUser events before execution);
+   * otherwise the tool keeps asking through its host callback.
+   */
+  readonly ask?: AskBroker
+  readonly askResolution?: AskResolutionWriter
   /** Interactive surfaces this composition offers; required so every consumer states them. */
   readonly permissionSurfaces: PermissionSurfaces
   readonly contextBuilder?: ContextBuilder
@@ -227,7 +252,7 @@ export interface RunAgentDependencies {
   readonly preSpawnGateFor: (sessionId: SessionId, taskId: string, bound: SessionSecurityStamp) => PreSpawnGate
   readonly traceSink?: TraceSink
   readonly observability?: ObservabilityPolicy
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
   readonly onTransientEvent?: (event: TransientStreamEvent) => void
   /** Optional cross-process guard used by local durable compositions. */
   readonly executionReservation?: SessionExecutionReservation
@@ -246,20 +271,11 @@ export interface RunAgentDependencies {
  * no knowledge of CLI, React, ACP or a provider SDK.
  */
 export class RunAgentUseCase {
-  private readonly pending = new Map<string, Promise<void>>()
-  private readonly admissions = new Map<string, Promise<void>>()
-  private readonly mailbox = new Map<string, Promise<void>>()
+  private readonly pending = new OrderedLane<string>()
+  private readonly admissions = new OrderedLane<string>()
+  private readonly mailbox = new OrderedLane<string>()
   private readonly recovering = new Set<string>()
   private readonly runAborters = new Map<string, AbortController>()
-  /**
-   * In-flight provider calls, one controller per run. They are deliberately
-   * distinct from runAborters: a policy change aborts the model attempt but
-   * never the user-cancellation signal that started tool processes carry.
-   * Cleared when the response commits or the run reaches a terminal.
-   */
-  private readonly modelAttemptAborters = new Map<string, { sessionId: SessionId; controller: AbortController }>()
-  /** Runs whose in-flight model attempt was aborted for a policy change. */
-  private readonly policyAbortedRuns = new Set<string>()
   private readonly authority: SessionAuthority
   private readonly transientPublisher: TransientEventPublisher
   private readonly traceSink: TraceSink
@@ -279,6 +295,8 @@ export class RunAgentUseCase {
     this.toolTurnExecutor = new ToolTurnExecutor({
       approval: deps.approval,
       approvalResolution: deps.approvalResolution,
+      ask: deps.ask,
+      askResolution: deps.askResolution,
       permissionSurfaces: deps.permissionSurfaces,
       guardian: deps.guardian,
       guardianWaits: deps.guardianWaits,
@@ -301,98 +319,94 @@ export class RunAgentUseCase {
   }
 
   /**
-   * Re-enter unfinished canonical runs after a process restart. The call only
-   * schedules work; recovery is intentionally silent and never exposes an
-   * intermediate "unknown" state to a client. A second host may inspect the
-   * same history, but the execution reservation and command idempotency fence
-   * decide which host is allowed to continue it.
+   * Re-enter the named session's unfinished canonical runs when this host
+   * first serves it. The call only schedules the resumed loops; recovery is
+   * intentionally silent and never exposes an intermediate "unknown" state
+   * to a client. A second host may inspect the same history, but the
+   * execution reservation and command idempotency fence decide which host
+   * is allowed to continue it.
    */
-  async recoverUnfinishedRuns(): Promise<void> {
-    for (const session of await this.deps.eventStore.listSessions()) {
-      const key = session.toString()
-      if (this.recovering.has(key)) continue
-      const events = await this.deps.eventStore.read(session)
-      const state = reduceCanonicalSession(events)
-      const running = [...state.runs.values()].filter((run) => run.status === "running")
-      for (const run of running) {
-        const started = events.find(
-          (event): event is Extract<AgentEvent, { type: "RunStarted" }> => event.type === "RunStarted" && event.payload.runId === run.runId,
-        )
-        if (started === undefined) continue
-        const accepted = events.find(
-          (event): event is Extract<AgentEvent, { type: "InputAccepted" }> =>
-            event.type === "InputAccepted" &&
-            event.payload.commandId === started.payload.commandId &&
-            (event.payload.kind === "message" || event.payload.kind === "notification"),
-        )
-        if (accepted === undefined) continue
-        const commandAccepted = events.find(
-          (event): event is Extract<AgentEvent, { type: "CommandAccepted" }> =>
-            event.type === "CommandAccepted" &&
-            event.payload.family === "start_run" &&
-            event.payload.commandId === started.payload.commandId,
-        )
-        const fingerprint = commandAccepted?.payload.inputFingerprint as StartRunFingerprint | undefined
-        const created = events.find((event): event is Extract<AgentEvent, { type: "SessionCreated" }> => event.type === "SessionCreated")
-        this.recovering.add(key)
-        void this.execute({
-          sessionId: session,
-          commandId: accepted.payload.commandId,
-          goal: accepted.payload.text,
-          ...(fingerprint?.model === undefined || fingerprint.model === null ? {} : { model: fingerprint.model }),
-          ...(fingerprint?.initialMessages === undefined || fingerprint.initialMessages.length === 0
+  async recoverSessionRuns(sessionId: SessionId): Promise<void> {
+    const key = sessionId.toString()
+    if (this.recovering.has(key)) return
+    const events = await this.deps.eventStore.read(sessionId)
+    const state = reduceCanonicalSession(events)
+    const running = [...state.runs.values()].filter((run) => run.status === "running")
+    for (const run of running) {
+      const started = events.find(
+        (event): event is Extract<AgentEvent, { type: "RunStarted" }> => event.type === "RunStarted" && event.payload.runId === run.runId,
+      )
+      if (started === undefined) continue
+      const accepted = events.find(
+        (event): event is Extract<AgentEvent, { type: "InputAccepted" }> =>
+          event.type === "InputAccepted" &&
+          event.payload.commandId === started.payload.commandId &&
+          (event.payload.kind === "message" || event.payload.kind === "notification"),
+      )
+      if (accepted === undefined) continue
+      const commandAccepted = events.find(
+        (event): event is Extract<AgentEvent, { type: "CommandAccepted" }> =>
+          event.type === "CommandAccepted" && event.payload.family === "start_run" && event.payload.commandId === started.payload.commandId,
+      )
+      const fingerprint = commandAccepted?.payload.inputFingerprint as StartRunFingerprint | undefined
+      const created = events.find((event): event is Extract<AgentEvent, { type: "SessionCreated" }> => event.type === "SessionCreated")
+      this.recovering.add(key)
+      void this.execute({
+        sessionId,
+        commandId: accepted.payload.commandId,
+        goal: accepted.payload.text,
+        ...(fingerprint?.model === undefined || fingerprint.model === null ? {} : { model: fingerprint.model }),
+        ...(fingerprint?.initialMessages === undefined || fingerprint.initialMessages.length === 0
+          ? {}
+          : { initialMessages: fingerprint.initialMessages }),
+        ...(fingerprint?.context === undefined
+          ? accepted.payload.context === undefined
             ? {}
-            : { initialMessages: fingerprint.initialMessages }),
-          ...(fingerprint?.context === undefined
-            ? accepted.payload.context === undefined
-              ? {}
-              : { context: accepted.payload.context }
-            : { context: fingerprint.context }),
-          ...(fingerprint?.fileReferences === undefined
-            ? accepted.payload.fileReferences === undefined
-              ? {}
-              : { fileReferences: accepted.payload.fileReferences }
-            : { fileReferences: fingerprint.fileReferences }),
-          ...(fingerprint?.workspace === undefined
-            ? created?.payload.workspaceRoot === undefined
-              ? {}
-              : { workspace: created.payload.workspaceRoot }
-            : { workspace: fingerprint.workspace }),
-          ...(fingerprint?.additionalDirectories === undefined
-            ? created?.payload.additionalDirectories === undefined
-              ? {}
-              : { additionalDirectories: created.payload.additionalDirectories }
-            : { additionalDirectories: fingerprint.additionalDirectories }),
-          // The fingerprint records what the INPUT specified, not the seeded
-          // session mode: an unspecified (null) mode stays unspecified on
-          // retry, and enforcement reads the canonical session mode. Injecting
-          // the SessionCreated seed here would make the retried fingerprint
-          // explicit and conflict with the recorded null, so an interrupted
-          // run would silently never recover.
-          ...(fingerprint?.permissionMode == null ? {} : { permissionMode: fingerprint.permissionMode }),
-          ...(fingerprint?.permissionRules === undefined
-            ? created?.payload.permissionRules === undefined
-              ? {}
-              : { permissionRules: created.payload.permissionRules }
-            : { permissionRules: fingerprint.permissionRules }),
-          ...(started.payload.maxTurns === undefined ? {} : { maxTurns: started.payload.maxTurns }),
-          ...(fingerprint?.modelCallPurpose === undefined || fingerprint.modelCallPurpose === null
+            : { context: accepted.payload.context }
+          : { context: fingerprint.context }),
+        ...(fingerprint?.fileReferences === undefined
+          ? accepted.payload.fileReferences === undefined
             ? {}
-            : { modelCallPurpose: fingerprint.modelCallPurpose }),
+            : { fileReferences: accepted.payload.fileReferences }
+          : { fileReferences: fingerprint.fileReferences }),
+        ...(fingerprint?.workspace === undefined
+          ? created?.payload.workspaceRoot === undefined
+            ? {}
+            : { workspace: created.payload.workspaceRoot }
+          : { workspace: fingerprint.workspace }),
+        ...(fingerprint?.additionalDirectories === undefined
+          ? created?.payload.additionalDirectories === undefined
+            ? {}
+            : { additionalDirectories: created.payload.additionalDirectories }
+          : { additionalDirectories: fingerprint.additionalDirectories }),
+        // The fingerprint records what the INPUT specified, not the seeded
+        // session mode: an unspecified (null) mode stays unspecified on
+        // retry, and enforcement reads the canonical session mode. Injecting
+        // the SessionCreated seed here would make the retried fingerprint
+        // explicit and conflict with the recorded null, so an interrupted
+        // run would silently never recover.
+        ...(fingerprint?.permissionMode == null ? {} : { permissionMode: fingerprint.permissionMode }),
+        ...(fingerprint?.permissionRules === undefined
+          ? created?.payload.permissionRules === undefined
+            ? {}
+            : { permissionRules: created.payload.permissionRules }
+          : { permissionRules: fingerprint.permissionRules }),
+        ...(started.payload.maxTurns === undefined ? {} : { maxTurns: started.payload.maxTurns }),
+        ...(fingerprint?.modelCallPurpose === undefined || fingerprint.modelCallPurpose === null
+          ? {}
+          : { modelCallPurpose: fingerprint.modelCallPurpose }),
+      })
+        .catch(() => {
+          // A competing writer, an unavailable provider, or a transient
+          // startup failure is retried by the next serve. The canonical
+          // stream remains the only user-visible state.
         })
-          .catch(() => {
-            // A competing writer, an unavailable provider, or a transient
-            // startup failure is retried by the next host lifecycle. The
-            // canonical stream remains the only user-visible state.
-          })
-          .finally(() => this.recovering.delete(key))
-      }
+        .finally(() => this.recovering.delete(key))
     }
   }
 
-  async execute(input: StartRunInput): Promise<RunResult> {
-    const previous = this.pending.get(input.sessionId)
-    const operation = (previous ?? Promise.resolve()).then(async () => {
+  execute(input: StartRunInput): Promise<RunResult> {
+    return this.pending.run(input.sessionId, async () => {
       if (this.deps.executionReservation === undefined) return this.executeNow(input)
       validateInput(input)
       const existing = await this.deps.eventStore.read(input.sessionId)
@@ -415,16 +429,6 @@ export class RunAgentUseCase {
         await lease.release(input.signal?.aborted ? "aborted" : "released").catch(() => {})
       }
     })
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(input.sessionId, tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(input.sessionId) === tracked) this.pending.delete(input.sessionId)
-    }
   }
 
   async steer(input: SteerInput): Promise<{ readonly inputId: string }> {
@@ -456,7 +460,7 @@ export class RunAgentUseCase {
     }
     const state = reduceCanonicalSession(events)
     const run = state.runs.get(String(input.runId))
-    if (run?.status !== "running") throw new Error(`Run is not running: ${input.runId}`)
+    if (run?.status !== "running") throw new RunNotActiveError(String(input.runId))
     const inputId = inputIdFor(input.commandId)
     const event = this.makeEvent(
       input.sessionId,
@@ -485,11 +489,9 @@ export class RunAgentUseCase {
     return this.withMailbox(input.sessionId, () => this.admitSerialized(input))
   }
 
-  private async admitSerialized(input: StartRunInput): Promise<RunAdmission> {
+  private admitSerialized(input: StartRunInput): Promise<RunAdmission> {
     validateInput(input)
-    const key = input.sessionId.toString()
-    const previous = this.admissions.get(key)
-    const operation = (previous ?? Promise.resolve()).then(async () => {
+    return this.admissions.run(input.sessionId.toString(), async () => {
       const events = await this.deps.eventStore.read(input.sessionId)
       const idempotency = resolveCommandIdempotency(START_RUN_FAMILY, events, {
         family: START_RUN_FAMILY.family,
@@ -504,22 +506,24 @@ export class RunAgentUseCase {
         if (existing.kind !== "message" || existing.text !== input.goal) {
           throw new Error(`commandId was already used for a different start_run: ${input.commandId}`)
         }
-        const existingRun = [...state.runs.values()].find(
-          (run) =>
-            String(run.runId) === String(existing.targetRunId) ||
-            events.some(
-              (event) => event.type === "RunStarted" && event.payload.runId === run.runId && event.payload.commandId === input.commandId,
-            ),
-        )
         if (existing.status === "cancelled" || existing.status === "cancelled-before-acceptance") {
-          throw new Error(`Input was cancelled and cannot be resubmitted with the same commandId: ${input.commandId}`)
+          throw commandIdempotencyConflictError({
+            commandId: input.commandId,
+            family: START_RUN_FAMILY.family,
+            inputFingerprint: startRunFingerprint(input, this.deps.workspaceRootCanonicalizer),
+            eventRange: events.filter((event) => event.type === "InputAccepted" && event.payload.inputId === existing.inputId),
+          })
         }
-        if (existingRun !== undefined)
-          return {
-            inputId,
-            runId: existingRun.runId,
-            queued: existing.targetRunId !== undefined,
-          }
+        // The mailbox is session-level: a pending fifo prompt is queued for
+        // whichever run consumes next, so replay reports the queue fact
+        // instead of accepting the same input twice.
+        if (existing.status === "pending") return { inputId, queued: true }
+        const startedRun = [...state.runs.values()].find((run) =>
+          events.some(
+            (event) => event.type === "RunStarted" && event.payload.runId === run.runId && event.payload.commandId === input.commandId,
+          ),
+        )
+        return { inputId, ...(startedRun !== undefined ? { runId: startedRun.runId } : {}), queued: false }
       }
       const running = [...state.runs.values()].find((candidate) => candidate.status === "running")
       if (running !== undefined) {
@@ -561,7 +565,6 @@ export class RunAgentUseCase {
               kind: "message",
               text: input.goal,
               delivery: "fifo",
-              targetRunId: running.runId,
               ...(input.context && input.context.length > 0 ? { context: [...input.context] } : {}),
               ...(input.fileReferences && input.fileReferences.length > 0 ? { fileReferences: [...input.fileReferences] } : {}),
             },
@@ -653,16 +656,6 @@ export class RunAgentUseCase {
       await this.append(admission)
       return { inputId, runId, queued: false }
     })
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.admissions.set(key, tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.admissions.get(key) === tracked) this.admissions.delete(key)
-    }
   }
 
   /** Durably admit a prompt into an already-running loop without waiting for its current turn. */
@@ -690,9 +683,17 @@ export class RunAgentUseCase {
           eventRange: events.filter((event) => event.type === "InputAccepted" && event.payload.inputId === existing.inputId),
         })
       if (existing.status === "cancelled" || existing.status === "cancelled-before-acceptance") {
-        throw new Error(`Input was cancelled and cannot be resubmitted with the same commandId: ${input.commandId}`)
+        throw commandIdempotencyConflictError({
+          commandId: input.commandId,
+          family: START_RUN_FAMILY.family,
+          inputFingerprint: startRunFingerprint(input, this.deps.workspaceRootCanonicalizer),
+          eventRange: events.filter((event) => event.type === "InputAccepted" && event.payload.inputId === existing.inputId),
+        })
       }
-      if (existing.targetRunId !== undefined) return { inputId: existing.inputId }
+      // The mailbox is session-level: a pending fifo prompt is already
+      // queued for whichever run consumes next, so re-admission is
+      // idempotent rather than a duplicate acceptance.
+      if (existing.status === "pending") return { inputId: existing.inputId }
       if (events.some((event) => event.type === "RunStarted" && event.payload.commandId === input.commandId)) return undefined
     }
     const running = [...state.runs.values()].find((candidate) => candidate.status === "running")
@@ -736,7 +737,6 @@ export class RunAgentUseCase {
           kind: "message",
           text: input.goal,
           delivery: "fifo",
-          targetRunId: running.runId,
           ...(input.context && input.context.length > 0 ? { context: [...input.context] } : {}),
           ...(input.fileReferences && input.fileReferences.length > 0 ? { fileReferences: [...input.fileReferences] } : {}),
         },
@@ -858,6 +858,62 @@ export class RunAgentUseCase {
       inputId: input.inputId,
       status: cancellationStatus(committed, input.commandId),
     }
+  }
+
+  /**
+   * Stop request for one run. Like cancelInput this reports a request state,
+   * never a completion: the durable RunStopRequested fact plus the in-process
+   * abort make the loop converge on its own terminal event.
+   */
+  async cancelRun(input: CancelRunInput): Promise<CancelRunResult> {
+    return this.withMailbox(input.sessionId, () => this.cancelRunSerialized(input))
+  }
+
+  private async cancelRunSerialized(input: CancelRunInput): Promise<CancelRunResult> {
+    if (input.commandId.trim().length === 0) throw new Error("commandId must not be empty")
+    const events = await this.deps.eventStore.read(input.sessionId)
+    const existing = events.find((event) => event.type === "RunStopRequested" && event.payload.commandId === input.commandId)
+    if (existing?.type === "RunStopRequested") {
+      if (String(existing.payload.runId) !== String(input.runId)) {
+        throw commandIdempotencyConflictError({
+          commandId: input.commandId,
+          family: "cancel_run",
+          inputFingerprint: { runId: String(existing.payload.runId) },
+          eventRange: events.filter((event) => event.type === "RunStopRequested" && event.payload.commandId === input.commandId),
+        })
+      }
+      // A recorded stop request replays as its own outcome: the run's later
+      // terminal state belongs to run.updated, not to this command's receipt.
+      return { runId: input.runId, status: "requested" }
+    }
+    const state = reduceCanonicalSession(events)
+    const run = state.runs.get(String(input.runId))
+    if (run === undefined) return { runId: input.runId, status: "not_found" }
+    if (run.status !== "running") return { runId: input.runId, status: "already_terminal" }
+    if (run.stopRequested) return { runId: input.runId, status: "requested" }
+    const trace = (eventId: string): EventTrace => ({
+      traceId: `run-cancel:${input.commandId}`,
+      operationId: `run-cancel:${input.commandId}`,
+      ...(eventId === input.commandId ? {} : { causationId: eventId }),
+    })
+    await this.append([
+      {
+        ...this.makeEvent(
+          input.sessionId,
+          events.length + 1,
+          "RunStopRequested",
+          {
+            runId: input.runId,
+            commandId: input.commandId,
+            reason: input.reason ?? "run cancelled",
+          },
+          trace,
+        ),
+        transitionId: `command:cancel_run:${input.commandId}`,
+      },
+    ])
+    this.runAborters.get(String(input.runId))?.abort()
+    return { runId: input.runId, status: "requested" }
   }
 
   private async executeNow(input: StartRunInput): Promise<RunResult> {
@@ -1214,24 +1270,6 @@ export class RunAgentUseCase {
     })
   }
 
-  /**
-   * Aborts every in-flight provider call of the given session after a
-   * canonical policy change. Started tool processes keep the user
-   * cancellation signal and commit their results normally; only model
-   * attempts are policy-cancellable. Returns whether at least one in-flight
-   * attempt (controller not yet released) was actually aborted.
-   */
-  abortModelAttemptsForPolicyChange(sessionId: SessionId): boolean {
-    let aborted = false
-    for (const [runKey, entry] of this.modelAttemptAborters) {
-      if (entry.sessionId !== sessionId) continue
-      aborted = true
-      this.policyAbortedRuns.add(runKey)
-      entry.controller.abort(new DOMException(POLICY_ABORT_REASON, "AbortError"))
-    }
-    return aborted
-  }
-
   private async runLoop(options: {
     input: StartRunInput
     run: RunId
@@ -1297,12 +1335,17 @@ export class RunAgentUseCase {
         let currentState = reduceCanonicalSession(currentEvents)
         if (currentState.runs.get(String(run))?.stopRequested === true) throw abortError("run stopped")
         // User inputs always outrank host notifications: consumption order is
-        // the message order the model sees.
+        // the message order the model sees. Fifo prompts carry no target run:
+        // the mailbox is session-level, so leftovers from earlier runs are
+        // consumed by whichever run reaches the boundary first.
         const pendingInputs = [...currentState.inputs.values()]
           .filter(
             (candidate) =>
               candidate.status === "pending" &&
-              (candidate.inputId === options.inputId || candidate.targetRunId === run || candidate.kind === "notification"),
+              (candidate.inputId === options.inputId ||
+                candidate.targetRunId === run ||
+                candidate.kind === "notification" ||
+                (candidate.kind === "message" && candidate.targetRunId === undefined)),
           )
           .sort((left, right) => Number(left.kind === "notification") - Number(right.kind === "notification"))
         for (const pendingInput of pendingInputs) {
@@ -1450,9 +1493,8 @@ export class RunAgentUseCase {
             // attributable.
             ...(this.deps.observability?.captureModelPayload === true ? { request } : {}),
             ...(request.context === undefined ? {} : { context: request.context }),
-            // The attempt is bound to the policy snapshot this request was
-            // assembled under; a commit that moves the revision before the
-            // response lands discards it instead of committing.
+            // Record the policy snapshot used to assemble this request.
+            // Tool dispatch rechecks the current policy before side effects.
             boundPolicyRevision: replaySession(currentEvents).policyRevision,
           },
           trace.nextTrace,
@@ -1465,18 +1507,8 @@ export class RunAgentUseCase {
           branchId,
           inputCursor,
           requestFingerprint,
-          boundPolicyRevision: attemptStarted.payload.boundPolicyRevision,
         }
         await this.append([...contextEvents, attemptStarted])
-        // The provider call gets its own controller so a policy change can
-        // cancel it without touching the user-cancellation signal that tools
-        // and approval requests carry; user cancels still chain through.
-        const attemptAborter = new AbortController()
-        const attemptSignal = input.signal === undefined ? attemptAborter.signal : AbortSignal.any([input.signal, attemptAborter.signal])
-        this.modelAttemptAborters.set(runKey, {
-          sessionId: input.sessionId,
-          controller: attemptAborter,
-        })
 
         const modelStartedAt = performance.now()
         traceSink.record({
@@ -1493,7 +1525,7 @@ export class RunAgentUseCase {
           tools: request.tools,
           ...((input.model ?? agent?.model) ? { model: input.model ?? agent?.model } : {}),
           ...(request.systemPrompt ? { systemPrompt: request.systemPrompt } : {}),
-          signal: attemptSignal,
+          signal: input.signal,
           onRetry: async (retry) => {
             const retryEvent = this.makeEvent(
               input.sessionId,
@@ -1585,25 +1617,15 @@ export class RunAgentUseCase {
                   estimated: contextUsage.estimated,
                 },
               }
-        // The commit is fenced on the exact history base the drift check
-        // read: a permission commit landing between the read and the append
-        // loses the revision CAS, so the loop re-reads and either converges
-        // on the policy abort or retries on the fresh base — mirroring the
-        // InputConsumed commit idiom. The authority restamps revisions, so
-        // the provisional event number never survives a race.
+        // The response is fenced on the exact history base this commit read.
+        // Concurrent history writes retry against a fresh parent; permission
+        // changes are enforced against current policy when any tool is dispatched.
         let responseBaseEvents = await this.deps.eventStore.read(input.sessionId)
         let responseCommitted = false
         for (let commitAttempt = 0; commitAttempt < 3 && !responseCommitted; commitAttempt += 1) {
           const responseBaseState = reduceCanonicalSession(responseBaseEvents)
           const responseParent = responseBaseState.activeHead
           if (responseParent === undefined) throw new Error("Cannot commit a model response without an active history head")
-          // A policy commit that landed while this attempt was in flight moved
-          // the canonical revision past what the request was bound to: the
-          // response commits nothing and converges on the abandoned-attempt
-          // path instead of acting on stale model output.
-          if (replaySession(responseBaseEvents).policyRevision !== activeAttempt.boundPolicyRevision) {
-            throw abortError(POLICY_ABORT_REASON)
-          }
           const responseCommit = this.makeEvent(
             input.sessionId,
             responseBaseEvents.length + 1,
@@ -1635,7 +1657,6 @@ export class RunAgentUseCase {
         }
         if (!responseCommitted) throw new Error("Model response could not commit: the session history kept moving")
         activeAttempt = undefined
-        this.modelAttemptAborters.delete(runKey)
         messages.push(assistant)
 
         const toolUses = toolUsesFrom(assistant.message.content)
@@ -1646,7 +1667,10 @@ export class RunAgentUseCase {
           const hasPendingInput = [...postResponseState.inputs.values()].some(
             (candidate) =>
               candidate.status === "pending" &&
-              (candidate.inputId === options.inputId || candidate.targetRunId === run || candidate.kind === "notification"),
+              (candidate.inputId === options.inputId ||
+                candidate.targetRunId === run ||
+                candidate.kind === "notification" ||
+                (candidate.kind === "message" && candidate.targetRunId === undefined)),
           )
           if (hasPendingInput) continue
           return this.completeRun(input.sessionId, run, turn, finalText, revision, trace.nextTrace, trace.commandTrace)
@@ -1676,11 +1700,6 @@ export class RunAgentUseCase {
         messages.push(toolResultMessage(execution.results))
         if (execution.interactionOutcome === "declined") throw abortError("User declined to answer questions")
         if (input.signal?.aborted) throw abortError()
-        // A policy change aborted this run's in-flight model work: end the
-        // run here instead of issuing the next model request under the new
-        // policy.
-        if (this.policyAbortedRuns.has(runKey)) throw abortError(POLICY_ABORT_REASON)
-
         if (execution.loopGuard) {
           return this.finishFailed(input.sessionId, run, turn, execution.loopGuard.message, revision, trace.nextTrace, trace.commandTrace)
         }
@@ -1722,17 +1741,11 @@ export class RunAgentUseCase {
     const traceSink = this.traceSink
     const current = await this.deps.eventStore.read(input.sessionId)
     let revision = current.length + 1
-    // Policy-abort double insurance: force the cancelled classification and
-    // the stable policy reason even when the provider adapter swallowed the
-    // signal or surfaced its own error text instead of the abort reason.
-    const policyAborted = this.policyAbortedRuns.has(String(run))
-    if (policyAborted) this.policyAbortedRuns.delete(String(run))
-    this.modelAttemptAborters.delete(String(run))
-    const message = policyAborted ? POLICY_ABORT_REASON : error instanceof Error ? error.message : String(error)
+    const message = error instanceof Error ? error.message : String(error)
     const failureEvents: AgentEvent[] = []
     const currentState = reduceCanonicalSession(current)
     const currentRunState = currentState.runs.get(String(run))
-    const cancelled = policyAborted || input.signal?.aborted || isAbortError(error) || currentRunState?.stopRequested === true
+    const cancelled = input.signal?.aborted || isAbortError(error) || currentRunState?.stopRequested === true
     if (
       currentRunState === undefined ||
       currentRunState.status !== "running" ||
@@ -1820,6 +1833,7 @@ export class RunAgentUseCase {
         turns: countTurns(current),
         message,
         ...(error instanceof ApprovalRequiredError ? { code: "approval_required" as const } : {}),
+        ...(error instanceof AskExpiredError ? { code: "interaction_expired" as const } : {}),
       },
       trace.nextTrace,
     )
@@ -1835,6 +1849,7 @@ export class RunAgentUseCase {
       attributes: { commandType: "run_agent" },
     })
     if (error instanceof ApprovalRequiredError) throw error
+    if (error instanceof AskExpiredError) throw error
     return {
       runId: run,
       status: "failed",
@@ -1843,20 +1858,8 @@ export class RunAgentUseCase {
     }
   }
 
-  private async withMailbox<T>(sessionId: SessionId, operation: () => Promise<T>): Promise<T> {
-    const key = sessionId.toString()
-    const previous = this.mailbox.get(key)
-    const current = (previous ?? Promise.resolve()).then(operation)
-    const tracked = current.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.mailbox.set(key, tracked)
-    try {
-      return await current
-    } finally {
-      if (this.mailbox.get(key) === tracked) this.mailbox.delete(key)
-    }
+  private withMailbox<T>(sessionId: SessionId, operation: () => Promise<T>): Promise<T> {
+    return this.mailbox.run(sessionId.toString(), operation)
   }
 
   private createTrace(
@@ -1977,12 +1980,13 @@ export class RunAgentUseCase {
     if (events.length === 0) return []
     const committed =
       expectedRevision === undefined ? await this.authority.append(events) : await this.authority.appendAtRevision(events, expectedRevision)
-    if (!committed.replayed) {
-      try {
-        await this.deps.onEventsAppended?.(committed.events)
-      } catch {
-        // Durable state is authoritative; observers can replay after a notification failure.
-      }
+    try {
+      // A replay can be the only fan-out that ever ran: the original attempt
+      // may die after the durable append but before observers execute, so
+      // replays must fan out too. Delivery is at-least-once.
+      await this.deps.onEventsAppended?.(committed.events, committed.replayed === true)
+    } catch {
+      // Durable state is authoritative; observers can replay after a notification failure.
     }
     return committed.events
   }

@@ -1,7 +1,7 @@
 /**
  * Text kernel facade: grapheme-safe measurement/wrapping, the bounded
  * markdown renderer, the transcript line kernel, card chrome and the
- * framed-card renderer, the closed 13-token × 6-theme table,
+ * framed-card renderer, the closed 20-token × 6-theme table,
  * sanitization, and the Ink style bridge. Everything here is
  * framework-free and pure; the bridge output is plain props, so
  * React stays in the view layer.
@@ -18,6 +18,27 @@ export {
   wrapVerbatimRange,
 } from "./measure.js"
 export { formatDuration } from "./duration.js"
+export {
+  horizontalTabDirection,
+  horizontalTabWindow,
+  moveHorizontalTab,
+  type HorizontalDirection,
+  type HorizontalTabWindow,
+} from "./horizontal-navigation.js"
+export {
+  askSurfaceRows,
+  ASK_OPTION_WINDOW_COMPACT,
+  ASK_OPTION_WINDOW_WIDE,
+  type AskSurfaceInput,
+  type AskSurfaceRow,
+  type AskSurfaceRowKind,
+} from "./ask-surface.js"
+export {
+  composerSurfaceLayout,
+  type ComposerSurfaceInput,
+  type ComposerSurfaceLayout,
+  type ComposerSurfaceRow,
+} from "./composer-surface.js"
 export { createToolDetailCache, type ToolDetailCache, type ToolDetailCacheBounds } from "./detail-cache.js"
 export {
   measureDetailedTranscriptSource,
@@ -32,9 +53,34 @@ export {
   type TranscriptToolInput,
 } from "./transcript.js"
 export { renderMarkdownRuns, renderMarkdownRunsRange, type MarkdownRenderPhase, type MarkdownRunsRange } from "./markdown.js"
-export { FRAME_FLOOR_COLUMNS, SUPPORT_FLOOR, breadcrumbRow, frameBox, frameInnerWidth, hintRow, tabRow } from "./chrome.js"
-export { CARD_ROW_CAP, renderCardLines, type CardView } from "./card.js"
-export { wrapFooterSegments } from "./footer.js"
+export { FRAME_FLOOR_COLUMNS, SUPPORT_FLOOR, breadcrumbRow, clipTextRuns, frameBox, frameInnerWidth, hintRow, tabRow } from "./chrome.js"
+export {
+  CARD_ROW_CAP,
+  cardRowHeight,
+  renderCardLines,
+  taskCardView,
+  taskSurfaceRowHeight,
+  type CardView,
+  type TaskCardSource,
+} from "./card.js"
+export {
+  appendToolDetailsHint,
+  footerMinimalSegments,
+  footerPendingDetails,
+  footerPermissionToken,
+  footerSegments,
+  footerStatusToken,
+  formatFooterContext,
+  formatFooterTokens,
+  formatSessionStatus,
+  permissionModeChip,
+  permissionModePanelLabel,
+  prioritizeFooterSegments,
+  wrapFooterSegments,
+  type FooterPendingRun,
+  type FooterSegmentInput,
+  type FooterTelemetry,
+} from "./footer.js"
 export { textRunsEqual, THEME_IDS, THEMES, type TextOverlay, type TextRun, type TextToken, type ThemeId } from "./theme.js"
 export { sanitizeText } from "./sanitize.js"
 export { serializeRuns } from "./serialize.js"

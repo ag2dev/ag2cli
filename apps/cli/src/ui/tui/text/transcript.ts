@@ -44,6 +44,8 @@ export interface TranscriptToolInput {
   /** Display title derived from a string `description` input at merge time. */
   readonly title?: string
   readonly status: "streaming" | "running" | "waiting" | "approved" | "denied" | "done" | "error"
+  /** Canonical public tool status, retained separately from the display lifecycle. */
+  readonly toolStatus?: "requested" | "awaiting_approval" | "running" | "completed" | "failed" | "denied"
   readonly result?: string
   readonly partialInput?: string
   readonly durationMs?: number
@@ -106,6 +108,20 @@ function toolToken(status: TranscriptToolInput["status"]): TextRun["token"] {
   }
 }
 
+function publicToolToken(status: NonNullable<TranscriptToolInput["toolStatus"]>): TextRun["token"] {
+  switch (status) {
+    case "failed":
+      return "error"
+    case "denied":
+    case "awaiting_approval":
+      return "warning"
+    case "completed":
+      return "success"
+    default:
+      return "accent"
+  }
+}
+
 function toolStatusLabel(status: TranscriptToolInput["status"]): string {
   switch (status) {
     case "waiting":
@@ -115,6 +131,178 @@ function toolStatusLabel(status: TranscriptToolInput["status"]): string {
     default:
       return status
   }
+}
+
+function publicToolStatusLabel(status: NonNullable<TranscriptToolInput["toolStatus"]>): string {
+  switch (status) {
+    case "completed":
+      return "done"
+    case "awaiting_approval":
+      return "approval"
+    default:
+      return status
+  }
+}
+
+function friendlyToolName(name: string): string {
+  const names: Readonly<Record<string, string>> = {
+    read_file: "Read",
+    glob: "Find files",
+    grep: "Search",
+    write_file: "Write",
+    web_fetch: "Fetch URL",
+    skill: "Skill",
+    todo_write: "Update todos",
+    ask_user: "Ask user",
+    session_history: "Session history",
+    bash: "Bash",
+    file_edit: "Edit",
+    agent: "Agent",
+    agent_join: "Join agent",
+  }
+  return names[name.toLowerCase()] ?? name
+}
+
+type InputRecord = Record<string, unknown>
+
+function inputRecord(value: unknown): InputRecord | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as InputRecord) : null
+}
+
+function inputText(record: InputRecord, key: string): string | undefined {
+  const value = record[key]
+  return typeof value === "string" ? value : undefined
+}
+
+function inputNumber(record: InputRecord, key: string): number | undefined {
+  const value = record[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function inputBool(record: InputRecord, key: string): boolean | undefined {
+  const value = record[key]
+  return typeof value === "boolean" ? value : undefined
+}
+
+function toolInputRecord(block: TranscriptToolInput): InputRecord | null {
+  const direct = inputRecord(block.input)
+  if (direct !== null) return direct
+  if (typeof block.partialInput !== "string") return null
+  try {
+    const parsed: unknown = JSON.parse(block.partialInput)
+    return inputRecord(parsed)
+  } catch {
+    return null
+  }
+}
+
+function partialInputRecord(block: TranscriptToolInput): InputRecord | null {
+  if (typeof block.partialInput !== "string") return null
+  try {
+    const parsed: unknown = JSON.parse(block.partialInput)
+    return inputRecord(parsed)
+  } catch {
+    return null
+  }
+}
+
+function writePreview(content: string, limit: number): { readonly lines: readonly string[]; readonly omitted: number } {
+  const lines = content === "" ? [] : content.split("\n")
+  if (content.endsWith("\n")) lines.pop()
+  return { lines: lines.slice(0, limit), omitted: Math.max(0, lines.length - limit) }
+}
+
+/** Compact, schema-aware action text; unknown tools keep their actual input as a fallback. */
+function toolInputSummary(block: TranscriptToolInput): string | undefined {
+  const input = toolInputRecord(block)
+  if (input === null) return undefined
+  const name = toolDisplayName(block).toLowerCase()
+  const path = (): string | undefined => inputText(input, "path") ?? inputText(input, "file_path")
+  switch (name) {
+    case "read_file":
+      return (
+        [
+          path(),
+          inputNumber(input, "offset") === undefined ? undefined : `line ${inputNumber(input, "offset")}`,
+          inputNumber(input, "limit") === undefined ? undefined : `limit ${inputNumber(input, "limit")}`,
+        ]
+          .filter(Boolean)
+          .join(" · ") || undefined
+      )
+    case "glob":
+      return (
+        [
+          inputText(input, "pattern"),
+          path(),
+          inputNumber(input, "offset") === undefined ? undefined : `offset ${inputNumber(input, "offset")}`,
+        ]
+          .filter(Boolean)
+          .join(" · ") || undefined
+      )
+    case "grep":
+      return (
+        [inputText(input, "pattern"), path(), inputText(input, "glob"), inputText(input, "output_mode")].filter(Boolean).join(" · ") ||
+        undefined
+      )
+    case "write_file": {
+      const content = inputText(input, "content")
+      if (content === undefined) return path()
+      const preview = writePreview(content, 10)
+      const suffix = preview.omitted > 0 ? ` · +${preview.omitted} lines` : ""
+      return `${path() ?? "content"} · ${preview.lines.join(" ")}${suffix}`
+    }
+    case "web_fetch":
+      return inputText(input, "url")
+    case "skill":
+      return inputText(input, "name")
+    case "todo_write": {
+      const todos = input.todos
+      if (!Array.isArray(todos)) return undefined
+      const labels = todos.slice(0, 3).flatMap((item) => {
+        const todo = inputRecord(item)
+        if (todo === null) return []
+        const label = inputText(todo, "activeForm") ?? inputText(todo, "content")
+        return label === undefined ? [] : [label]
+      })
+      const more = Math.max(0, todos.length - Math.min(3, todos.length))
+      return [...labels, ...(more > 0 ? [`+${more} more`] : [])].join(" · ") || `${todos.length} items`
+    }
+    case "session_history":
+      return (
+        [
+          inputText(input, "action"),
+          inputText(input, "query"),
+          inputNumber(input, "offset") === undefined ? undefined : `offset ${inputNumber(input, "offset")}`,
+        ]
+          .filter(Boolean)
+          .join(" · ") || undefined
+      )
+    case "bash":
+      return inputText(input, "command")
+    case "file_edit": {
+      const oldString = inputText(input, "old_string")
+      const newString = inputText(input, "new_string")
+      return (
+        [
+          path(),
+          oldString === undefined ? undefined : `replace ${clipText(oldString.replace(/\s+/gu, " "), 36).text}`,
+          newString === undefined ? undefined : `with ${clipText(newString.replace(/\s+/gu, " "), 36).text}`,
+        ]
+          .filter(Boolean)
+          .join(" · ") || undefined
+      )
+    }
+    case "agent":
+      return Object.hasOwn(input, "description") ? inputText(input, "description") : undefined
+    case "agent_join":
+      return Object.hasOwn(input, "task_id") ? inputText(input, "task_id") : undefined
+    default:
+      return undefined
+  }
+}
+
+function indentRuns(line: readonly TextRun[], indent: string): readonly TextRun[] {
+  return [{ text: indent, token: "text" }, ...line]
 }
 
 /**
@@ -127,16 +315,84 @@ function toolDisplayName(block: TranscriptToolInput): string {
 }
 
 function toolLines(block: TranscriptToolInput, columns: number): readonly (readonly TextRun[])[] {
-  const token = toolToken(block.status)
+  const token = block.toolStatus === undefined ? toolToken(block.status) : publicToolToken(block.toolStatus)
   const name = toolDisplayName(block)
-  const action = typeof block.title === "string" && block.title.length > 0 ? ` · ${block.title}` : ""
-  const summary = sanitizeText(`[${toolStatusLabel(block.status)}] ${name}${action}`)
-    .replace(/\s+/gu, " ")
-    .trim()
+  const status = block.toolStatus === undefined ? toolStatusLabel(block.status) : publicToolStatusLabel(block.toolStatus)
+  const isError = block.toolStatus === "failed" || block.status === "error"
+  const input = toolInputSummary(block)
+  const title = typeof block.title === "string" && block.title.length > 0 ? block.title : undefined
+  const shortEditError = isError && columns <= 40 && name.toLowerCase() === "file_edit"
+  const actionInput = shortEditError ? undefined : input
+  const action = [actionInput, ...(title !== undefined && title !== input ? [title] : [])].filter(Boolean).join(" · ")
   const width = Math.max(1, columns)
-  const clipped = clipText(summary, width)
-  const text = clipped.clipped ? `${clipText(summary, Math.max(0, width - textWidth("…"))).text}…` : clipped.text
-  return [[{ text, token }]]
+  const statusText = sanitizeText(`[${status}] `)
+  const nameText = sanitizeText(friendlyToolName(name))
+  const safeAction = sanitizeText(action).replace(/\s+/gu, " ").trim()
+  const separator = safeAction.length > 0 ? " · " : ""
+  const fixedWidth = textWidth(statusText) + textWidth(nameText) + textWidth(separator)
+  // Keep the final cell clear so Ink's width-constrained Text does not
+  // leave a wrap-pending fragment to bleed into the following transcript row.
+  const actionWidth = Math.max(0, width - fixedWidth - 1)
+  const clippedAction = actionWidth > 0 ? clipText(safeAction, actionWidth) : { text: "", clipped: safeAction.length > 0 }
+  const actionText = clippedAction.clipped ? `${clipText(safeAction, Math.max(0, actionWidth - textWidth("…"))).text}…` : clippedAction.text
+  const summaryRuns: TextRun[] = [
+    { text: statusText, token },
+    { text: nameText, token: "accent" },
+  ]
+  if (actionText.length > 0) summaryRuns.push({ text: separator, token: "muted" }, { text: actionText, token: "muted" })
+  const rows: (readonly TextRun[])[] = [summaryRuns]
+  if (name.toLowerCase() === "ask_user" && block.questionOutcome !== undefined) {
+    const outcome =
+      block.questionOutcome === "answered" ? "Answered" : block.questionOutcome === "declined" ? "User declined" : "Clarification requested"
+    rows.push([{ text: `  ${outcome}`, token: block.questionOutcome === "rejected" ? "warning" : "muted" }])
+  }
+  const nameIsBash = name.toLowerCase() === "bash"
+  const isRunning = block.toolStatus === "running" || block.status === "running"
+  const isComplete = block.toolStatus === "completed" || block.status === "done"
+  if ((nameIsBash && isRunning) || isError) {
+    if (block.result === undefined) {
+      if (nameIsBash && (isComplete || isError)) {
+        rows.push([{ text: "  Output unavailable in public projection", token: "muted" }])
+      } else if (isError) rows.push([{ text: "  Error details unavailable · Ctrl+O", token: "warning" }])
+      return rows
+    }
+    const outputColumns = Math.max(1, width - 4)
+    const total = measurePlainText(block.result, outputColumns).lineCount
+    const windowSize = nameIsBash ? 5 : width <= 40 ? (shortEditError ? 2 : 3) : 10
+    const start = nameIsBash ? Math.max(0, total - windowSize) : 0
+    const count = Math.min(windowSize, total)
+    const compactBash = nameIsBash && width <= 40
+    if (!compactBash) {
+      if (nameIsBash) rows.push([{ text: "  Live output window · captured deltas", token: "muted" }])
+      else if (width <= 40) {
+        const record = toolInputRecord(block)
+        const errorPath = record === null ? undefined : (inputText(record, "file_path") ?? inputText(record, "path"))
+        const prefix = `  ${friendlyToolName(name)} failed · `
+        const pathWidth = Math.max(1, width - 1 - textWidth(prefix))
+        const clippedPath = errorPath === undefined ? { text: "captured output", clipped: false } : clipText(errorPath, pathWidth)
+        const pathText = clippedPath.clipped ? `${clipText(errorPath!, Math.max(0, pathWidth - textWidth("…"))).text}…` : clippedPath.text
+        rows.push([{ text: `${prefix}${pathText}`, token: "warning" }])
+      } else rows.push([{ text: "  Error detail · captured output", token: "muted" }])
+    }
+    const visibleCount = compactBash ? Math.min(2, count) : count
+    const visibleStart = compactBash ? Math.max(0, total - visibleCount) : start
+    rows.push(...plainLinesRange(block.result, "text", outputColumns, visibleStart, visibleCount).map((line) => indentRuns(line, "    ")))
+    if (total > visibleCount && !compactBash) {
+      const omitted = nameIsBash ? start : total - count
+      rows.push([{ text: `  +${omitted} captured rows omitted · Ctrl+O details`, token: "muted" }])
+    }
+  } else if (nameIsBash && isComplete) {
+    if (block.result === undefined) rows.push([{ text: "  Output unavailable in public projection", token: "muted" }])
+    else {
+      const outputColumns = Math.max(1, width - 4)
+      const total = measurePlainText(block.result, outputColumns).lineCount
+      const count = Math.min(3, total)
+      rows.push([{ text: "  Captured output window · extent unknown", token: "muted" }])
+      rows.push(...plainLinesRange(block.result, "text", outputColumns, 0, count).map((line) => indentRuns(line, "    ")))
+      if (total > count) rows.push([{ text: `  +${total - count} captured rows omitted · Ctrl+O details`, token: "muted" }])
+    }
+  }
+  return rows
 }
 
 // The live tail re-mints its wrapper every tick but carries the same
@@ -172,7 +428,10 @@ interface DetailedToolSection {
 
 export function detailedToolSections(block: TranscriptToolInput): readonly DetailedToolSection[] {
   const sections: DetailedToolSection[] = [
-    { body: `[${toolStatusLabel(block.status)}] ${toolDisplayName(block)}`, token: toolToken(block.status) },
+    {
+      body: `[${block.toolStatus === undefined ? toolStatusLabel(block.status) : publicToolStatusLabel(block.toolStatus)}] ${friendlyToolName(toolDisplayName(block))}`,
+      token: block.toolStatus === undefined ? toolToken(block.status) : publicToolToken(block.toolStatus),
+    },
   ]
   // The title gate matches the compact row: an empty title carries no
   // action, and a muted "Action:" line with nothing after it reads as
@@ -183,22 +442,155 @@ export function detailedToolSections(block: TranscriptToolInput): readonly Detai
     block.durationMs === undefined ? null : `${block.durationMs} ms`,
   ].filter((part): part is string => part !== null)
   if (metadata.length > 0) sections.push({ body: metadata.join(" · "), token: "muted" })
-  // A block without recorded input shows no section at all — an
-  // "undefined" placeholder row would read as tool output.
-  if (block.input !== undefined) sections.push({ body: "Input:", token: "muted" }, { body: jsonText(block.input), token: "text" })
-  if (block.partialInput !== undefined)
+  const input = toolInputRecord(block)
+  const inputSummary = toolInputSummary(block)
+  if (input !== null && inputSummary !== undefined) {
+    sections.push({ body: block.input === undefined || block.input === null ? "Partial input:" : "Input:", token: "muted" })
+    const name = toolDisplayName(block).toLowerCase()
+    const path = inputText(input, "path") ?? inputText(input, "file_path")
+    const add = (label: string, value: string | number | boolean | undefined): void => {
+      if (value !== undefined) sections.push({ body: `${label}: ${value}`, token: "text" })
+    }
+    switch (name) {
+      case "read_file":
+      case "glob":
+      case "grep":
+        add("path", path)
+        add(name === "read_file" ? "offset" : "pattern", name === "read_file" ? inputNumber(input, "offset") : inputText(input, "pattern"))
+        add(
+          name === "read_file" || name === "glob" ? "limit" : "mode",
+          name === "read_file" || name === "glob" ? inputNumber(input, "limit") : inputText(input, "output_mode"),
+        )
+        if (name === "grep") add("glob", inputText(input, "glob"))
+        break
+      case "write_file": {
+        add("path", path)
+        const content = inputText(input, "content")
+        if (content !== undefined) {
+          const preview = writePreview(content, 10)
+          sections.push({ body: "Content preview:", token: "muted" })
+          for (const line of preview.lines) sections.push({ body: line, token: "text" })
+          if (preview.omitted > 0) sections.push({ body: `… ${preview.omitted} more lines omitted`, token: "muted" })
+        }
+        break
+      }
+      case "web_fetch":
+        add("url", inputText(input, "url"))
+        add("max_length", inputNumber(input, "max_length"))
+        break
+      case "skill":
+        add("name", inputText(input, "name"))
+        break
+      case "todo_write": {
+        const todos = input.todos
+        if (Array.isArray(todos)) {
+          sections.push({ body: `Todos (${todos.length}):`, token: "muted" })
+          for (const item of todos.slice(0, 10)) {
+            const todo = inputRecord(item)
+            if (todo === null) continue
+            const label = inputText(todo, "activeForm") ?? inputText(todo, "content")
+            if (label !== undefined) sections.push({ body: `[${inputText(todo, "status") ?? "unknown"}] ${label}`, token: "text" })
+          }
+          if (todos.length > 10) sections.push({ body: `… ${todos.length - 10} more todos omitted`, token: "muted" })
+        } else sections.push({ body: jsonText(block.input), token: "text" })
+        break
+      }
+      case "session_history":
+        add("action", inputText(input, "action"))
+        add("query", inputText(input, "query"))
+        add("offset", inputNumber(input, "offset"))
+        add("limit", inputNumber(input, "limit"))
+        add("charOffset", inputNumber(input, "charOffset"))
+        break
+      case "bash":
+        add("command", inputText(input, "command"))
+        add("timeout", inputNumber(input, "timeout"))
+        break
+      case "file_edit":
+        add("file_path", path)
+        add("old_string", inputText(input, "old_string"))
+        add("new_string", inputText(input, "new_string"))
+        add("replace_all", inputBool(input, "replace_all"))
+        break
+      case "agent":
+        if (Object.hasOwn(input, "description")) {
+          add("description", inputText(input, "description"))
+          add("subagent_type", inputText(input, "subagent_type"))
+          add("child handle", inputText(input, "task_id"))
+        } else sections.push({ body: jsonText(block.input), token: "text" })
+        break
+      case "agent_join":
+        if (Object.hasOwn(input, "task_id")) {
+          add("task_id", inputText(input, "task_id"))
+          add("timeout_ms", inputNumber(input, "timeout_ms"))
+        } else sections.push({ body: jsonText(block.input), token: "text" })
+        break
+      default:
+        sections.push({ body: jsonText(block.input), token: "text" })
+    }
+  } else if (block.input !== undefined) {
+    sections.push({ body: "Input:", token: "muted" }, { body: jsonText(block.input), token: "text" })
+  }
+  if (block.partialInput !== undefined && partialInputRecord(block) === null)
+    sections.push(
+      { body: input === null ? "Input unavailable · partial JSON:" : "Partial input could not be parsed:", token: "muted" },
+      { body: block.partialInput, token: "text" },
+    )
+  else if (block.partialInput !== undefined && input === null)
     sections.push({ body: "Partial input:", token: "muted" }, { body: block.partialInput, token: "text" })
-  if (block.result !== undefined) sections.push({ body: "Result:", token: "muted" }, { body: block.result, token: "text" })
+  const isBash = toolDisplayName(block).toLowerCase() === "bash"
+  const isRunning = block.toolStatus === "running" || block.status === "running"
+  if (isBash) {
+    if (block.result === undefined) sections.push({ body: "Output unavailable in public projection", token: "muted" })
+    else {
+      const heading = isRunning ? "Live output window · captured deltas" : "Captured output window · extent unknown"
+      sections.push({ body: heading, token: "muted" }, { body: block.result, token: "text" })
+    }
+  } else if (block.result !== undefined) sections.push({ body: "Result:", token: "muted" }, { body: block.result, token: "text" })
+  else if (block.status === "error") sections.push({ body: "Error details unavailable in public projection", token: "muted" })
   if (block.diff !== undefined && typeof block.diff === "object" && block.diff !== null) {
     const diff = block.diff as {
       readonly addedLines?: unknown
       readonly removedLines?: unknown
       readonly sites?: unknown
       readonly truncated?: unknown
+      readonly previewAvailable?: unknown
+      readonly hunks?: unknown
     }
     if (typeof diff.addedLines === "number" && typeof diff.removedLines === "number" && typeof diff.sites === "number") {
       const marker = diff.truncated === true ? " · truncated" : ""
       sections.push({ body: `Diff: +${diff.addedLines} −${diff.removedLines} across ${diff.sites} change sites${marker}`, token: "muted" })
+      if (diff.previewAvailable === false) sections.push({ body: "Diff preview unavailable", token: "warning" })
+      else if (Array.isArray(diff.hunks)) {
+        for (const rawHunk of diff.hunks) {
+          const hunk = inputRecord(rawHunk)
+          if (hunk === null || !Array.isArray(hunk.lines)) continue
+          const oldStart = typeof hunk.oldStart === "number" ? hunk.oldStart : "?"
+          const oldLines = typeof hunk.oldLines === "number" ? hunk.oldLines : "?"
+          const newStart = typeof hunk.newStart === "number" ? hunk.newStart : "?"
+          const newLines = typeof hunk.newLines === "number" ? hunk.newLines : "?"
+          sections.push({
+            body: `@@ -${oldStart},${oldLines} +${newStart},${newLines} @@`,
+            token: "muted",
+          })
+          let oldLine = typeof hunk.oldStart === "number" ? hunk.oldStart : undefined
+          let newLine = typeof hunk.newStart === "number" ? hunk.newStart : undefined
+          for (const rawLine of hunk.lines) {
+            const line = inputRecord(rawLine)
+            if (
+              line === null ||
+              typeof line.text !== "string" ||
+              (line.kind !== "context" && line.kind !== "added" && line.kind !== "removed")
+            )
+              continue
+            const diffMarker = line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "
+            const token = line.kind === "added" ? "diffAdded" : line.kind === "removed" ? "diffRemoved" : "text"
+            const oldNumber = line.kind === "added" ? "  " : oldLine === undefined ? "?" : String(oldLine++)
+            const newNumber = line.kind === "removed" ? "  " : newLine === undefined ? "?" : String(newLine++)
+            sections.push({ body: `${oldNumber.padStart(3)} ${newNumber.padStart(3)} │ ${diffMarker}${line.text}`, token })
+          }
+        }
+      }
     }
   }
   if (block.questionOutcome !== undefined) sections.push({ body: `Question: ${block.questionOutcome}`, token: "muted" })

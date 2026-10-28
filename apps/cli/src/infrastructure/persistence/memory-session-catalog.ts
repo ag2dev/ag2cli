@@ -53,6 +53,7 @@ export class MemorySessionCatalog implements SessionCatalog {
       ...(workspaceId === undefined ? {} : { workspaceId }),
       snapshot,
       createdAt: events[0]!.timestamp,
+      updatedAt: events.at(-1)!.timestamp,
       ...(state.title === undefined ? {} : { title: state.title }),
       archived: state.archivedAt !== undefined,
       ...(state.archivedAt === undefined ? {} : { archivedAt: state.archivedAt }),
@@ -99,6 +100,23 @@ export class MemorySessionCatalog implements SessionCatalog {
     return (await this.get(id, options))!
   }
 
+  async setTitleIfAbsent(id: SessionId, value: string, options?: SessionCatalogOptions): Promise<SessionRecord> {
+    throwIfAborted(options?.signal)
+    const title = normalizeTitle(value)
+    if (title === undefined) throw new Error("Session title must not be empty")
+    const record = await this.get(id, options)
+    if (record === undefined) throw new Error(`Session does not exist: ${id}`)
+    if (record.title !== undefined) return record
+    try {
+      await this.appendTitle(id, title, record.snapshot.lastRevision)
+    } catch (error) {
+      const raced = await this.get(id, options)
+      if (raced?.title !== undefined) return raced
+      throw error
+    }
+    return (await this.get(id, options))!
+  }
+
   async fork(source: SessionId, target: SessionId, title?: string, options?: SessionCatalogOptions): Promise<SessionRecord> {
     const sourceEvents = await this.events.read(source)
     if (sourceEvents.length === 0) throw new Error(`Source Session does not exist: ${source}`)
@@ -115,20 +133,20 @@ export class MemorySessionCatalog implements SessionCatalog {
     options?: SessionCatalogOptions,
   ): Promise<SessionRecord> {
     throwIfAborted(options?.signal)
+    const normalized = normalizeTitle(title)
     const existing = await this.get(target, options)
     if (existing !== undefined) {
       const existingEvents = await this.events.read(target)
       const completed = existingEvents.find((event) => event.type === "ForkCompleted")
+      // Retry idempotency is payload-symmetric with create: only the exact
+      // same (source, cursor, title) replays; a divergent title conflicts
+      // instead of mutating the existing target.
       if (
         completed?.type === "ForkCompleted" &&
         completed.payload.sourceSessionId === source &&
-        sameHistoryCursor(completed.payload.sourceCursor, cursor)
+        sameHistoryCursor(completed.payload.sourceCursor, cursor) &&
+        existing.title === normalized
       ) {
-        const normalized = normalizeTitle(title)
-        if (normalized !== undefined && existing.title !== normalized) {
-          await this.appendTitle(target, normalized, existingEvents.at(-1)!.revision)
-          return (await this.get(target, options))!
-        }
         return existing
       }
       throw new Error(`Target Session already exists: ${target}`)
@@ -139,7 +157,6 @@ export class MemorySessionCatalog implements SessionCatalog {
     replaySession(sourceEvents)
     const materialized = materializeSessionAtCursor(sourceEvents, target, cursor, randomUUID)
     await this.authority.append(materialized.events, `fork:${target}:${source}:${cursor.nodeId}:${cursor.physicalRevision}`)
-    const normalized = normalizeTitle(title)
     if (normalized !== undefined) {
       const targetEvents = await this.events.read(target)
       await this.appendTitle(target, normalized, targetEvents.at(-1)!.revision)

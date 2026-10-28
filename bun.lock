@@ -18,10 +18,11 @@
       "dependencies": {
         "@ag2cli/app-server-client": "workspace:*",
         "@ag2cli/app-server-protocol": "workspace:*",
-        "@ag2cli/client": "workspace:*",
         "@ag2cli/core": "workspace:*",
-        "@ag2cli/protocol": "workspace:*",
+        "@ag2cli/model-catalog": "workspace:*",
         "@ag2cli/runtime": "workspace:*",
+        "@ag2cli/session-client": "workspace:*",
+        "@ag2cli/session-protocol": "workspace:*",
         "@agentclientprotocol/sdk": "^1.4.0",
         "@anthropic-ai/sdk": "0.94.0",
         "@vscode/ripgrep": "^1.18.0",
@@ -84,17 +85,6 @@
         "typescript": "5.9.3",
       },
     },
-    "packages/client": {
-      "name": "@ag2cli/client",
-      "version": "0.0.0-private",
-      "dependencies": {
-        "@ag2cli/core": "workspace:*",
-        "@ag2cli/protocol": "workspace:*",
-      },
-      "devDependencies": {
-        "typescript": "5.9.3",
-      },
-    },
     "packages/core": {
       "name": "@ag2cli/core",
       "version": "0.0.0-private",
@@ -105,12 +95,9 @@
         "typescript": "5.9.3",
       },
     },
-    "packages/protocol": {
-      "name": "@ag2cli/protocol",
+    "packages/model-catalog": {
+      "name": "@ag2cli/model-catalog",
       "version": "0.0.0-private",
-      "dependencies": {
-        "@ag2cli/core": "workspace:*",
-      },
       "devDependencies": {
         "typescript": "5.9.3",
       },
@@ -120,8 +107,29 @@
       "version": "0.0.0-private",
       "dependencies": {
         "@ag2cli/core": "workspace:*",
-        "@ag2cli/protocol": "workspace:*",
+        "@ag2cli/session-protocol": "workspace:*",
         "zod": "3.25.76",
+      },
+      "devDependencies": {
+        "typescript": "5.9.3",
+      },
+    },
+    "packages/session-client": {
+      "name": "@ag2cli/session-client",
+      "version": "0.0.0-private",
+      "dependencies": {
+        "@ag2cli/core": "workspace:*",
+        "@ag2cli/session-protocol": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "5.9.3",
+      },
+    },
+    "packages/session-protocol": {
+      "name": "@ag2cli/session-protocol",
+      "version": "0.0.0-private",
+      "dependencies": {
+        "@ag2cli/core": "workspace:*",
       },
       "devDependencies": {
         "typescript": "5.9.3",
@@ -133,13 +141,15 @@
 
     "@ag2cli/app-server-protocol": ["@ag2cli/app-server-protocol@workspace:packages/app-server-protocol"],
 
-    "@ag2cli/client": ["@ag2cli/client@workspace:packages/client"],
-
     "@ag2cli/core": ["@ag2cli/core@workspace:packages/core"],
 
-    "@ag2cli/protocol": ["@ag2cli/protocol@workspace:packages/protocol"],
+    "@ag2cli/model-catalog": ["@ag2cli/model-catalog@workspace:packages/model-catalog"],
 
     "@ag2cli/runtime": ["@ag2cli/runtime@workspace:packages/runtime"],
+
+    "@ag2cli/session-client": ["@ag2cli/session-client@workspace:packages/session-client"],
+
+    "@ag2cli/session-protocol": ["@ag2cli/session-protocol@workspace:packages/session-protocol"],
 
     "@agentclientprotocol/sdk": ["@agentclientprotocol/sdk@1.4.0", "", { "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" } }, "sha512-/eufudw+aFY1LKLolT6yFE6UMmYRl7fMJ/DEONSIyR6wI3slHWITBsANRGqXEY8FRzqUxwh7QEaGiZHcJPVThg=="],
 
@@ -446,6 +456,10 @@
     "widest-line": ["widest-line@6.0.0", "", { "dependencies": { "string-width": "^8.1.0" } }, "sha512-U89AsyEeAsyoF0zVJBkG9zBgekjgjK7yk9sje3F4IQpXBJ10TF6ByLlIfjMhcmHMJgHZI4KHt4rdNfktzxIAMA=="],
 
     "wrap-ansi": ["wrap-ansi@10.0.2", "", { "dependencies": { "ansi-styles": "^6.2.3", "string-width": "^8.2.0" } }, "sha512-6OLRNZqRntVGBm26ghZ5eZhCuWWyOkRCSn8XsOIuq5stpCE/tjLbdozd93naILZig0lmD8ANfRwnhn0DLeXGlg=="],
+
+    "ws": ["ws@8.21.3", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-201TZ/kPWxoPr/OKWjquZR1SWKXcvxdH+e1xrx89b3YbmzLMFCLfnaG1HFIgWzJOEWZ7MvpK++odZufgYR50Rw=="],
+
+    "yaml": ["yaml@2.9.0", "", { "bin": { "yaml": "bin.mjs" } }, "sha512-2AvhNX3mb8zd6Zy7INTtSpl1F15HW6Wnqj0srWlkKLcpYl/gMIMJiyuGq2KeI2YFxUPjdlB+3Lc10seMLtL4cA=="],
 
     "yoga-layout": ["yoga-layout@3.2.1", "", {}, "sha512-0LPOt3AxKqMdFBZA3HBAt/t/8vIKq7VaQYbuA8WxCgung+p9TVyKRYdpvCb80HcdTN2NkbIKbhNwKUfm3tQywQ=="],
 

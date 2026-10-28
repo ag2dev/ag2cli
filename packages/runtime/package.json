@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@ag2cli/core": "workspace:*",
-    "@ag2cli/protocol": "workspace:*",
+    "@ag2cli/session-protocol": "workspace:*",
     "zod": "3.25.76"
   },
   "scripts": {

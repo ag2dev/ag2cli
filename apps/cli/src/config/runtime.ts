@@ -2,7 +2,7 @@ import { join } from "node:path"
 import type { HeadlessOutputFormat } from "./output-format.js"
 import type { ObservabilityMode, TelemetryMode } from "@ag2cli/core/model/observation.js"
 import { parseMaxPayloadBytes, parseObservabilityMode, parseTelemetryMode } from "@ag2cli/runtime/ports/observability.js"
-import { thresholdsForContextWindow, type CompactThresholds } from "@ag2cli/core/model/limits.js"
+import type { CompactThresholds } from "@ag2cli/core/model/limits.js"
 import { validateProjectInstructionFileName } from "./instruction-file.js"
 import {
   defaultConfigPath,
@@ -38,6 +38,8 @@ export interface RuntimeConfig {
   /** Application-scoped home; unlike HOME, this does not affect child processes or workspaces. */
   readonly applicationHome?: string
   readonly provider: {
+    /** Optional user-facing label for the configured endpoint. */
+    readonly displayName?: string
     readonly protocol: "anthropic" | "openai"
     readonly compatibility?: OpenAICompatibilityName
     readonly thinking: OpenAIThinkingMode
@@ -59,7 +61,8 @@ export interface RuntimeConfig {
     /** Credential is environment-only; absent keeps the guardian unconfigured. */
     readonly apiKey?: string
   }
-  readonly compact: CompactThresholds
+  /** Explicit compaction thresholds only; missing fields complete in composition from resolved model facts. */
+  readonly compact?: Partial<CompactThresholds>
   /** Optional per-run agentic turn cap; absent means unlimited. */
   readonly maxTurns?: number
   /** Preferred language for model-generated explanations and direct replies. */
@@ -131,7 +134,7 @@ export type RuntimeConfigOverrides = {
   readonly guardian?: Partial<Omit<NonNullable<RuntimeConfig["guardian"]>, "implementation">> & {
     readonly implementation?: NonNullable<RuntimeConfig["guardian"]>["implementation"]
   }
-  readonly compact?: Partial<RuntimeConfig["compact"]>
+  readonly compact?: Partial<CompactThresholds>
   readonly maxTurns?: number
   readonly responseLanguage?: string
   readonly ui?: Partial<RuntimeConfig["ui"]>
@@ -203,8 +206,9 @@ export function loadRuntimeConfig(
   const envConfig = readEnvironmentOverrides(env)
   const merged = mergeConfigSources<RuntimeConfigOverrides>(fileConfig, envConfig, options.cliOverrides)
   const protocol = readProtocol(merged.provider?.protocol)
+  const providerDisplayName = readProviderDisplayName(merged.provider?.displayName)
   const contextWindow = readContextWindowOverride(merged.provider?.contextWindow)
-  const compact = readCompactThresholds(merged.compact, contextWindow)
+  const compact = readExplicitCompactThresholds(merged.compact)
   const maxTurns = readConfiguredMaxTurns(merged.maxTurns)
   const responseLanguage = readResponseLanguage(merged.responseLanguage)
   const guardian = readGuardian(merged.guardian)
@@ -220,6 +224,7 @@ export function loadRuntimeConfig(
   return {
     ...(applicationHome === undefined ? {} : { applicationHome }),
     provider: {
+      ...(providerDisplayName === undefined ? {} : { displayName: providerDisplayName }),
       protocol,
       compatibility: readCompatibility(merged.provider?.compatibility),
       thinking: readThinking(merged.provider?.thinking),
@@ -227,14 +232,14 @@ export function loadRuntimeConfig(
       ...(merged.provider?.baseURL ? { baseURL: merged.provider.baseURL } : {}),
       ...(merged.provider?.apiKey ? { apiKey: merged.provider.apiKey } : {}),
       ...(merged.provider?.model ? { model: merged.provider.model } : {}),
-      contextWindow,
+      ...(contextWindow === undefined ? {} : { contextWindow }),
       ...(merged.provider?.maxTokens === undefined ? {} : { maxTokens: merged.provider.maxTokens }),
       ...(merged.provider?.openaiBaseURL ? { openaiBaseURL: merged.provider.openaiBaseURL } : {}),
       ...(merged.provider?.openaiApiKey ? { openaiApiKey: merged.provider.openaiApiKey } : {}),
       ...(merged.provider?.openaiModel ? { openaiModel: merged.provider.openaiModel } : {}),
     },
     ...(guardian === undefined ? {} : { guardian }),
-    compact,
+    ...(compact === undefined ? {} : { compact }),
     ...(maxTurns === undefined ? {} : { maxTurns }),
     ...(responseLanguage === undefined ? {} : { responseLanguage }),
     ui: {
@@ -352,6 +357,7 @@ export function loadTuiThemePreference(
 
 function readEnvironmentOverrides(env: Readonly<Record<string, string | undefined>>): RuntimeConfigOverrides {
   const provider: {
+    displayName?: string
     protocol?: "anthropic" | "openai"
     compatibility?: OpenAICompatibilityName
     thinking?: OpenAIThinkingMode
@@ -365,6 +371,7 @@ function readEnvironmentOverrides(env: Readonly<Record<string, string | undefine
     openaiApiKey?: string
     openaiModel?: string
   } = {}
+  if (env.AG2CLI_PROVIDER_DISPLAY_NAME !== undefined) provider.displayName = env.AG2CLI_PROVIDER_DISPLAY_NAME
   if (env.AG2CLI_PROTOCOL !== undefined) provider.protocol = readProtocol(env.AG2CLI_PROTOCOL)
   if (env.AG2CLI_COMPATIBILITY !== undefined) provider.compatibility = readCompatibility(env.AG2CLI_COMPATIBILITY)
   if (env.AG2CLI_THINKING !== undefined) provider.thinking = readThinking(env.AG2CLI_THINKING)
@@ -463,7 +470,7 @@ function readEnvironmentOverrides(env: Readonly<Record<string, string | undefine
   return {
     provider,
     ...(Object.keys(guardian).length === 0 ? {} : { guardian }),
-    compact,
+    ...(Object.keys(compact).length === 0 ? {} : { compact }),
     ...(maxTurns === undefined ? {} : { maxTurns }),
     ...(responseLanguage === undefined ? {} : { responseLanguage }),
     ui,
@@ -528,9 +535,31 @@ function readProtocol(value: string | undefined): "anthropic" | "openai" {
   throw new Error(`Unsupported AG2CLI_PROTOCOL: ${value}`)
 }
 
+function readProviderDisplayName(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  const displayName = value.trim()
+  if (displayName.length === 0) return undefined
+  // oxlint-disable-next-line no-control-regex -- terminal labels must remain on one line
+  if (displayName.length > 64 || /[\u0000-\u001f\u007f]/u.test(displayName)) {
+    throw new Error("AG2CLI_PROVIDER_DISPLAY_NAME must be 1-64 single-line characters")
+  }
+  return displayName
+}
+
 function readCompatibility(value: string | undefined): OpenAICompatibilityName | undefined {
   if (value === undefined || value === "auto") return undefined
-  const names: readonly OpenAICompatibilityName[] = ["generic", "openai", "deepseek", "qwen", "openrouter", "together", "zai", "llama.cpp"]
+  const names: readonly OpenAICompatibilityName[] = [
+    "generic",
+    "openai",
+    "deepseek",
+    "qwen",
+    "openrouter",
+    "together",
+    "zai",
+    "llama.cpp",
+    "moonshot",
+    "xai",
+  ]
   if (!names.includes(value as OpenAICompatibilityName)) throw new Error(`Unsupported OpenAI compatibility: ${value}`)
   return value as OpenAICompatibilityName
 }
@@ -563,22 +592,24 @@ function readContextWindowValue(value: string): number {
   return contextWindow
 }
 
-function readContextWindowOverride(value: number | undefined): number {
-  if (value === undefined) return 200_000
+function readContextWindowOverride(value: number | undefined): number | undefined {
+  if (value === undefined) return undefined
   if (!Number.isSafeInteger(value) || value < 1 || value > 10_000_000) {
     throw new Error(`Invalid contextWindow: ${value}`)
   }
   return value
 }
 
-function readCompactThresholds(configured: Partial<RuntimeConfig["compact"]> | undefined, contextWindow: number): CompactThresholds {
-  const defaults = thresholdsForContextWindow(contextWindow)
-  const autoCompactTokens = configured?.autoCompactTokens ?? defaults.autoCompactTokens
-  const blockingLimitTokens = configured?.blockingLimitTokens ?? defaults.blockingLimitTokens
-  if (blockingLimitTokens <= autoCompactTokens) {
-    throw new Error("AG2CLI_BLOCKING_LIMIT_TOKENS must be greater than AG2CLI_AUTO_COMPACT_TOKENS")
+function readExplicitCompactThresholds(configured: Partial<CompactThresholds> | undefined): Partial<CompactThresholds> | undefined {
+  if (configured?.autoCompactTokens !== undefined && configured.blockingLimitTokens !== undefined) {
+    if (configured.blockingLimitTokens <= configured.autoCompactTokens) {
+      throw new Error("AG2CLI_BLOCKING_LIMIT_TOKENS must be greater than AG2CLI_AUTO_COMPACT_TOKENS")
+    }
   }
-  return { autoCompactTokens, blockingLimitTokens }
+  if (configured === undefined || (configured.autoCompactTokens === undefined && configured.blockingLimitTokens === undefined)) {
+    return undefined
+  }
+  return { ...configured }
 }
 
 function readConfiguredMaxTurns(value: number | undefined): number | undefined {

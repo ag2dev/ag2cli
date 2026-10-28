@@ -7,6 +7,7 @@ import { DEFAULT_SESSION_PERMISSION_MODE, IncompatibleSessionEventError } from "
 import type { SessionId } from "@ag2cli/core/ids.js"
 import type { AgentEvent, HistoryCursor } from "@ag2cli/core/events/event.js"
 import type { EventStore } from "@ag2cli/runtime/ports/event-store.js"
+import type { SessionNotesStore } from "@ag2cli/runtime/ports/session-notes-store.js"
 import { SessionAuthority } from "@ag2cli/runtime/application/session/session-authority.js"
 import {
   type SessionCatalog,
@@ -20,17 +21,29 @@ import { JsonlEventStore, type JsonlEventStoreOptions } from "./jsonl-event-stor
 export class JsonlSessionCatalog implements SessionCatalog {
   readonly authority: SessionAuthority
 
-  constructor(eventsOrRoot: EventStore | string, authority?: SessionAuthority, options?: JsonlEventStoreOptions) {
+  constructor(
+    eventsOrRoot: EventStore | string,
+    authority?: SessionAuthority,
+    options?: JsonlEventStoreOptions,
+    notesStore?: SessionNotesStore,
+  ) {
     const events = typeof eventsOrRoot === "string" ? new JsonlEventStore(eventsOrRoot, options) : eventsOrRoot
     this.events = events
     this.authority = authority ?? new SessionAuthority(events)
+    this.notesStore = notesStore
   }
 
   private readonly events: EventStore
+  private readonly notesStore: SessionNotesStore | undefined
 
-  static fromRoot(root: string, authority?: SessionAuthority, options?: JsonlEventStoreOptions): JsonlSessionCatalog {
+  static fromRoot(
+    root: string,
+    authority?: SessionAuthority,
+    options?: JsonlEventStoreOptions,
+    notesStore?: SessionNotesStore,
+  ): JsonlSessionCatalog {
     const events = new JsonlEventStore(root, options)
-    return new JsonlSessionCatalog(events, authority, options)
+    return new JsonlSessionCatalog(events, authority, options, notesStore)
   }
 
   async list(options?: SessionCatalogOptions): Promise<readonly SessionRecord[]> {
@@ -65,6 +78,7 @@ export class JsonlSessionCatalog implements SessionCatalog {
       ...(state.workspaceId === undefined ? {} : { workspaceId: state.workspaceId }),
       snapshot,
       createdAt: events[0]!.timestamp,
+      updatedAt: events.at(-1)!.timestamp,
       archived: state.archivedAt !== undefined,
       ...(state.title === undefined ? {} : { title: state.title }),
       ...(state.archivedAt === undefined ? {} : { archivedAt: state.archivedAt }),
@@ -110,6 +124,23 @@ export class JsonlSessionCatalog implements SessionCatalog {
     return (await this.get(id, options))!
   }
 
+  async setTitleIfAbsent(id: SessionId, value: string, options?: SessionCatalogOptions): Promise<SessionRecord> {
+    throwIfAborted(options?.signal)
+    const title = normalizeTitle(value)
+    if (title === undefined) throw new Error("Session title must not be empty")
+    const record = await this.get(id, options)
+    if (record === undefined) throw new Error(`Session does not exist: ${id}`)
+    if (record.title !== undefined) return record
+    try {
+      await this.appendTitle(id, title, record.snapshot.lastRevision)
+    } catch (error) {
+      const raced = await this.get(id, options)
+      if (raced?.title !== undefined) return raced
+      throw error
+    }
+    return (await this.get(id, options))!
+  }
+
   async fork(sourceId: SessionId, targetId: SessionId, title?: string, options?: SessionCatalogOptions): Promise<SessionRecord> {
     const source = await this.events.read(sourceId)
     if (source.length === 0) throw new Error(`Source Session does not exist: ${sourceId}`)
@@ -140,16 +171,16 @@ export class JsonlSessionCatalog implements SessionCatalog {
     if (existing !== undefined) {
       const existingEvents = await this.events.read(targetId)
       const completed = existingEvents.find((event) => event.type === "ForkCompleted")
+      // Retry idempotency is payload-symmetric with create: only the exact
+      // same (source, cursor, title) replays; a divergent title conflicts
+      // instead of mutating the existing target.
       if (
         completed?.type === "ForkCompleted" &&
         completed.payload.sourceSessionId === sourceId &&
         completed.payload.targetSessionId === targetId &&
-        sameHistoryCursor(completed.payload.sourceCursor, cursor)
+        sameHistoryCursor(completed.payload.sourceCursor, cursor) &&
+        existing.title === title
       ) {
-        if (title !== undefined && existing.title !== title) {
-          await this.appendTitle(targetId, title, existingEvents.at(-1)!.revision)
-          return (await this.get(targetId, options))!
-        }
         return existing
       }
       throw new Error(`Target Session already exists: ${targetId}`)
@@ -194,6 +225,9 @@ export class JsonlSessionCatalog implements SessionCatalog {
   async delete(id: SessionId, options?: SessionCatalogOptions): Promise<void> {
     throwIfAborted(options?.signal)
     if (!(await this.get(id, options))) throw new Error(`Session does not exist: ${id}`)
+    // The notes side-car goes first: a session id resurrected later must
+    // never read back the deleted session's notes.
+    await this.notesStore?.delete(id)
     await this.authority.deleteSession(id)
   }
 

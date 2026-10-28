@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto"
-import { open, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { link, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 
 /**
  * Shared file coordination primitives for durable host state.
@@ -27,7 +27,11 @@ const DEFAULT_LOCK_STALE_AFTER_MS = 30_000
 export interface FileLockOptions {
   readonly timeoutMs?: number
   readonly staleAfterMs?: number
-  /** Treat malformed metadata as a live lock instead of reclaiming it by age. */
+  /**
+   * Treat malformed metadata as a live lock instead of reclaiming it by age.
+   * A zero-byte file is still reclaimed: it never completed creation, so no
+   * owner metadata exists to protect.
+   */
   readonly failClosedOnCorruptMetadata?: boolean
   /** Preserve the existing lock metadata representation of each store. */
   readonly metadataTrailingNewline?: boolean
@@ -62,7 +66,12 @@ export async function acquireFileLock(path: string, options: FileLockOptions = {
   const timeoutMs = options.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS
   const staleAfterMs = options.staleAfterMs ?? DEFAULT_LOCK_STALE_AFTER_MS
   const metadataSuffix = options.metadataTrailingNewline === false ? "" : "\n"
-  const deadline = Date.now() + timeoutMs
+  // The timeout budgets time actually spent blocked between attempts, not
+  // wall clock: a loaded runner stretches every attempt's file I/O far past
+  // the budget without any real contention. A hard wall cap still bounds
+  // the loop against pathological per-attempt stalls.
+  const wallDeadline = Date.now() + timeoutMs * 4
+  let waitedMs = 0
   const guardPath = `${path}.guard`
 
   for (;;) {
@@ -71,37 +80,27 @@ export async function acquireFileLock(path: string, options: FileLockOptions = {
     let waitError: unknown
     try {
       try {
-        const handle = await open(path, "wx", 0o600)
-        const ownerNonce = randomUUID()
-        try {
-          await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: Date.now(), ownerNonce })}${metadataSuffix}`, "utf8")
-          await handle.sync()
-          let released = false
-          acquired = {
-            path,
-            ownerNonce,
-            release: async () => {
-              if (released) return
-              released = true
-              const releaseGuard = await acquireRawFileLock(guardPath, options)
+        const ownerNonce = await createLockFileAtomically(path, metadataSuffix)
+        let released = false
+        acquired = {
+          path,
+          ownerNonce,
+          release: async () => {
+            if (released) return
+            released = true
+            const releaseGuard = await acquireRawFileLock(guardPath, options)
+            try {
               try {
-                try {
-                  const metadata = await readFile(path, "utf8")
-                  const parsed = JSON.parse(metadata) as { readonly ownerNonce?: unknown }
-                  if (parsed.ownerNonce === ownerNonce) await rm(path, { force: true })
-                } catch {
-                  // The lock may already have been reclaimed after this owner died.
-                }
-              } finally {
-                await releaseGuard.release()
-                await handle.close().catch(() => {})
+                const metadata = await readFile(path, "utf8")
+                const parsed = JSON.parse(metadata) as { readonly ownerNonce?: unknown }
+                if (parsed.ownerNonce === ownerNonce) await rm(path, { force: true })
+              } catch {
+                // The lock may already have been reclaimed after this owner died.
               }
-            },
-          }
-        } catch (error) {
-          await handle.close().catch(() => {})
-          await rm(path, { force: true }).catch(() => {})
-          throw error
+            } finally {
+              await releaseGuard.release()
+            }
+          },
         }
       } catch (error) {
         if (!isAlreadyExists(error)) throw error
@@ -115,56 +114,78 @@ export async function acquireFileLock(path: string, options: FileLockOptions = {
       await guard.release()
     }
     if (acquired !== undefined) return acquired
-    if (Date.now() >= deadline) {
+    if (waitedMs >= timeoutMs || Date.now() >= wallDeadline) {
       throw options.timeoutError?.(path, waitError) ?? new Error(`file lock wait timeout: ${path}`, { cause: waitError })
     }
     await new Promise((resolve) => setTimeout(resolve, 10))
+    waitedMs += 10
   }
 }
 
 async function acquireRawFileLock(path: string, options: FileLockOptions): Promise<FileLock> {
   const metadataSuffix = options.metadataTrailingNewline === false ? "" : "\n"
   const staleAfterMs = options.staleAfterMs ?? DEFAULT_LOCK_STALE_AFTER_MS
-  const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS)
+  const timeoutMs = options.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS
+  const wallDeadline = Date.now() + timeoutMs * 4
+  let waitedMs = 0
   for (;;) {
     try {
-      const handle = await open(path, "wx", 0o600)
-      const ownerNonce = randomUUID()
-      try {
-        await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: Date.now(), ownerNonce })}${metadataSuffix}`, "utf8")
-        await handle.sync()
-        let released = false
-        return {
-          path,
-          ownerNonce,
-          release: async () => {
-            if (released) return
-            released = true
-            try {
-              const metadata = await readFile(path, "utf8")
-              const parsed = JSON.parse(metadata) as { readonly ownerNonce?: unknown }
-              if (parsed.ownerNonce === ownerNonce) await rm(path, { force: true })
-            } catch {
-              // The lock may already have been reclaimed after this owner died.
-            }
-            await handle.close().catch(() => {})
-          },
-        }
-      } catch (error) {
-        await handle.close().catch(() => {})
-        await rm(path, { force: true }).catch(() => {})
-        throw error
+      const ownerNonce = await createLockFileAtomically(path, metadataSuffix)
+      let released = false
+      return {
+        path,
+        ownerNonce,
+        release: async () => {
+          if (released) return
+          released = true
+          try {
+            const metadata = await readFile(path, "utf8")
+            const parsed = JSON.parse(metadata) as { readonly ownerNonce?: unknown }
+            if (parsed.ownerNonce === ownerNonce) await rm(path, { force: true })
+          } catch {
+            // The lock may already have been reclaimed after this owner died.
+          }
+        },
       }
     } catch (error) {
       if (!isAlreadyExists(error)) throw error
       if (await reclaimStaleLock(path, staleAfterMs, options)) {
         continue
       }
-      if (Date.now() >= deadline) {
+      if (waitedMs >= timeoutMs || Date.now() >= wallDeadline) {
         throw options.timeoutError?.(path, error) ?? new Error(`file lock wait timeout: ${path}`, { cause: error })
       }
       await new Promise((resolve) => setTimeout(resolve, 10))
+      waitedMs += 10
     }
+  }
+}
+
+/**
+ * Create a lock file whose ownership metadata is durable before the lock
+ * becomes visible: metadata is written to a uniquely named temporary and
+ * linked into place atomically. A creator that crashes mid-acquisition
+ * leaves only the temporary behind, never a zero-byte lock file that
+ * fail-closed callers could never reclaim. Throws the raw EEXIST error
+ * when the path is already held.
+ */
+async function createLockFileAtomically(path: string, metadataSuffix: string): Promise<string> {
+  const ownerNonce = randomUUID()
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    const handle = await open(temporary, "wx", 0o600)
+    try {
+      await handle.writeFile(`${JSON.stringify({ pid: process.pid, createdAt: Date.now(), ownerNonce })}${metadataSuffix}`, "utf8")
+      await handle.sync()
+    } finally {
+      await handle.close().catch(() => {})
+    }
+    await link(temporary, path)
+    await rm(temporary, { force: true }).catch(() => {})
+    return ownerNonce
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => {})
+    throw error
   }
 }
 
@@ -236,6 +257,9 @@ function dirname(path: string): string {
 async function isStaleLock(path: string, staleAfterMs: number, failClosedOnCorruptMetadata: boolean): Promise<boolean> {
   try {
     const metadata = await stat(path)
+    // A zero-byte lock is a creation that never completed: no owner
+    // metadata exists to protect, so even fail-closed callers reclaim it.
+    if (metadata.size === 0) return true
     let ownerPid: number | undefined
     try {
       const value = JSON.parse(await readFile(path, "utf8")) as { readonly pid?: unknown }

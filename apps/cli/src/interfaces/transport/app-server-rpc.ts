@@ -9,6 +9,7 @@ import {
   isRequest,
 } from "@ag2cli/app-server-protocol/json-rpc.js"
 import {
+  type AppServerCapabilities,
   type AppServerClientInfo,
   type AppServerDescriptor,
   type AppServerDeviceRegistry,
@@ -19,20 +20,17 @@ import {
   type JsonRpcResponse,
   type JsonValue,
   type InteractionLeaseScope,
+  type ServerInitializeParams,
+  type ServerInitializeResult,
 } from "@ag2cli/app-server-protocol/types.js"
 import { AppServerProtocolError, assertJsonValue } from "@ag2cli/app-server-protocol/validation.js"
+import type { PublicPermissionModeValue } from "@ag2cli/app-server-protocol/dto/snapshot.js"
 import type { SessionId } from "@ag2cli/core/ids.js"
 import type { AgentEvent } from "@ag2cli/core/events/event.js"
-import { IncompatibleSessionEventError } from "@ag2cli/core/session/session-security.js"
 import type { TransientStreamEvent } from "@ag2cli/core/events/transient.js"
-import type { SessionServer } from "@ag2cli/client/session-client.js"
-import { SessionIdConflictError, type SessionCatalog } from "@ag2cli/runtime/ports/session-catalog.js"
-import { CommandIdempotencyConflictError } from "@ag2cli/runtime/application/session/command-idempotency.js"
-import { SessionPolicyRevisionConflictError } from "@ag2cli/runtime/application/session/permission-state.js"
-import { SessionRevisionConflictError } from "@ag2cli/runtime/application/session/revision-conflict.js"
-import { SessionWriterConflictError } from "@ag2cli/runtime/application/session/session-authority.js"
-import { SessionExecutionReservationConflictError } from "@ag2cli/runtime/ports/session-execution-reservation.js"
-import { getSnapshotCommand, readEventsCommand } from "@ag2cli/protocol/session-command.js"
+import type { SessionServer } from "@ag2cli/session-client/session-client.js"
+import { type SessionCatalog } from "@ag2cli/runtime/ports/session-catalog.js"
+import { getSnapshotCommand, readEventsCommand } from "@ag2cli/session-protocol/session-command.js"
 import { AppServerOperationRegistry } from "./app-server-operation-registry.js"
 import {
   AppServerInteractionError,
@@ -40,17 +38,27 @@ import {
   type AppServerPresenceRegistration,
   type AppServerWriteAccess,
 } from "./app-server-presence.js"
-import type { AppServerDeviceProofVerifier } from "./app-server-device-proof.js"
 import { ConnectionMethods } from "./rpc/connection-methods.js"
-import { RpcApplicationError, type MethodContext, type RpcSubscription, type ServeWorkspaceRegistry, toJson } from "./rpc/method-context.js"
+import { type MethodContext, type RpcSubscription, type ServeWorkspaceRegistry } from "./rpc/method-context.js"
+import { classifyRuntimeCommandError, RpcApplicationError, toJson } from "./public-session-command-mapping.js"
+import { DEFAULT_SELECTABLE_MODES } from "./rpc/catalog-projection.js"
 import { SessionReadMethods } from "./rpc/session-read-methods.js"
 import { SessionWriteMethods } from "./rpc/session-write-methods.js"
 import { DeviceMethods } from "./rpc/device-methods.js"
 import { InteractionMethods } from "./rpc/interaction-methods.js"
+import { WorkspaceMethods, type WorkspaceInspectionPort } from "./rpc/workspace-methods.js"
 
-export { APP_SERVER_SESSION_COMMAND_POLICIES } from "./rpc/session-write-methods.js"
+export { DEFAULT_SELECTABLE_MODES } from "./rpc/catalog-projection.js"
 
-const DEFAULT_SCOPES: readonly AppServerScope[] = ["session:read", "session:write", "approval:write", "shell:execute"]
+const DEFAULT_SCOPES: readonly AppServerScope[] = [
+  "session:read",
+  "session:write",
+  "session:policy",
+  "approval:write",
+  "shell:execute",
+  "workspace:read",
+]
+
 export interface AppServerRpcConnectionOptions {
   readonly sessionServer: SessionServer
   readonly catalog?: SessionCatalog
@@ -74,20 +82,22 @@ export interface AppServerRpcConnectionOptions {
   readonly securityFingerprint?: string
   readonly grantedScopes?: readonly AppServerScope[]
   readonly deviceRegistry?: AppServerDeviceRegistry
-  readonly capabilities?: readonly string[]
+  readonly capabilities?: AppServerCapabilities
   readonly connectionId?: string
   readonly deviceId?: string
-  /** Device identity already authenticated by the physical transport. */
-  readonly authenticatedDeviceId?: string
-  /** Public key registered for the authenticated device, when proof is required. */
-  readonly authenticatedDevicePublicKey?: string
-  /** Host-owned verifier for the initialize challenge proof. */
-  readonly deviceProofVerifier?: AppServerDeviceProofVerifier
   /** Shared by all connections belonging to one Host. */
   readonly operationRegistry?: AppServerOperationRegistry
   /** Shared by all connections belonging to one Host. */
   readonly presenceRegistry?: AppServerPresenceRegistry
   readonly workspaceRegistry?: ServeWorkspaceRegistry
+  /**
+   * Structured workspace inspection (owner: capabilities/workspace),
+   * satisfied structurally at the composition wiring site. Hosts without
+   * the read-only workspace face leave this undefined.
+   */
+  readonly workspaceInspection?: WorkspaceInspectionPort
+  /** Permission modes remote clients may select; defaults to the four base modes. */
+  readonly selectableModes?: readonly PublicPermissionModeValue[]
   /** Host-scoped live projection used only for reconnecting clients. */
   readonly readTransient?: (sessionId: SessionId) => readonly TransientStreamEvent[]
   readonly onNotification: (notification: JsonRpcNotification) => void
@@ -100,8 +110,7 @@ export class AppServerRpcConnection {
   private readonly presenceRegistry?: AppServerPresenceRegistry
   private readonly connectionId: string
   private readonly deviceId: string
-  private readonly authenticatedDeviceId?: string
-  private readonly capabilities?: readonly string[]
+  private readonly capabilities?: AppServerCapabilities
   private readonly grantedScopes: readonly AppServerScope[]
   private readonly deviceRegistry?: AppServerDeviceRegistry
   private presenceRegistration?: AppServerPresenceRegistration
@@ -114,21 +123,11 @@ export class AppServerRpcConnection {
   private readonly sessionWriteMethods: SessionWriteMethods
   private readonly interactionMethods: InteractionMethods
   private readonly deviceMethods: DeviceMethods
+  private readonly workspaceMethods: WorkspaceMethods
 
   constructor(private readonly options: AppServerRpcConnectionOptions) {
     this.connectionId = options.connectionId ?? `connection-${randomUUID()}`
-    if (
-      options.deviceId !== undefined &&
-      options.authenticatedDeviceId !== undefined &&
-      options.deviceId !== options.authenticatedDeviceId
-    ) {
-      throw new Error("deviceId does not match authenticatedDeviceId")
-    }
-    if (options.authenticatedDevicePublicKey !== undefined && options.authenticatedDeviceId === undefined) {
-      throw new Error("authenticatedDevicePublicKey must be set together with authenticatedDeviceId")
-    }
-    this.authenticatedDeviceId = options.authenticatedDeviceId
-    this.deviceId = options.authenticatedDeviceId ?? options.deviceId ?? `device-${randomUUID()}`
+    this.deviceId = options.deviceId ?? `device-${randomUUID()}`
     this.grantedScopes = options.grantedScopes ?? DEFAULT_SCOPES
     this.deviceRegistry = options.deviceRegistry
     this.capabilities = options.capabilities
@@ -159,12 +158,11 @@ export class AppServerRpcConnection {
       get clientKind() {
         return contextState.clientKind
       },
-      ...(this.authenticatedDeviceId === undefined ? {} : { authenticatedDeviceId: this.authenticatedDeviceId }),
-      ...(options.authenticatedDevicePublicKey === undefined ? {} : { authenticatedDevicePublicKey: options.authenticatedDevicePublicKey }),
-      ...(options.deviceProofVerifier === undefined ? {} : { deviceProofVerifier: options.deviceProofVerifier }),
       operationRegistry: this.operationRegistry,
       ...(this.presenceRegistry === undefined ? {} : { presenceRegistry: this.presenceRegistry }),
       ...(options.workspaceRegistry === undefined ? {} : { workspaceRegistry: options.workspaceRegistry }),
+      ...(options.workspaceInspection === undefined ? {} : { workspaceInspection: options.workspaceInspection }),
+      selectableModes: options.selectableModes ?? DEFAULT_SELECTABLE_MODES,
       ...(options.readTransient === undefined ? {} : { readTransient: options.readTransient }),
       subscriptions: this.subscriptions,
       get scopes() {
@@ -200,6 +198,7 @@ export class AppServerRpcConnection {
       readEvents: (id: SessionId, afterRevision: number) => this.readEvents(id, afterRevision),
       assertWriteAccess: (id: SessionId, scope: InteractionLeaseScope | "none", generation: number | undefined) =>
         this.assertWriteAccess(id, scope, generation),
+      acquireWriteAccess: (id: SessionId, scope: InteractionLeaseScope) => this.acquireWriteAccess(id, scope),
       releaseWriteAccess: (id: SessionId, access: AppServerWriteAccess | undefined) => this.releaseWriteAccess(id, access),
       detachSession: (id: SessionId) => this.detachSession(id),
       emit: (method: string, params: Record<string, unknown>) => this.emit(method, params),
@@ -210,6 +209,7 @@ export class AppServerRpcConnection {
     this.sessionWriteMethods = new SessionWriteMethods(this.methodContext)
     this.interactionMethods = new InteractionMethods(this.methodContext)
     this.deviceMethods = new DeviceMethods(this.methodContext)
+    this.workspaceMethods = new WorkspaceMethods(this.methodContext)
   }
 
   async handle(message: JsonRpcMessage): Promise<JsonRpcResponse | undefined> {
@@ -234,11 +234,21 @@ export class AppServerRpcConnection {
     this.presenceRegistration = undefined
   }
 
+  /** Trusted in-process entry point; network clients must use server.initialize after preflight. */
+  initializeLocal(
+    params: Omit<ServerInitializeParams, "hostId" | "auth" | "appServerProtocolVersion"> & {
+      readonly appServerProtocolVersion?: ServerInitializeParams["appServerProtocolVersion"]
+    },
+  ): Promise<ServerInitializeResult> {
+    if (this.closed) return Promise.reject(new Error("App Server connection is closed"))
+    return this.connectionMethods.initializeLocal(params)
+  }
+
   private async dispatch(request: JsonRpcRequest): Promise<JsonValue> {
     if (request.method === "server.initialize") return toJson(await this.connectionMethods.initialize(request.params))
     if (!this.initialized) throw new RpcApplicationError("not_initialized", "Call server.initialize first")
     if (request.method === "server.health") return this.connectionMethods.health()
-    if (request.method === "server.describe") return this.connectionMethods.describe()
+    if (request.method === "server.describe") return toJson(this.connectionMethods.describe())
 
     switch (request.method) {
       case "session.list":
@@ -259,16 +269,38 @@ export class AppServerRpcConnection {
         return toJson(await this.sessionReadMethods.detach(request.params))
       case "session.snapshot":
         return toJson(await this.sessionReadMethods.snapshot(request.params))
-      case "session.command":
-        return toJson(await this.sessionWriteMethods.command(request.params))
       case "session.plan":
         return toJson(await this.sessionWriteMethods.plan(request.params))
+      case "session.compact":
+        return toJson(await this.sessionWriteMethods.compact(request.params))
+      case "session.addDirectory":
+        return toJson(await this.sessionWriteMethods.addDirectory(request.params))
+      case "session.setContextWindow":
+        return toJson(await this.sessionWriteMethods.setContextWindow(request.params))
+      case "session.clearContextWindow":
+        return toJson(await this.sessionWriteMethods.clearContextWindow(request.params))
+      case "session.selectAgent":
+        return toJson(await this.sessionWriteMethods.selectAgent(request.params))
+      case "session.updateGoal":
+        return toJson(await this.sessionWriteMethods.updateGoal(request.params))
       case "session.submit":
-        return toJson(await this.sessionWriteMethods.submit(request.params))
-      case "session.cancel":
-        return toJson(await this.sessionWriteMethods.cancel(request.params))
-      case "session.resolveApproval":
-        return toJson(await this.sessionWriteMethods.resolveApproval(request.params))
+        return await this.sessionWriteMethods.submit(request.params)
+      case "session.steer":
+        return toJson(await this.sessionWriteMethods.steer(request.params))
+      case "session.cancelRun":
+        return toJson(await this.sessionWriteMethods.cancelRun(request.params))
+      case "session.cancelInput":
+        return toJson(await this.sessionWriteMethods.cancelInput(request.params))
+      case "session.messages":
+        return toJson(await this.sessionReadMethods.messages(request.params))
+      case "session.resolveInteraction":
+        return toJson(await this.sessionWriteMethods.resolveInteraction(request.params))
+      case "session.getPermissionPolicy":
+        return toJson(await this.sessionWriteMethods.getPermissionPolicy(request.params))
+      case "session.setPermissionMode":
+        return toJson(await this.sessionWriteMethods.setPermissionMode(request.params))
+      case "session.setPermissionRules":
+        return toJson(await this.sessionWriteMethods.setPermissionRules(request.params))
       case "session.replay":
         return toJson(await this.sessionReadMethods.replay(request.params))
       case "session.trace":
@@ -277,6 +309,24 @@ export class AppServerRpcConnection {
         return toJson(await this.sessionReadMethods.modelCalls(request.params))
       case "session.resync":
         return toJson(await this.sessionReadMethods.resync(request.params))
+      case "session.createTask":
+        return toJson(await this.sessionWriteMethods.createTask(request.params))
+      case "session.listTasks":
+        return toJson(await this.sessionWriteMethods.listTasks(request.params))
+      case "session.cancelTask":
+        return toJson(await this.sessionWriteMethods.cancelTask(request.params))
+      case "session.getTaskLogs":
+        return toJson(await this.sessionWriteMethods.getTaskLogs(request.params))
+      case "session.executeShell":
+        return toJson(await this.sessionWriteMethods.executeShell(request.params))
+      case "session.executeUserShell":
+        return toJson(await this.sessionWriteMethods.executeUserShell(request.params))
+      case "session.listCheckpoints":
+        return toJson(await this.sessionWriteMethods.listCheckpoints(request.params))
+      case "session.previewRewind":
+        return toJson(await this.sessionWriteMethods.previewRewind(request.params))
+      case "session.rewind":
+        return toJson(await this.sessionWriteMethods.rewind(request.params))
       case "interaction.acquire":
       case "interaction.renew":
       case "interaction.release":
@@ -286,6 +336,10 @@ export class AppServerRpcConnection {
         return toJson(await this.deviceMethods.list())
       case "device.revoke":
         return toJson(await this.deviceMethods.revoke(request.params))
+      case "workspace.diff":
+        return toJson(await this.workspaceMethods.diff(request.params))
+      case "workspace.readFile":
+        return toJson(await this.workspaceMethods.readFile(request.params))
       default:
         throw new RpcMethodNotFoundError(request.method)
     }
@@ -349,8 +403,8 @@ export class AppServerRpcConnection {
   /**
    * `scope === "none"` means the command is not lease-protected at all.
    * When the Host has no interaction lease subsystem configured
-   * (`presenceRegistry === undefined`; this only
-   * happens in tests, the real Host composition always provides one), a
+   * (`presenceRegistry === undefined`; serve Hosts configure one, the
+   * local TUI/run Hosts deliberately run without), a
    * caller that never names a lease may still proceed unguarded, but a
    * caller that explicitly names one it cannot possibly hold gets
    * `interaction_unavailable` rather than being silently ignored.
@@ -366,6 +420,16 @@ export class AppServerRpcConnection {
       return undefined
     }
     return this.presenceRegistry.assertWriteAccess(id.toString(), scope, this.connectionId, generation)
+  }
+
+  /**
+   * Implicit one-shot lease acquisition for submit without an explicit
+   * lease: another holder still fences the request with
+   * `interaction_lease_held`; the caller releases right after admission.
+   */
+  private acquireWriteAccess(id: SessionId, scope: InteractionLeaseScope): AppServerWriteAccess | undefined {
+    if (this.presenceRegistry === undefined) return undefined
+    return { scope, lease: this.presenceRegistry.acquire(id.toString(), scope, this.connectionId) }
   }
 
   private requireLeaseSupport(): void {
@@ -411,54 +475,12 @@ function errorResponse(
     ]
   }
   // Surface input conflicts as stable protocol errors before generic internal mapping.
-  if (error instanceof CommandIdempotencyConflictError) {
+  const classified = classifyRuntimeCommandError(error, isWorkspaceUnavailableError)
+  if (classified !== undefined) {
     return [
       JSON_RPC_INVALID_PARAMS,
-      error.message,
-      { code: "command_idempotency_conflict", details: toJson({ family: error.family, commandId: error.commandId }) },
-    ]
-  }
-  if (error instanceof SessionExecutionReservationConflictError) {
-    return [JSON_RPC_INVALID_PARAMS, error.message, { code: "reservation_conflict", details: toJson({ sessionId: error.sessionId }) }]
-  }
-  if (error instanceof SessionWriterConflictError) {
-    return [JSON_RPC_INVALID_PARAMS, error.message, { code: "reservation_conflict", details: toJson({ sessionId: error.sessionId }) }]
-  }
-  if (error instanceof SessionRevisionConflictError) {
-    return [
-      JSON_RPC_INVALID_PARAMS,
-      error.message,
-      { code: "revision_conflict", details: toJson({ sessionId: error.sessionId, expectedRevision: error.expectedRevision }) },
-    ]
-  }
-  if (error instanceof SessionPolicyRevisionConflictError) {
-    return [
-      JSON_RPC_INVALID_PARAMS,
-      error.message,
-      {
-        code: "policy_revision_conflict",
-        details: toJson({
-          sessionId: error.sessionId,
-          expectedPolicyRevision: error.expectedPolicyRevision,
-          actualPolicyRevision: error.actualPolicyRevision,
-        }),
-      },
-    ]
-  }
-  if (error instanceof IncompatibleSessionEventError) {
-    // A rules commit the current policy contract forbids (e.g. Allow(bash))
-    // or incompatible persisted history: the typed reason crosses the wire
-    // instead of an opaque internal error.
-    return [JSON_RPC_INVALID_PARAMS, error.message, { code: "incompatible_session_event" }]
-  }
-  if (error instanceof SessionIdConflictError) {
-    return [JSON_RPC_INVALID_PARAMS, error.message, { code: "session_id_conflict", details: toJson({ sessionId: error.sessionId }) }]
-  }
-  if (isWorkspaceUnavailableError(error)) {
-    return [
-      JSON_RPC_INVALID_PARAMS,
-      error.message,
-      { code: "workspace_unavailable", details: toJson({ workspaceRoot: error.workspaceRoot }) },
+      classified.message,
+      { code: classified.code, ...(classified.details === undefined ? {} : { details: classified.details }) },
     ]
   }
   return [JSON_RPC_INTERNAL_ERROR, "App Server internal error", { code: "internal_error" }]

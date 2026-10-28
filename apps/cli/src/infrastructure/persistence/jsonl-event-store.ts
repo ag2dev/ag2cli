@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
 import { mkdir, open, readFile, readdir, rename, rm } from "node:fs/promises"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { sessionId, type SessionId } from "@ag2cli/core/ids.js"
 import type { AgentEvent, AgentEventType } from "@ag2cli/core/events/event.js"
 import { validateCanonicalSessionContract } from "@ag2cli/core/session/canonical-session.js"
@@ -54,6 +54,8 @@ const EVENT_TYPES: ReadonlySet<AgentEventType> = new Set([
   "ToolCallPrepared",
   "ToolApprovalRequested",
   "ToolApprovalResolved",
+  "AskUserRequested",
+  "AskUserResolved",
   "ToolCallExecutionStarted",
   "RunCompleted",
   "RunFailed",
@@ -93,6 +95,11 @@ function epochPath(root: string, id: SessionId): string {
 
 function writerLeasePath(root: string, id: SessionId): string {
   return join(root, `${encodeURIComponent(id)}.events.writer.json`)
+}
+
+/** Absolute durable transcript path for a session, for boundary-block stamps. */
+export function sessionTranscriptPath(eventsRoot: string, id: SessionId): string {
+  return resolve(eventPath(eventsRoot, id))
 }
 
 type StoredEvent = {
@@ -151,6 +158,11 @@ function isEventTrace(value: unknown): boolean {
 
 /** Durable canonical Session storage. Every successful write replaces a complete file. */
 export class JsonlEventStore implements EventStore {
+  // Deliberately hand-rolled: only appendIfRevision's track() enqueues here,
+  // while confirmDurable/read/delete await the tail without adding work of
+  // their own — the real serialization is the per-session file lock. A
+  // per-key lane would either start tracking reads (a behavior change) or
+  // need a one-consumer tail-await facet.
   private readonly pending = new Map<string, Promise<void>>()
 
   constructor(

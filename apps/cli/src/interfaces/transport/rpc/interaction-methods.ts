@@ -1,7 +1,8 @@
 import { type AppServerInteractionLease, type JsonValue } from "@ag2cli/app-server-protocol/types.js"
 import { parseInteractionRequest, requireLeaseGeneration } from "@ag2cli/app-server-protocol/validation.js"
 import { sessionId } from "@ag2cli/core/ids.js"
-import { RpcApplicationError, toJson, type MethodContext } from "./method-context.js"
+import type { MethodContext } from "./method-context.js"
+import { RpcApplicationError, toJson } from "../public-session-command-mapping.js"
 
 /** App Server interaction lease operations for one connection. */
 export class InteractionMethods {

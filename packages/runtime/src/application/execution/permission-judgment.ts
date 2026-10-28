@@ -19,6 +19,7 @@ const EFFECT_BY_NAME = new Map<string, ModelToolEffect>([
   ["file_edit", "structured-write"],
   ["todo_write", "session-internal"],
   ["skill", "session-internal"],
+  ["session_history", "session-internal"],
   ["ask_user", "interaction"],
   ["bash", "bash"],
   ["web_fetch", "network"],

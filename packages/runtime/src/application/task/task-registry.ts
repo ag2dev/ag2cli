@@ -3,6 +3,7 @@ import { replaySession } from "@ag2cli/core/session/session-snapshot.js"
 import { DEFAULT_SESSION_PERMISSION_MODE } from "@ag2cli/core/session/session-security.js"
 import type { SessionId, TaskId } from "@ag2cli/core/ids.js"
 import type { EventStore } from "../../ports/event-store.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { MAX_TASK_OUTPUT_BYTES, MAX_TASK_OUTPUT_CHUNK, type BackgroundTaskType, type TaskSnapshot } from "@ag2cli/core/task/task.js"
 import {
   commandIdempotencyConflictError,
@@ -16,6 +17,9 @@ interface CreateTaskFingerprint {
   readonly title: string
   readonly prompt?: string
   readonly argv?: readonly string[]
+  readonly command?: string
+  readonly cwd?: string
+  readonly timeoutMs?: number
   readonly intervalMs?: number
   readonly maxRuns?: number
 }
@@ -43,6 +47,9 @@ export type CreateTaskInput = {
   readonly workspace?: string
   readonly prompt?: string
   readonly argv?: readonly string[]
+  readonly command?: string
+  readonly cwd?: string
+  readonly timeoutMs?: number
   readonly intervalMs?: number
   readonly maxRuns?: number
   readonly parentRunId?: import("@ag2cli/core/ids.js").RunId
@@ -55,7 +62,7 @@ export interface TaskRegistryDependencies {
     nextEventId(): string
     now(): string
   }
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 /**
@@ -63,7 +70,7 @@ export interface TaskRegistryDependencies {
  * outside this class; this boundary only validates and persists state.
  */
 export class BackgroundTaskRegistry {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
   private readonly authority: SessionAuthority
 
   constructor(private readonly deps: TaskRegistryDependencies) {
@@ -251,19 +258,8 @@ export class BackgroundTaskRegistry {
     })
   }
 
-  private async serial<T>(sessionId: SessionId, operation: () => Promise<T>): Promise<T> {
-    const previous = this.pending.get(sessionId)
-    const current = (previous ?? Promise.resolve()).then(operation)
-    const tracked = current.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(sessionId, tracked)
-    try {
-      return await current
-    } finally {
-      if (this.pending.get(sessionId) === tracked) this.pending.delete(sessionId)
-    }
+  private serial<T>(sessionId: SessionId, operation: () => Promise<T>): Promise<T> {
+    return this.lane.run(sessionId, operation)
   }
 
   private async append(events: readonly AgentEvent[]): Promise<void> {
@@ -307,6 +303,9 @@ function createSnapshot(input: CreateTaskInput, createdAt: string): TaskSnapshot
     if (!input.prompt || input.prompt.trim().length === 0) throw new Error("agent/loop task.prompt must not be empty")
   }
   if (input.type === "shell" && (!input.argv || input.argv.length === 0)) throw new Error("shell task.argv must not be empty")
+  if (input.type === "user_shell" && (!input.command || input.command.trim().length === 0)) {
+    throw new Error("user_shell task.command must not be empty")
+  }
   if (input.type === "loop" && input.intervalMs === undefined) throw new Error("loop task.intervalMs must not be empty")
   return {
     id: input.taskId,
@@ -316,6 +315,9 @@ function createSnapshot(input: CreateTaskInput, createdAt: string): TaskSnapshot
     createdAt,
     ...(input.prompt ? { prompt: input.prompt } : {}),
     ...(input.argv ? { argv: [...input.argv] } : {}),
+    ...(input.command ? { command: input.command } : {}),
+    ...(input.cwd ? { cwd: input.cwd } : {}),
+    ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
     ...(input.intervalMs === undefined ? {} : { intervalMs: input.intervalMs }),
     ...(input.maxRuns === undefined ? {} : { maxRuns: input.maxRuns }),
     runCount: 0,
@@ -336,6 +338,9 @@ function taskDefinitionFingerprint(task: TaskSnapshot): CreateTaskFingerprint {
     title: task.title,
     ...(task.prompt === undefined ? {} : { prompt: task.prompt }),
     ...(task.argv === undefined ? {} : { argv: [...task.argv] }),
+    ...(task.command === undefined ? {} : { command: task.command }),
+    ...(task.cwd === undefined ? {} : { cwd: task.cwd }),
+    ...(task.timeoutMs === undefined ? {} : { timeoutMs: task.timeoutMs }),
     ...(task.intervalMs === undefined ? {} : { intervalMs: task.intervalMs }),
     ...(task.maxRuns === undefined ? {} : { maxRuns: task.maxRuns }),
   }

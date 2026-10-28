@@ -249,7 +249,7 @@ export function createInputDecoder(): TuiInputDecoder {
           continue
         }
         if (char === "\t") {
-          events.push({ type: "char", value: "\t" })
+          events.push({ type: "tab" })
           index += 1
           continue
         }

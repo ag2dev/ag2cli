@@ -32,9 +32,10 @@
   "dependencies": {
     "@ag2cli/app-server-client": "workspace:*",
     "@ag2cli/app-server-protocol": "workspace:*",
-    "@ag2cli/client": "workspace:*",
+    "@ag2cli/session-client": "workspace:*",
     "@ag2cli/core": "workspace:*",
-    "@ag2cli/protocol": "workspace:*",
+    "@ag2cli/model-catalog": "workspace:*",
+    "@ag2cli/session-protocol": "workspace:*",
     "@ag2cli/runtime": "workspace:*",
     "@agentclientprotocol/sdk": "^1.4.0",
     "@anthropic-ai/sdk": "0.94.0",

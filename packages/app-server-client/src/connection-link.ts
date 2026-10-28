@@ -1,11 +1,13 @@
 import type { AppServerClientInfo } from "@ag2cli/app-server-protocol/types.js"
+import { isAppServerHostId } from "@ag2cli/app-server-protocol/host-proof.js"
+import { decodeBase64Url } from "@ag2cli/app-server-protocol/device-proof.js"
 
 export const APP_SERVER_CONNECTION_LINK_VERSION = 1 as const
 export const APP_SERVER_CONNECTION_LINK_SCHEME = "ag2cli:"
 
 export interface AppServerConnectionLink {
   readonly endpoint: string
-  readonly serverFingerprint: string
+  readonly hostId: string
   readonly pairingToken: string
   readonly expiresAt: string
   readonly clientKind?: AppServerClientInfo["clientKind"]
@@ -23,7 +25,7 @@ export function createAppServerConnectionLink(input: AppServerConnectionLink): s
   const normalized = normalizeConnectionLink(input)
   const url = new URL("ag2cli://connect/v1")
   url.searchParams.set("endpoint", normalized.endpoint)
-  url.searchParams.set("server", normalized.serverFingerprint)
+  url.searchParams.set("hostId", normalized.hostId)
   url.searchParams.set("ticket", normalized.pairingToken)
   url.searchParams.set("expires", normalized.expiresAt)
   if (normalized.clientKind !== undefined) url.searchParams.set("client", normalized.clientKind)
@@ -46,58 +48,116 @@ export function parseAppServerConnectionLink(value: string): AppServerConnection
   if (url.username.length > 0 || url.password.length > 0 || url.hash.length > 0) {
     throw new AppServerConnectionLinkError("connection link must not contain credentials or a fragment")
   }
-  const allowedKeys = new Set(["endpoint", "server", "ticket", "expires", "client"])
+  const allowedKeys = new Set(["endpoint", "hostId", "ticket", "expires", "client"])
   for (const key of url.searchParams.keys()) {
     if (!allowedKeys.has(key)) throw new AppServerConnectionLinkError(`connection link contains an unknown field: ${key}`)
   }
   const endpoint = requiredValue(url.searchParams, "endpoint")
-  const serverFingerprint = requiredValue(url.searchParams, "server")
+  const hostId = requiredValue(url.searchParams, "hostId")
   const pairingToken = requiredValue(url.searchParams, "ticket")
   const expiresAt = requiredValue(url.searchParams, "expires")
   const clientKind = optionalValue(url.searchParams, "client")
-  return normalizeConnectionLink({
-    endpoint,
-    serverFingerprint,
-    pairingToken,
-    expiresAt,
-    ...(clientKind === undefined ? {} : { clientKind: parseClientKind(clientKind) }),
-  })
+  return normalizeConnectionLink(
+    {
+      endpoint,
+      hostId,
+      pairingToken,
+      expiresAt,
+      ...(clientKind === undefined ? {} : { clientKind: parseClientKind(clientKind) }),
+    },
+    true,
+  )
 }
 
-function normalizeConnectionLink(input: AppServerConnectionLink): AppServerConnectionLink {
-  const endpoint = normalizeEndpoint(input.endpoint)
-  const serverFingerprint = normalizeSafeToken(input.serverFingerprint, "server fingerprint", 256)
+function normalizeConnectionLink(input: AppServerConnectionLink, preserveEndpoint = false): AppServerConnectionLink {
+  const endpoint = preserveEndpoint ? validateAppServerEndpoint(input.endpoint) : normalizeAppServerEndpoint(input.endpoint)
+  const hostId = input.hostId.trim()
+  if (!isAppServerHostId(hostId)) throw new AppServerConnectionLinkError("connection link has an invalid Host ID")
   const pairingToken = normalizeSafeToken(input.pairingToken, "pairing token", 256)
-  if (!/^ag2cli-pairing\.[A-Za-z0-9_-]{43}$/u.test(pairingToken)) {
+  if (!isValidPairingToken(pairingToken)) {
     throw new AppServerConnectionLinkError("connection link has an invalid pairing token format")
   }
   const expiresAt = normalizeExpiry(input.expiresAt)
   const clientKind = input.clientKind === undefined ? undefined : parseClientKind(input.clientKind)
   return {
     endpoint,
-    serverFingerprint,
+    hostId,
     pairingToken,
     expiresAt,
     ...(clientKind === undefined ? {} : { clientKind }),
   }
 }
 
-function normalizeEndpoint(value: string): string {
+function isValidPairingToken(value: string): boolean {
+  if (!value.startsWith("ag2cli-pairing.")) return false
+  return decodeBase64Url(value.slice("ag2cli-pairing.".length))?.byteLength === 32
+}
+
+/** Normalize an endpoint and enforce the App Server cleartext loopback policy. */
+export function normalizeAppServerEndpoint(value: string): string {
   if (typeof value !== "string" || value.trim().length === 0)
     throw new AppServerConnectionLinkError("connection link endpoint must not be empty")
+  const source = value.trim()
+  assertEndpointHasNoQueryOrUserInfo(source)
   let endpoint: URL
   try {
-    endpoint = new URL(value.trim())
+    endpoint = new URL(source)
   } catch {
     throw new AppServerConnectionLinkError("connection link endpoint must be a valid URL")
   }
   if (endpoint.protocol !== "ws:" && endpoint.protocol !== "wss:") {
     throw new AppServerConnectionLinkError("connection link endpoint must use ws:// or wss://")
   }
+  validateParsedEndpoint(endpoint)
+  return endpoint.toString()
+}
+
+function validateAppServerEndpoint(value: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.trim() !== value) {
+    throw new AppServerConnectionLinkError("connection link endpoint must be a canonical URL string")
+  }
+  assertEndpointHasNoQueryOrUserInfo(value)
+  let endpoint: URL
+  try {
+    endpoint = new URL(value)
+  } catch {
+    throw new AppServerConnectionLinkError("connection link endpoint must be a valid URL")
+  }
+  validateParsedEndpoint(endpoint)
+  return value
+}
+
+function assertEndpointHasNoQueryOrUserInfo(value: string): void {
+  if (value.includes("?") || value.includes("#")) {
+    throw new AppServerConnectionLinkError("connection link endpoint must not contain a query or fragment")
+  }
+  const authority = /^wss?:\/\/([^/]+)/iu.exec(value)?.[1]
+  if (authority?.includes("@")) {
+    throw new AppServerConnectionLinkError("connection link endpoint must not contain credentials")
+  }
+}
+
+function validateParsedEndpoint(endpoint: URL): void {
+  if (endpoint.protocol !== "ws:" && endpoint.protocol !== "wss:") {
+    throw new AppServerConnectionLinkError("connection link endpoint must use ws:// or wss://")
+  }
   if (endpoint.username.length > 0 || endpoint.password.length > 0 || endpoint.hash.length > 0) {
     throw new AppServerConnectionLinkError("connection link endpoint must not contain credentials or a fragment")
   }
-  return endpoint.toString()
+  if (endpoint.search.length > 0) {
+    throw new AppServerConnectionLinkError("connection link endpoint must not contain a query")
+  }
+  if (endpoint.protocol === "ws:" && !isLoopbackHost(endpoint.hostname)) {
+    throw new AppServerConnectionLinkError("cleartext App Server endpoints must use loopback")
+  }
+}
+
+function isLoopbackHost(value: string): boolean {
+  const host = value.toLowerCase().replace(/\.$/u, "")
+  const unbracketed = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host
+  if (unbracketed === "localhost" || unbracketed === "::1" || unbracketed === "0:0:0:0:0:0:0:1") return true
+  const octets = unbracketed.split(".")
+  return octets.length === 4 && octets[0] === "127" && octets.every((octet) => /^\d{1,3}$/u.test(octet) && Number(octet) <= 255)
 }
 
 function normalizeSafeToken(value: string, label: string, maxLength: number): string {

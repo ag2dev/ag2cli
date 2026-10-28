@@ -70,13 +70,18 @@ ag2cli
 
 The TUI starts by default. You can also run `ag2cli tui` explicitly.
 
-```text
-workspace: /path/to/your/repository
-model: deepseek-flash
-type a message, @ to mention, / for commands
+The first screen paints the workspace intro, the composer, and the footer together (abridged):
 
-❯ Summarize this repository's purpose and main entry points.
+```text
+  >_ AG2CLI
+     /path/to/your/repository
+
+› █
+
+deepseek-flash · ⏸ manual · idle
 ```
+
+Type a message at the `›` prompt; `@` mentions and `/` commands complete as you type.
 
 ## Headless run
 

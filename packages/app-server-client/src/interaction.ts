@@ -74,8 +74,6 @@ export function parseInteractionLeases(value: unknown): AppServerInteractionLeas
 function parseInteractionHolder(value: unknown): AppServerInteractionHolder {
   const record = asRecord(value, "interaction.lease.holder")
   return {
-    connectionId: parseNonEmptyString(record.connectionId, "interaction.lease.holder.connectionId"),
-    deviceId: parseNonEmptyString(record.deviceId, "interaction.lease.holder.deviceId"),
     clientId: parseNonEmptyString(record.clientId, "interaction.lease.holder.clientId"),
     clientKind: parseClientKind(record.clientKind, "interaction.lease.holder.clientKind"),
     name: parseNonEmptyString(record.name, "interaction.lease.holder.name"),

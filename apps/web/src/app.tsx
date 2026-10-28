@@ -1,16 +1,23 @@
-import { AlertCircle, Code2, Compass, Folder, Monitor, Moon, PlugZap, Sparkles, Sun, Trash2, X } from "lucide-react"
+import { AlertCircle, Code2, Compass, Folder, Info, Monitor, Moon, PlugZap, Sparkles, Sun, Trash2, X } from "lucide-react"
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react"
 import { BrowserClient } from "./lib/browser-client"
-import { pendingApprovals, projectChat } from "./lib/conversation"
+import { sessionCapabilities } from "./lib/capabilities"
+import { projectChat } from "./lib/conversation"
 import { createBrowserDeviceIdentityStore } from "./lib/device-identity"
 import { browserDeviceStorageKey } from "./lib/pairing"
 import { browserClientId, readPreference, writePreference } from "./lib/storage"
 import { isDarkTheme, nextThemeMode, parseThemeMode, type ThemeMode } from "./lib/theme"
-import { ApprovalCards } from "./components/approval-card"
+import { InteractionCards } from "./components/interaction-card"
+import { PermissionModeSelector } from "./components/permission-mode"
+import { PlanPanel } from "./components/plan-panel"
+import { ShellConsole } from "./components/shell-console"
 import { AppSidebar, workspaceName } from "./components/sidebar"
 import { Composer } from "./components/composer"
 import { Conversation } from "./components/conversation"
 import { ConnectionSettings } from "./components/connection-settings"
+import { LeaseBadges, presenceRoster } from "./components/presence"
+import { QueuedInputs } from "./components/queued-inputs"
+import { WorkspaceBrowser } from "./components/workspace-browser"
 import { Alert, AlertAction, AlertTitle } from "./components/ui/alert"
 import { Badge } from "./components/ui/badge"
 import { Button } from "./components/ui/button"
@@ -47,7 +54,7 @@ export function App({ client: injectedClient, demo = false }: { client?: Browser
   const [mode, setMode] = useState<ThemeMode>(() => parseThemeMode(readPreference("theme")))
   const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches)
   const entries = useMemo(() => projectChat(state.events, state.transientEvents), [state.events, state.transientEvents])
-  const approvals = useMemo(() => pendingApprovals(state.events), [state.events])
+  const capabilities = sessionCapabilities(state.initialize?.capabilities)
   const workspace = state.workspaces.find((item) => item.workspaceId === state.selectedWorkspaceId)
   const session = state.sessions.find((item) => item.sessionId === state.activeSessionId)
   const draftKey = state.activeSessionId ?? `workspace:${state.selectedWorkspaceId ?? "none"}`
@@ -98,23 +105,48 @@ export function App({ client: injectedClient, demo = false }: { client?: Browser
       return { ...current, [key]: "" }
     })
   }
-  const composer = (
-    <Composer
-      draft={draft}
-      onChange={changeDraft}
-      onSubmit={() => void submit()}
-      onCancel={() => void client.cancel()}
-      workspaceName={workspace ? workspaceName(workspace.workspaceRoot) : undefined}
-      disabled={!connected || workspace?.availability !== "available" || state.loadingSession}
-      sending={state.sending}
-      running={running}
-    />
+  async function steer(): Promise<void> {
+    const key = draftKey
+    const value = draft
+    const accepted = await client.steer(value)
+    setDrafts((current) => {
+      if (!accepted || current[key] !== value) return current
+      return { ...current, [key]: "" }
+    })
+  }
+  // A cancelled steer returns its text to the composer; replayed history never
+  // triggers the refill.
+  useEffect(() => {
+    const cancelled = state.steerCancelled
+    if (!cancelled) return
+    setDrafts((current) => ({ ...current, [draftKey]: cancelled.text }))
+    client.clearSteerCancelled()
+  }, [state.steerCancelled, draftKey, client])
+  const composerArea = (
+    <>
+      <PlanPanel plans={state.plans} />
+      {capabilities.shell ? (
+        <ShellConsole client={client} tasks={state.shellTasks} sending={state.shellSending} error={state.shellError} />
+      ) : null}
+      <Composer
+        draft={draft}
+        onChange={changeDraft}
+        onSubmit={() => void submit()}
+        onSteer={() => void steer()}
+        onCancel={() => void client.cancel()}
+        workspaceName={workspace ? workspaceName(workspace.workspaceRoot) : undefined}
+        disabled={!connected || workspace?.availability !== "available" || state.loadingSession || state.readOnly === true}
+        sending={state.sending}
+        running={running}
+        steerCapable={capabilities.steer}
+      />
+    </>
   )
   return (
     <SidebarProvider>
       <AppSidebar
         state={state}
-        approvals={approvals}
+        pendingCount={state.pendingInteractions.length}
         onNew={(workspaceId) => {
           client.newConversation(workspaceId)
           setSettingsOpen(false)
@@ -149,10 +181,23 @@ export function App({ client: injectedClient, demo = false }: { client?: Browser
                 Demo
               </Badge>
             ) : null}
+            {state.readOnly ? (
+              <Badge variant="secondary" className="text-[10px]" title="This conversation has events this client cannot interpret">
+                Read-only
+              </Badge>
+            ) : null}
+            <LeaseBadges leases={state.leases} onTakeover={() => void client.takeoverSessionControl()} />
             {state.presence.length > 1 ? (
-              <Badge variant="secondary" className="text-[10px]" title="Connected clients">
+              <Badge variant="secondary" className="text-[10px]" title={presenceRoster(state.presence, state.clientId)}>
                 {state.presence.length} clients
               </Badge>
+            ) : null}
+            {capabilities.permissionModes.length > 0 && state.security ? (
+              <PermissionModeSelector
+                security={state.security}
+                disabled={!connected || state.loadingSession}
+                onChange={(permissionMode) => void client.setPermissionMode(permissionMode)}
+              />
             ) : null}
             <Button
               variant="ghost"
@@ -186,6 +231,17 @@ export function App({ client: injectedClient, demo = false }: { client?: Browser
             <AlertTitle>Reconnecting to your workspace…</AlertTitle>
           </Alert>
         ) : null}
+        {state.notice && !settingsOpen ? (
+          <Alert role="status" className="mx-4 mt-3 md:mx-7">
+            <Info size={16} />
+            <AlertTitle>{state.notice}</AlertTitle>
+            <AlertAction>
+              <Button variant="ghost" size="icon" aria-label="Dismiss notice" onClick={() => client.dismissNotice()}>
+                <X size={15} />
+              </Button>
+            </AlertAction>
+          </Alert>
+        ) : null}
         {state.error && !settingsOpen ? (
           <Alert variant="destructive" className="mx-4 mt-3 md:mx-7">
             <AlertCircle size={16} />
@@ -201,6 +257,16 @@ export function App({ client: injectedClient, demo = false }: { client?: Browser
           <ConnectionSettings client={client} connected={connected} onClose={() => setSettingsOpen(false)} />
         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col">
+            {capabilities.workspace.diff && !empty ? (
+              <div className="shrink-0 pt-3">
+                <WorkspaceBrowser
+                  client={client}
+                  diff={state.workspaceDiff}
+                  file={state.workspaceFile}
+                  readFileCapable={capabilities.workspace.readFile}
+                />
+              </div>
+            ) : null}
             {empty ? (
               <Empty className="mx-auto w-full max-w-3xl flex-1">
                 {connected ? (
@@ -216,7 +282,7 @@ export function App({ client: injectedClient, demo = false }: { client?: Browser
                       <EmptyDescription>A little clarity, a new feature, or the next big thing.</EmptyDescription>
                     </EmptyHeader>
                     <EmptyContent className="mt-2 max-w-2xl">
-                      {composer}
+                      {composerArea}
                       <div className="grid w-full grid-cols-1 gap-2.5 sm:grid-cols-3">
                         {suggestions.map(({ icon: Icon, title, description, prompt }) => (
                           <button
@@ -258,9 +324,14 @@ export function App({ client: injectedClient, demo = false }: { client?: Browser
             ) : (
               <>
                 <Conversation entries={entries} sessionId={state.activeSessionId} loading={state.loadingSession} running={running} />
-                <ApprovalCards client={client} approvals={approvals} />
+                <InteractionCards client={client} interactions={state.pendingInteractions} askUserCapable={capabilities.askUser} />
+                <QueuedInputs
+                  inputs={state.queuedInputs}
+                  canCancel={capabilities.cancelInput}
+                  onCancel={(inputId) => void client.cancelInput(inputId)}
+                />
                 <div className="w-full max-w-3xl shrink-0 self-center px-4 pb-4 md:px-7">
-                  {composer}
+                  {composerArea}
                   <p className="mt-2.5 text-center text-[10px] text-muted-foreground">Review generated changes before applying them.</p>
                 </div>
               </>

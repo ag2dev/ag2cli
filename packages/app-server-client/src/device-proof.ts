@@ -27,19 +27,20 @@ export async function generateAppServerDeviceKeyPair(cryptoApi: Crypto = globalT
 /** Sign one short-lived server challenge for the first initialize request. */
 export async function signAppServerDeviceChallenge(
   challenge: AppServerDeviceChallenge,
+  deviceId: string,
   clientId: string,
   keyPair: AppServerDeviceKeyPair,
   cryptoApi: Crypto = globalThis.crypto,
 ): Promise<AppServerDeviceProof> {
   const message = createAppServerDeviceProofMessage({
-    serverFingerprint: challenge.serverFingerprint,
+    hostId: challenge.hostId,
     challenge: challenge.challenge,
-    deviceId: challenge.deviceId,
+    deviceId,
     clientId,
   })
   const signature = await cryptoApi.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keyPair.privateKey, new TextEncoder().encode(message))
   return {
-    deviceId: challenge.deviceId,
+    deviceId,
     challenge: challenge.challenge,
     signature: `${APP_SERVER_DEVICE_SIGNATURE_PREFIX}${encodeBase64Url(new Uint8Array(signature))}`,
   }

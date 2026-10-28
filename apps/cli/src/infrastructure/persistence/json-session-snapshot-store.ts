@@ -1,6 +1,6 @@
 import { mkdir, readFile, rm } from "node:fs/promises"
 import { join } from "node:path"
-import { parseSessionSnapshot } from "@ag2cli/protocol/session-codec.js"
+import { parseSessionSnapshot } from "@ag2cli/session-protocol/session-codec.js"
 import type { SessionId } from "@ag2cli/core/ids.js"
 import type { SessionSnapshotStore, StoredSessionSnapshot } from "@ag2cli/runtime/ports/session-snapshot-store.js"
 import { replaceFileAtomically, withFileLock } from "./file-coordination.js"

@@ -406,6 +406,8 @@ export function applySessionEvent(snapshot: SessionSnapshot, event: AgentEvent):
     case "ToolCallPrepared":
     case "ToolApprovalRequested":
     case "ToolApprovalResolved":
+    case "AskUserRequested":
+    case "AskUserResolved":
     case "ToolCallExecutionStarted":
     case "ToolAttemptStarted":
     case "ToolAttemptAbandoned":

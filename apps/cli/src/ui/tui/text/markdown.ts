@@ -212,6 +212,11 @@ function parseInline(
 
 function renderInline(value: string, base: InlineStyle): readonly TextRun[] {
   const codes: { readonly text: string; readonly style: InlineStyle }[] = []
+  const literal = (content: string): string => {
+    const index = codes.length
+    codes.push({ text: content, style: {} })
+    return `${PLACEHOLDER_START}${index}${PLACEHOLDER_END}`
+  }
   const code = (content: string): string => {
     const index = codes.length
     codes.push({ text: content, style: { token: "warning" } })
@@ -224,7 +229,12 @@ function renderInline(value: string, base: InlineStyle): readonly TextRun[] {
     return `${SPAN_OPEN}${index}${SPAN_OPEN_END}${content}${SPAN_CLOSE}`
   }
   let result = value
-  result = result.replace(/`([^`\n]+)`/g, (_match: string, content: string) => code(content))
+  result = result.replace(/(?<!\\)`([^`\n]+)(?<!\\)`/g, (_match: string, content: string) => code(content))
+  // Backslash-escaped Markdown punctuation stays literal in dynamic text
+  // fields and cannot start a later emphasis, code, or link match.
+  result = result.replace(/\\([\s\S])/gu, (match: string, content: string) =>
+    ["\\", "`", "*", "_", "[", "]", "~"].includes(content) ? literal(content) : match,
+  )
   result = result.replace(/\*\*([^*\n]+)\*\*/g, (_match: string, content: string) => span(content, strongStyle()))
   result = result.replace(/(?<![\p{L}\p{N}_])__([^_\n]+)__(?![\p{L}\p{N}_])/gu, (_match: string, content: string) =>
     span(content, strongStyle()),

@@ -15,6 +15,9 @@ export interface BackgroundTaskExecutionResult {
 
 /** Execution boundary for durable tasks; it contains no scheduler or UI policy. */
 export interface BackgroundTaskExecutor {
+  /** Optional capability filter; unsupported task types fail closed at create. */
+  canRun?(task: Pick<TaskSnapshot, "type">): boolean
+
   execute(input: BackgroundTaskExecutionInput): Promise<BackgroundTaskExecutionResult>
 }
 

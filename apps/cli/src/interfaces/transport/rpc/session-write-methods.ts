@@ -1,156 +1,215 @@
 import { randomUUID } from "node:crypto"
-import { interactionLeaseScopeForIntent, parseInputIntent } from "@ag2cli/app-server-protocol/input-intent.js"
+import { resolve as resolvePath } from "node:path"
 import {
-  isAppServerPermissionMode,
-  isPermissionRuleBehavior,
-  type AppServerScope,
-  type InteractionLeaseScope,
   type JsonValue,
-  type SessionCommandParams,
-  type SessionSubmitParams,
+  type SessionAddDirectoryResult,
+  type SessionArchiveResult,
+  type SessionCancelInputResult,
+  type SessionCancelRunResult,
+  type SessionCancelTaskResult,
+  type SessionClearContextWindowResult,
+  type SessionCompactResult,
+  type SessionCreateParams,
+  type SessionCreateTaskResult,
+  type SessionDeleteResult,
+  type SessionExecuteShellResult,
+  type SessionExecuteUserShellResult,
+  type SessionGetPermissionPolicyResult,
+  type SessionGetTaskLogsResult,
+  type SessionListCheckpointsResult,
+  type SessionListTasksResult,
+  type SessionPreviewRewindResult,
+  type SessionResolveInteractionResult,
+  type SessionRewindResult,
+  type SessionSelectAgentResult,
+  type SessionSetContextWindowResult,
+  type SessionSetPermissionModeResult,
+  type SessionSetPermissionRulesResult,
+  type SessionSnapshotResult,
+  type SessionSteerResult,
+  type SessionSubmitResult,
+  type SessionUpdateGoalResult,
 } from "@ag2cli/app-server-protocol/types.js"
+import type { PublicTaskSummary } from "@ag2cli/app-server-protocol/dto/snapshot.js"
+import { MAX_TASK_TITLE_LENGTH } from "@ag2cli/app-server-protocol/dto/task-methods.js"
 import {
-  asRecord,
-  parseNonEmptyString,
+  parseSessionAddDirectoryParams,
   parseSessionArchiveParams,
-  parseSessionCommandParams,
+  parseSessionCancelInputParams,
+  parseSessionCancelRunParams,
+  parseSessionCancelTaskParams,
+  parseSessionClearContextWindowParams,
+  parseSessionCompactParams,
   parseSessionCreateParams,
+  parseSessionCreateTaskParams,
   parseSessionDeleteParams,
+  parseSessionExecuteShellParams,
+  parseSessionExecuteUserShellParams,
   parseSessionForkParams,
+  parseSessionGetPermissionPolicyParams,
+  parseSessionGetTaskLogsParams,
+  parseSessionListCheckpointsParams,
+  parseSessionListTasksParams,
   parseSessionPlanParams,
-  parseSessionResolveApprovalParams,
+  parseSessionPreviewRewindParams,
+  parseSessionResolveInteractionParams,
+  parseSessionRewindParams,
+  parseSessionSelectAgentParams,
+  parseSessionSetContextWindowParams,
+  parseSessionSetPermissionModeParams,
+  parseSessionSetPermissionRulesParams,
+  parseSessionSteerParams,
   parseSessionSubmitParams,
+  parseSessionUpdateGoalParams,
 } from "@ag2cli/app-server-protocol/validation.js"
-import { runId, sessionId, taskId, type SessionId } from "@ag2cli/core/ids.js"
-import type { HistoryCursor } from "@ag2cli/core/events/event.js"
-import { CommandIdempotencyConflictError } from "@ag2cli/runtime/application/session/command-idempotency.js"
-import { SessionExecutionReservationConflictError } from "@ag2cli/runtime/ports/session-execution-reservation.js"
-import { SessionPolicyRevisionConflictError } from "@ag2cli/runtime/application/session/permission-state.js"
-import { SessionRevisionConflictError } from "@ag2cli/runtime/application/session/revision-conflict.js"
-import { SessionWriterConflictError } from "@ag2cli/runtime/application/session/session-authority.js"
-import { ApprovalResolutionError } from "@ag2cli/runtime/application/session/approval-resolution.js"
-import type { SessionCommand, SessionCommandResult } from "@ag2cli/protocol/session-command.js"
+import { sessionId, taskId, type SessionId } from "@ag2cli/core/ids.js"
+import { isTerminalTaskStatus, type TaskSnapshot } from "@ag2cli/core/task/task.js"
+import type { SessionCommand, SessionCommandResult } from "@ag2cli/session-protocol/session-command.js"
 import { appServerOperationKey, type AppServerOperation } from "../app-server-operation-registry.js"
 import {
-  addAdditionalDirectoryCommand,
   cancelTaskCommand,
-  clearContextWindowCommand,
-  compactSessionCommand,
-  createPlanCommand,
   createTaskCommand,
-  executeShellCommand,
-  executeUserShellCommand,
   listCheckpointsCommand,
   listTasksCommand,
-  previewRewindCommand,
-  resolveApprovalCommand,
-  rewindCommand,
-  setAgentCommand,
-  setContextWindowCommand,
-  setPermissionModeCommand,
-  setPermissionRulesCommand,
-  startRunCommand,
-  steerCommand,
-  cancelInputCommand,
-  updateGoalCommand,
-} from "@ag2cli/protocol/session-command.js"
-import { RpcApplicationError, toJson, type MethodContext } from "./method-context.js"
-
-/**
- * Commands a remote client may never run while the session snapshot holds
- * full-access (ADR §3): model runs, broker-bypassing model calls, shell
- * execution, live policy mutation, and history restore.
- */
-const FULL_ACCESS_OPERATION_COMMANDS: ReadonlySet<SessionCommand["type"]> = new Set([
-  "start_run",
-  "create_plan",
-  "steer",
-  "create_task",
-  "compact",
-  "execute_shell",
-  "execute_user_shell",
-  "set_permission_rules",
-  "rewind",
-])
+  readTaskLogsCommand,
+} from "@ag2cli/session-protocol/session-command.js"
+import type { MethodContext } from "./method-context.js"
+import { resolveSessionWorkspace } from "./workspace-methods.js"
+import {
+  addDirectoryCommandFromParams,
+  addDirectoryResultFrom,
+  assemblePublicSessionSnapshot,
+  assertInputAcceptedAdmission,
+  cancelInputCommandFor,
+  cancelInputPrecheck,
+  cancelRunCommandFor,
+  cancelRunPrecheck,
+  clearContextWindowCommandFromParams,
+  clearContextWindowResultFrom,
+  compactCommandFromParams,
+  compactResultFrom,
+  existingCreateReplay,
+  inputAdmissionResult,
+  inputCancelResultFromDurableStatus,
+  planCommandFromParams,
+  planResultFrom,
+  policyDocument,
+  previewRewindCommandFromParams,
+  requireRunningRun,
+  requireSelectableMode,
+  resolveAskUserInteraction,
+  resolveCreateWorkspaceRoot,
+  resolveToolApprovalInteraction,
+  rewindCommandFromParams,
+  rewindResultFrom,
+  RpcApplicationError,
+  selectAgentCommandFromParams,
+  selectAgentResultFrom,
+  setContextWindowCommandFromParams,
+  setContextWindowResultFrom,
+  setPermissionModeCommandFor,
+  setPermissionRulesCommandFor,
+  startRunCommandFromSubmitParams,
+  steerCommandFromParams,
+  toPublicCheckpoint,
+  updateGoalCommandFromParams,
+  updateGoalResultFrom,
+} from "../public-session-command-mapping.js"
 
 export class SessionWriteMethods {
   constructor(private readonly context: MethodContext) {}
 
-  async createSession(value: unknown): Promise<import("@ag2cli/runtime/ports/session-catalog.js").SessionRecord> {
+  /**
+   * Client-generated resource identity: `sessionId` is required and create is
+   * idempotent per (sessionId, payload). A retry with the same workspaceId
+   * and title replays the existing session's canonical `{session}` result —
+   * checked before workspace validation so a replay survives the workspace
+   * leaving the registry — and a divergent payload on the same id is a
+   * `command_idempotency_conflict`.
+   */
+  async createSession(value: unknown): Promise<SessionSnapshotResult> {
     this.context.requireScope("session:write")
     const catalog = this.context.requireCatalog()
     const params = parseSessionCreateParams(value)
-    const id = sessionId(params.sessionId ?? randomUUID())
-    if (this.context.workspaceRegistry !== undefined) {
-      const workspace = await this.context.workspaceRegistry.get(params.workspaceId)
-      if (workspace === undefined)
-        throw new RpcApplicationError("workspace_access_denied", `workspaceId is not authorized: ${params.workspaceId}`)
-      return catalog.create(id, workspace.workspaceRoot, {
+    const id = sessionId(params.sessionId)
+    const replayed = await this.replayCreatePayload(catalog, id, params)
+    if (replayed !== undefined) return replayed
+    const workspaceRoot = await resolveCreateWorkspaceRoot(params.workspaceId, this.context)
+    try {
+      const record = await catalog.create(id, workspaceRoot, {
+        workspaceId: params.workspaceId,
         ...(params.title === undefined ? {} : { title: params.title }),
-        workspaceId: workspace.workspaceId,
       })
+      return { session: await assemblePublicSessionSnapshot(this.context, record) }
+    } catch (error) {
+      // Lost a race against a concurrent create with the same id; classify
+      // by payload exactly like the pre-check above.
+      const raced = await this.replayCreatePayload(catalog, id, params)
+      if (raced === undefined) throw error
+      return raced
     }
-    const workspaceRoot = this.context.workspaceRoot
-    if (workspaceRoot === undefined)
-      throw new RpcApplicationError("workspace_access_denied", "No available workspace is registered on this server")
-    const workspaceId = params.workspaceId
-    if (workspaceId !== this.context.workspaceIdForRoot(workspaceRoot)) {
-      throw new RpcApplicationError("workspace_access_denied", `workspaceId is not authorized: ${workspaceId}`)
-    }
-    return catalog.create(id, workspaceRoot, {
-      ...(params.title === undefined ? {} : { title: params.title }),
-      workspaceId,
-    })
+  }
+
+  private async replayCreatePayload(
+    catalog: ReturnType<MethodContext["requireCatalog"]>,
+    id: SessionId,
+    params: SessionCreateParams,
+  ): Promise<SessionSnapshotResult | undefined> {
+    const existing = await existingCreateReplay(catalog, id, params)
+    return existing === undefined ? undefined : { session: await assemblePublicSessionSnapshot(this.context, existing) }
   }
 
   /**
    * `session.fork`/`session.archive`/`session.delete` reorder or change a
    * Session's own existence and therefore always require the
-   * `session-control` interaction lease, unlike the `session.command`
-   * actions whose required scope varies per action.
+   * `session-control` interaction lease, unlike the write faces whose
+   * required scope varies per method. Fork addresses history by business
+   * identity only (fork-at-head); same-payload retries replay inside the
+   * catalog, and any other occupied target id is a conflict.
    */
-  async forkSession(value: unknown): Promise<import("@ag2cli/runtime/ports/session-catalog.js").SessionRecord> {
+  async forkSession(value: unknown): Promise<SessionSnapshotResult> {
     this.context.requireScope("session:write")
-    this.requireClientAction("fork")
     const catalog = this.context.requireCatalog()
     const params = parseSessionForkParams(value)
     const source = sessionId(params.sourceSessionId)
     const target = sessionId(params.targetSessionId ?? randomUUID())
+    await this.context.requireExistingSession(source)
     const access = this.context.assertWriteAccess(source, "session-control", params.lease?.generation)
     try {
-      if (params.cursor === undefined) return await catalog.fork(source, target, params.title)
-      const cursor: HistoryCursor = {
-        sessionId: sessionId(params.cursor.sessionId),
-        branchId: params.cursor.branchId,
-        nodeId: params.cursor.nodeId,
-        physicalRevision: params.cursor.physicalRevision,
-        recordHash: params.cursor.recordHash,
-      }
-      return await catalog.forkAtCursor(source, target, cursor, params.title)
+      const record = await catalog.fork(source, target, params.title)
+      return { session: await assemblePublicSessionSnapshot(this.context, record) }
+    } catch (error) {
+      if ((await catalog.get(target).catch(() => undefined)) === undefined) throw error
+      throw new RpcApplicationError("command_idempotency_conflict", `targetSessionId already exists with a different payload: ${target}`)
     } finally {
       this.context.releaseWriteAccess(source, access)
     }
   }
 
-  async archiveSession(value: unknown): Promise<import("@ag2cli/runtime/ports/session-catalog.js").SessionRecord> {
+  async archiveSession(value: unknown): Promise<SessionArchiveResult> {
     this.context.requireScope("session:write")
     const catalog = this.context.requireCatalog()
     const params = parseSessionArchiveParams(value)
     const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
     const access = this.context.assertWriteAccess(id, "session-control", params.lease?.generation)
     try {
-      return await catalog.archive(id)
+      const record = await catalog.archive(id)
+      if (record.archivedAt === undefined) {
+        throw new RpcApplicationError("invalid_host_result", "Archive produced no archivedAt timestamp")
+      }
+      return { sessionId: id, archived: true, archivedAt: record.archivedAt }
     } finally {
       this.context.releaseWriteAccess(id, access)
     }
   }
 
-  async deleteSession(value: unknown): Promise<JsonValue> {
+  async deleteSession(value: unknown): Promise<SessionDeleteResult> {
     this.context.requireScope("session:write")
-    this.requireClientAction("delete")
     const catalog = this.context.requireCatalog()
     const params = parseSessionDeleteParams(value)
     const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
     const access = this.context.assertWriteAccess(id, "session-control", params.lease?.generation)
     try {
       await catalog.delete(id)
@@ -160,44 +219,65 @@ export class SessionWriteMethods {
     }
   }
 
-  async command(value: unknown): Promise<JsonValue> {
-    const params = parseSessionCommandParams(value)
-    this.requireClientAction(params.action.type)
-    this.context.requireScope(requiredRpcScopeFor(params.action.type))
+  /** Policy face (contract §13): reads and writes share one result — the full
+   * policy document — so a writer sees the new `policyRevision` it must carry
+   * into its next CAS. Rule bodies travel only through this face, never
+   * through the snapshot projection. */
+  async getPermissionPolicy(value: unknown): Promise<SessionGetPermissionPolicyResult> {
+    this.context.requireScope("session:policy")
+    const params = parseSessionGetPermissionPolicyParams(value)
     const id = sessionId(params.sessionId)
     await this.context.requireExistingSession(id)
-    if (params.expectedRevision !== undefined) await this.context.requireRevision(id, params.expectedRevision)
-    const command = commandForAction(params)
-    await this.denyFullAccessOperation(id, command)
-    const interactionScope = requiredInteractionScopeFor(params.action.type)
-    if (params.lease !== undefined && interactionScope !== "none" && params.lease.scope !== interactionScope) {
-      throw new RpcApplicationError(
-        "interaction_lease_scope_mismatch",
-        `Action ${params.action.type} requires a lease with the ${interactionScope} scope; received ${params.lease.scope}`,
-      )
-    }
-    const access = this.context.assertWriteAccess(id, interactionScope, params.lease?.generation)
-    const operationKey = appServerOperationKey(id.toString(), params.commandId)
-    let operation: AppServerOperation
+    return { policy: policyDocument(id, await this.context.readSnapshot(id), this.context.selectableModes) }
+  }
+
+  /** Selecting one of manual|accept-edits|plan on a full-access session is
+   * the escape hatch and stays open. A mode the server does not offer in
+   * selectableModes is `invalid_params`; a stale `expectedPolicyRevision`
+   * surfaces as `policy_revision_conflict`. */
+  async setPermissionMode(value: unknown): Promise<SessionSetPermissionModeResult> {
+    this.context.requireScope("session:policy")
+    const params = parseSessionSetPermissionModeParams(value)
+    requireSelectableMode(this.context.selectableModes, params.mode)
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const command = setPermissionModeCommandFor(`session-setPermissionMode:${randomUUID()}`, params.mode, params.expectedPolicyRevision)
+    const access = this.context.assertWriteAccess(id, "session-control", params.lease.generation)
     try {
-      operation = this.context.operationRegistry.begin(operationKey)
-    } catch {
-      throw new RpcApplicationError("command_in_progress", `commandId is already running: ${params.commandId}`)
-    }
-    try {
-      const result = await this.context.sessionServer.execute(id, command, { signal: operation.signal })
-      return commandResult(id, params.commandId, result)
+      const result = await this.context.sessionServer.execute(id, command)
+      if (result.type !== "permission_updated") {
+        throw new RpcApplicationError("invalid_host_result", "Host did not return permission_updated")
+      }
+      return { policy: policyDocument(id, result.snapshot, this.context.selectableModes) }
     } finally {
-      operation.release()
       this.context.releaseWriteAccess(id, access)
     }
   }
 
-  async submit(value: unknown): Promise<JsonValue> {
+  async setPermissionRules(value: unknown): Promise<SessionSetPermissionRulesResult> {
+    this.context.requireScope("session:policy")
+    const params = parseSessionSetPermissionRulesParams(value)
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const command = setPermissionRulesCommandFor(`session-setPermissionRules:${randomUUID()}`, params.rules, params.expectedPolicyRevision)
+    const access = this.context.assertWriteAccess(id, "session-control", params.lease.generation)
+    try {
+      const result = await this.context.sessionServer.execute(id, command)
+      if (result.type !== "permission_updated") {
+        throw new RpcApplicationError("invalid_host_result", "Host did not return permission_updated")
+      }
+      return { policy: policyDocument(id, result.snapshot, this.context.selectableModes) }
+    } finally {
+      this.context.releaseWriteAccess(id, access)
+    }
+  }
+
+  /** Submit is mailbox admission only: the text is a literal prompt —
+   * slash/shell intents are retired, their actions ride the dedicated
+   * methods — and the run (if started) continues in the background. */
+  async submit(value: unknown): Promise<SessionSubmitResult> {
     const params = parseSessionSubmitParams(value)
-    const intent = parseInputIntent(params.text)
-    this.requireClientAction(intent.kind === "shell" ? "shell" : "prompt")
-    this.context.requireScope(intent.kind === "shell" ? "shell:execute" : "session:write")
+    this.context.requireScope("session:write")
     const id = sessionId(params.sessionId)
     if (this.context.catalog) await this.context.requireExistingSession(id)
     if (params.expectedRevision !== undefined) {
@@ -209,76 +289,44 @@ export class SessionWriteMethods {
         )
       }
     }
-    const command = await this.commandForIntent(id, params.commandId, intent, params)
-    // A slash intent is parsed into the canonical session command before the
-    // capability check. Checking only the outer `prompt` intent would let a
-    // mobile client tunnel rewind/permission/shell actions through submit.
-    this.requireClientAction(command.type)
-    // The same produced-command rule covers full-access snapshots: a slash
-    // intent must not tunnel a guarded command past the action route.
-    await this.denyFullAccessOperation(id, command)
-    const interactionScope = requiredInteractionScopeForIntent(intent)
-    const access = this.context.assertWriteAccess(id, interactionScope, params.lease?.[interactionScope])
+    const command = startRunCommandFromSubmitParams(params)
+    // An omitted lease means the server acquires the composer scope for this
+    // connection one-shot; an explicit lease is a strict generation CAS.
+    const access =
+      params.lease === undefined
+        ? this.context.acquireWriteAccess(id, "composer")
+        : this.context.assertWriteAccess(id, "composer", params.lease.generation)
     const operationKey = appServerOperationKey(id.toString(), params.commandId)
     let operation: AppServerOperation
     try {
       operation = this.context.operationRegistry.begin(operationKey)
     } catch {
-      throw new RpcApplicationError("command_in_progress", `commandId is already running: ${params.commandId}`)
+      // A retry joins the in-flight admission: the runtime's commandId
+      // idempotency reads back the recorded admission, or rejects a reused
+      // commandId whose input diverges.
+      try {
+        const replay = await this.context.sessionServer.execute(id, command, { acceptOnly: true })
+        assertInputAcceptedAdmission(replay)
+        return inputAdmissionResult(id, params.commandId, replay)
+      } finally {
+        this.context.releaseWriteAccess(id, access)
+      }
     }
     let backgroundOwnership = false
     try {
-      const intentKind = intent.kind
-      if (intent.kind === "prompt" || intent.kind === "mention") {
-        const admission = await this.context.sessionServer.execute(id, command, {
-          signal: operation.signal,
-          acceptOnly: true,
-        })
-        if (admission.type !== "input_accepted") {
-          throw new RpcApplicationError("invalid_host_result", "Host did not return input_accepted")
-        }
-        this.context.releaseWriteAccess(id, access)
-        backgroundOwnership = true
-        if (!admission.queued) {
-          void this.runInBackground(id, params.commandId, intent.kind, command, operation)
-        } else {
-          operation.release()
-        }
-        return {
-          accepted: true,
-          sessionId: id,
-          commandId: params.commandId,
-          intent: intent.kind,
-          inputId: admission.inputId,
-        }
+      const admission = await this.context.sessionServer.execute(id, command, {
+        signal: operation.signal,
+        acceptOnly: true,
+      })
+      assertInputAcceptedAdmission(admission)
+      this.context.releaseWriteAccess(id, access)
+      backgroundOwnership = true
+      if (!admission.queued) {
+        void this.runInBackground(id, command, operation)
+      } else {
+        operation.release()
       }
-      if (isAsyncIntent(intent)) {
-        this.context.releaseWriteAccess(id, access)
-        backgroundOwnership = true
-        void this.runInBackground(id, params.commandId, intent.kind, command, operation)
-        return {
-          accepted: true,
-          sessionId: id,
-          commandId: params.commandId,
-          intent: intent.kind,
-        }
-      }
-      const result = await this.context.sessionServer.execute(id, command, { signal: operation.signal })
-      if (intent.kind === "slash") {
-        return toJson({
-          ...asRecord(commandResult(id, params.commandId, result), "session.submit.result"),
-          intent: "slash",
-        })
-      }
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId: params.commandId,
-        intent: intentKind,
-        ...(resultWithRunId(result) ? { runId: result.runId.toString() } : {}),
-        ...(resultWithResult(result) ? { result: toJson(result.result) } : {}),
-        ...(resultWithSnapshot(result) ? { snapshot: toJson(result.snapshot) } : {}),
-      }
+      return inputAdmissionResult(id, params.commandId, admission)
     } finally {
       if (!backgroundOwnership) {
         operation.release()
@@ -288,672 +336,492 @@ export class SessionWriteMethods {
   }
 
   async plan(value: unknown): Promise<JsonValue> {
-    this.requireClientAction("plan")
     const params = parseSessionPlanParams(value)
     this.context.requireScope("session:write")
     const id = sessionId(params.sessionId)
     if (this.context.catalog) await this.context.requireExistingSession(id)
     if (params.expectedRevision !== undefined) await this.context.requireRevision(id, params.expectedRevision)
-    const command = createPlanCommand({
-      commandId: params.commandId,
-      goal: params.text,
-      ...(params.context === undefined ? {} : { context: params.context }),
-      ...(params.workspace === undefined ? {} : { workspace: params.workspace }),
-    })
-    await this.denyFullAccessOperation(id, command)
+    const command = planCommandFromParams(params)
     const access = this.context.assertWriteAccess(id, "composer", params.lease?.generation)
     const operationKey = appServerOperationKey(id.toString(), params.commandId)
     let operation: AppServerOperation
     try {
       operation = this.context.operationRegistry.begin(operationKey)
     } catch {
-      throw new RpcApplicationError("command_in_progress", `commandId is already running: ${params.commandId}`)
+      // A retry joins the in-flight command: per-session serialization makes
+      // this execute a read-back of the first attempt's durable result.
+      const replay = await this.context.sessionServer.execute(id, command)
+      this.context.releaseWriteAccess(id, access)
+      return planResultFrom(id, params.commandId, replay)
     }
     try {
-      const result = await this.context.sessionServer.execute(id, command, { signal: operation.signal })
-      if (result.type !== "plan_created") throw new RpcApplicationError("invalid_host_result", "Host did not return plan_created")
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId: params.commandId,
-        intent: "plan",
-        result: toJson(result.plan),
-        snapshot: toJson(result.snapshot),
-      }
+      return planResultFrom(id, params.commandId, await this.context.sessionServer.execute(id, command, { signal: operation.signal }))
     } finally {
       operation.release()
       this.context.releaseWriteAccess(id, access)
     }
   }
 
-  async resolveApproval(value: unknown): Promise<JsonValue> {
-    this.context.requireScope("approval:write")
-    this.requireClientAction("approval")
-    const params = parseSessionResolveApprovalParams(value)
+  /**
+   * Unified interaction resolution (contract §10): one entry point whose
+   * `kind` selects both the required scope (`approval:write` vs
+   * `session:write`) and the resolution machinery. Idempotency is
+   * resource-keyed on the interaction with canonical first-writer-wins; the
+   * `resolutionId` stays the caller's private retry identity. The result
+   * echoes the canonical resolution read back from durable events, never a
+   * client-supplied echo.
+   */
+  async resolveInteraction(value: unknown): Promise<SessionResolveInteractionResult> {
+    const params = parseSessionResolveInteractionParams(value)
     const id = sessionId(params.sessionId)
     await this.context.requireExistingSession(id)
-    let result: SessionCommandResult
-    try {
-      result = await this.context.sessionServer.execute(
-        id,
-        resolveApprovalCommand({
-          runId: runId(params.runId),
-          turn: params.turn,
-          toolUseId: params.toolUseId,
-          preparedEventId: params.preparedEventId,
-          expectedScopeRevision: params.expectedScopeRevision,
-          expectedPolicyRevision: params.expectedPolicyRevision,
-          decision: params.decision,
-        }),
-      )
-    } catch (error) {
-      if (error instanceof ApprovalResolutionError) {
-        throw new RpcApplicationError(error.code, error.message, error.details === undefined ? undefined : toJson(error.details))
-      }
-      throw error
+    const deps = {
+      readEvents: (session: SessionId) => this.context.readEvents(session, 0),
+      execute: (session: SessionId, command: SessionCommand) => this.context.sessionServer.execute(session, command),
     }
-    if (result.type !== "snapshot") throw new RpcApplicationError("invalid_host_result", "Host did not return an approval snapshot")
-    return { sessionId: id, snapshot: toJson(result.snapshot) }
+    if (params.kind === "tool_approval") {
+      this.context.requireScope("approval:write")
+      return resolveToolApprovalInteraction(deps, id, params)
+    }
+    this.context.requireScope("session:write")
+    return resolveAskUserInteraction(deps, id, params)
   }
 
-  async cancel(value: unknown): Promise<JsonValue> {
+  /** Steer only targets a live run: a run the snapshot does not show as
+   * running is `run_not_active`, never a silent queue for a future run.
+   * Admission is the mailbox fact; delivery arrives as durable input events.
+   * The wire carries no lease, so the composer scope is acquired one-shot
+   * like a submit that omits it; another holder still fences with
+   * `interaction_lease_held`. */
+  async steer(value: unknown): Promise<SessionSteerResult> {
+    const params = parseSessionSteerParams(value)
     this.context.requireScope("session:write")
-    this.requireClientAction("cancel")
-    const record = asRecord(value, "session.cancel.params")
-    const id = sessionId(parseNonEmptyString(record.sessionId, "sessionId"))
-    const commandId = record.commandId === undefined ? undefined : parseNonEmptyString(record.commandId, "commandId")
-    const requestedRunId = record.runId === undefined ? undefined : parseNonEmptyString(record.runId, "runId")
-    const key = commandId === undefined ? undefined : appServerOperationKey(id.toString(), commandId)
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
     const snapshot = await this.context.readSnapshot(id)
-    const targetRun =
-      requestedRunId === undefined ? snapshot.currentRun : snapshot.runs?.find((run) => run.id.toString() === requestedRunId)
-    const targetCommandId =
-      commandId === undefined ? targetRun?.commandId : snapshot.runs?.some((run) => run.commandId === commandId) ? commandId : undefined
-    let durableStatus: "cancelled" | "cancelled-before-acceptance" | "already-delivered" | undefined
-    if (targetCommandId !== undefined) {
-      const durable = await this.context.sessionServer.execute(
-        id,
-        cancelInputCommand({
-          commandId: `session-cancel:${targetCommandId}`,
-          inputId: `input:${targetCommandId}`,
-          reason: "session.cancel",
-        }),
-      )
-      if (durable.type !== "input_cancelled") throw new RpcApplicationError("invalid_host_result", "Host did not return input_cancelled")
-      durableStatus = durable.status
+    requireRunningRun(snapshot, params.runId)
+    const command = steerCommandFromParams(params.runId, params.commandId, params.text)
+    const access = this.context.acquireWriteAccess(id, "composer")
+    try {
+      const admission = await this.context.sessionServer.execute(id, command)
+      return inputAdmissionResult(id, params.commandId, admission)
+    } finally {
+      this.context.releaseWriteAccess(id, access)
     }
-    const cancelled = (key === undefined ? false : this.context.operationRegistry.cancel(key)) || durableStatus !== undefined
+  }
+
+  /** CancelRun reports a request state, not a completion: the terminal fact
+   * is the run.updated event. The snapshot is the same durable history the
+   * Host reduces, so a run it does not know is `not_found` and a terminal one
+   * `already_terminal` — both converge without a Host write, keeping cancel
+   * usable while the workspace root is gone (cancelInput holds the same
+   * boundary). */
+  async cancelRun(value: unknown): Promise<SessionCancelRunResult> {
+    const params = parseSessionCancelRunParams(value)
+    this.context.requireScope("session:write")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const precheck = cancelRunPrecheck(await this.context.readSnapshot(id), params.runId)
+    if (precheck.state !== "running") return { requested: false, state: precheck.state }
+    const durable = await this.context.sessionServer.execute(id, cancelRunCommandFor(params.runId))
+    if (durable.type !== "run_cancellation") throw new RpcApplicationError("invalid_host_result", "Host did not return run_cancellation")
+    if (durable.status === "requested") {
+      this.context.operationRegistry.cancel(appServerOperationKey(id.toString(), precheck.run.commandId))
+    }
+    return { requested: durable.status === "requested", state: durable.status }
+  }
+
+  /** CancelInput addresses the mailbox by inputId. An input the snapshot
+   * never accepted is `not_found`; one already cancelled is
+   * `already_terminal`; everything else is a cancellation request whose
+   * outcome arrives as input.updated. */
+  async cancelInput(value: unknown): Promise<SessionCancelInputResult> {
+    const params = parseSessionCancelInputParams(value)
+    this.context.requireScope("session:write")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const precheck = cancelInputPrecheck(await this.context.readSnapshot(id), params.inputId)
+    if (precheck === "not_found") return { requested: false, state: "not_found" }
+    if (precheck === "already_terminal") return { requested: false, state: "already_terminal" }
+    const durable = await this.context.sessionServer.execute(id, cancelInputCommandFor(params.inputId))
+    if (durable.type !== "input_cancelled") throw new RpcApplicationError("invalid_host_result", "Host did not return input_cancelled")
+    return inputCancelResultFromDurableStatus(durable.status)
+  }
+
+  /** Contract §11.7 session action face: convergent session-state mutations
+   * behind the composer interaction lease. Results carry the reducer facts
+   * only — structural updates keep arriving as durable session events. */
+  private async runSessionAction<R>(
+    params: { readonly sessionId: string; readonly commandId: string; readonly lease?: { readonly generation: number } },
+    command: SessionCommand,
+    toResult: (id: SessionId, commandId: string, result: SessionCommandResult) => R,
+  ): Promise<R> {
+    this.context.requireScope("session:write")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const access = this.context.assertWriteAccess(id, "composer", params.lease?.generation)
+    let operation: AppServerOperation
+    try {
+      operation = this.context.operationRegistry.begin(appServerOperationKey(id.toString(), params.commandId))
+    } catch {
+      // A retry joins the in-flight command: per-session serialization makes
+      // this execute a read-back of the first attempt's durable result.
+      const replay = await this.context.sessionServer.execute(id, command)
+      this.context.releaseWriteAccess(id, access)
+      return toResult(id, params.commandId, replay)
+    }
+    try {
+      const result = await this.context.sessionServer.execute(id, command, { signal: operation.signal })
+      return toResult(id, params.commandId, result)
+    } finally {
+      operation.release()
+      this.context.releaseWriteAccess(id, access)
+    }
+  }
+
+  async compact(value: unknown): Promise<SessionCompactResult> {
+    const params = parseSessionCompactParams(value)
+    return this.runSessionAction(params, compactCommandFromParams(params), compactResultFrom)
+  }
+
+  async addDirectory(value: unknown): Promise<SessionAddDirectoryResult> {
+    const params = parseSessionAddDirectoryParams(value)
+    return this.runSessionAction(params, addDirectoryCommandFromParams(params), addDirectoryResultFrom)
+  }
+
+  async setContextWindow(value: unknown): Promise<SessionSetContextWindowResult> {
+    const params = parseSessionSetContextWindowParams(value)
+    return this.runSessionAction(params, setContextWindowCommandFromParams(params), setContextWindowResultFrom)
+  }
+
+  async clearContextWindow(value: unknown): Promise<SessionClearContextWindowResult> {
+    const params = parseSessionClearContextWindowParams(value)
+    return this.runSessionAction(params, clearContextWindowCommandFromParams(params), clearContextWindowResultFrom)
+  }
+
+  async selectAgent(value: unknown): Promise<SessionSelectAgentResult> {
+    const params = parseSessionSelectAgentParams(value)
+    return this.runSessionAction(params, selectAgentCommandFromParams(params), selectAgentResultFrom)
+  }
+
+  async updateGoal(value: unknown): Promise<SessionUpdateGoalResult> {
+    const params = parseSessionUpdateGoalParams(value)
+    return this.runSessionAction(params, updateGoalCommandFromParams(params), updateGoalResultFrom)
+  }
+
+  /** Rewind face (contract §11.7): a plain read — checkpoints travel as
+   * business facts only, the internal DAG cursor never reaches the wire. */
+  async listCheckpoints(value: unknown): Promise<SessionListCheckpointsResult> {
+    const params = parseSessionListCheckpointsParams(value)
+    this.context.requireScope("session:read")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const result = await this.context.sessionServer.execute(id, listCheckpointsCommand())
+    if (result.type !== "checkpoints") throw new RpcApplicationError("invalid_host_result", "Host did not return checkpoints")
+    return { sessionId: id, checkpoints: result.checkpoints.map(toPublicCheckpoint) }
+  }
+
+  /** Read-only preview behind the `session-control` lease: it leaves no
+   * durable history, so there is no commandId and no idempotency registry —
+   * §16 idempotency applies to mutations only. */
+  async previewRewind(value: unknown): Promise<SessionPreviewRewindResult> {
+    const params = parseSessionPreviewRewindParams(value)
+    this.context.requireScope("session:write")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    if (params.expectedRevision !== undefined) await this.context.requireRevision(id, params.expectedRevision)
+    const access = this.context.assertWriteAccess(id, "session-control", params.lease?.generation)
+    try {
+      const result = await this.context.sessionServer.execute(id, previewRewindCommandFromParams(params))
+      if (result.type !== "rewind_preview") throw new RpcApplicationError("invalid_host_result", "Host did not return rewind_preview")
+      return {
+        sessionId: id,
+        checkpoint: toPublicCheckpoint(result.preview.checkpoint),
+        currentRevision: result.preview.currentRevision,
+        currentGeneration: result.preview.currentGeneration,
+        staleRevision: result.preview.staleRevision,
+        canCommit: result.preview.canCommit,
+      }
+    } finally {
+      this.context.releaseWriteAccess(id, access)
+    }
+  }
+
+  /** Timeline move behind the `session-control` lease with revision CAS and
+   * commandId idempotency. The physical revision log is never rewritten —
+   * old projections are invalidated by a resync barrier, so the result
+   * carries facts, not a snapshot (contract §15.7); `failed` rewind states
+   * are canonical facts, not RPC errors. */
+  async rewind(value: unknown): Promise<SessionRewindResult> {
+    const params = parseSessionRewindParams(value)
+    this.context.requireScope("session:write")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    if (params.expectedRevision !== undefined) await this.context.requireRevision(id, params.expectedRevision)
+    const command = rewindCommandFromParams(params)
+    const access = this.context.assertWriteAccess(id, "session-control", params.lease?.generation)
+    let operation: AppServerOperation
+    try {
+      operation = this.context.operationRegistry.begin(appServerOperationKey(id.toString(), params.commandId))
+    } catch {
+      // A retry joins the in-flight command: per-session serialization makes
+      // this execute a read-back of the first attempt's durable result.
+      const replay = await this.context.sessionServer.execute(id, command)
+      this.context.releaseWriteAccess(id, access)
+      return rewindResultFrom(id, params.commandId, replay)
+    }
+    try {
+      const result = await this.context.sessionServer.execute(id, command, { signal: operation.signal })
+      return rewindResultFrom(id, params.commandId, result)
+    } finally {
+      operation.release()
+      this.context.releaseWriteAccess(id, access)
+    }
+  }
+
+  /** Standalone task face (contract §11.7): agent work is the only kind
+   * creatable here — shell execution rides the dedicated execute methods,
+   * periodic loops stay a local-runtime concern. */
+  async createTask(value: unknown): Promise<SessionCreateTaskResult> {
+    const params = parseSessionCreateTaskParams(value)
+    this.context.requireScope("session:write")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const command = createTaskCommand({
+      commandId: params.commandId,
+      taskType: "agent",
+      title: params.title,
+      prompt: params.prompt,
+    })
+    const access = this.context.assertWriteAccess(id, "composer", params.lease?.generation)
+    let operation: AppServerOperation
+    try {
+      operation = this.context.operationRegistry.begin(appServerOperationKey(id.toString(), params.commandId))
+    } catch {
+      // A retry joins the in-flight command: per-session serialization makes
+      // this execute a read-back of the first attempt's durable result.
+      const replay = await this.context.sessionServer.execute(id, command)
+      this.context.releaseWriteAccess(id, access)
+      return taskCreatedResult(id, params.commandId, replay)
+    }
+    try {
+      return taskCreatedResult(id, params.commandId, await this.context.sessionServer.execute(id, command, { signal: operation.signal }))
+    } finally {
+      operation.release()
+      this.context.releaseWriteAccess(id, access)
+    }
+  }
+
+  /** Public listings never surface periodic loop tasks; their agent
+   * masquerade only guards direct task summaries elsewhere. */
+  async listTasks(value: unknown): Promise<SessionListTasksResult> {
+    const params = parseSessionListTasksParams(value)
+    this.context.requireScope("session:read")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const result = await this.context.sessionServer.execute(id, listTasksCommand())
+    if (result.type !== "tasks") throw new RpcApplicationError("invalid_host_result", "Host did not return tasks")
+    return { sessionId: id, tasks: result.tasks.filter((task) => task.type !== "loop").map(publicTaskSummaryOf) }
+  }
+
+  /** `cancelled` reports the post-call transition only: an already terminal
+   * task is a convergent no-op returning false, never an error. */
+  async cancelTask(value: unknown): Promise<SessionCancelTaskResult> {
+    const params = parseSessionCancelTaskParams(value)
+    this.context.requireScope("session:write")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const snapshot = await this.context.readSnapshot(id)
+    const existing = snapshot.tasks?.find((candidate) => candidate.id.toString() === params.taskId)
+    if (existing === undefined) {
+      throw new RpcApplicationError("invalid_params", `session has no background task: ${params.taskId}`, { taskId: params.taskId })
+    }
+    if (isTerminalTaskStatus(existing.status)) {
+      return { cancelled: false, sessionId: id, taskId: params.taskId, task: publicTaskSummaryOf(existing) }
+    }
+    const result = await this.context.sessionServer.execute(
+      id,
+      cancelTaskCommand({
+        taskId: taskId(params.taskId),
+        ...(params.reason === undefined ? {} : { reason: params.reason }),
+      }),
+    )
+    if (result.type !== "task_cancelled") throw new RpcApplicationError("invalid_host_result", "Host did not return task_cancelled")
+    return {
+      cancelled: result.task.status === "cancelled",
+      sessionId: id,
+      taskId: params.taskId,
+      task: publicTaskSummaryOf(result.task),
+    }
+  }
+
+  /** Authoritative paged task output: chunks live behind this face, never in
+   * the durable public event stream. The cursor is present only on a partial
+   * page; a missing task is a client addressing error. */
+  async getTaskLogs(value: unknown): Promise<SessionGetTaskLogsResult> {
+    const params = parseSessionGetTaskLogsParams(value)
+    this.context.requireScope("session:read")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const snapshot = await this.context.readSnapshot(id)
+    const known = snapshot.tasks?.some((candidate) => candidate.id.toString() === params.taskId) ?? false
+    if (!known) {
+      throw new RpcApplicationError("invalid_params", `session has no background task: ${params.taskId}`, { taskId: params.taskId })
+    }
+    const result = await this.context.sessionServer.execute(
+      id,
+      readTaskLogsCommand({
+        taskId: taskId(params.taskId),
+        ...(params.afterSequence === undefined ? {} : { afterSequence: params.afterSequence }),
+        ...(params.limit === undefined ? {} : { limit: params.limit }),
+      }),
+    )
+    if (result.type !== "task_logs") throw new RpcApplicationError("invalid_host_result", "Host did not return task_logs")
     return {
       sessionId: id,
-      cancelled,
-      ...(commandId === undefined ? {} : { commandId }),
-      ...(requestedRunId === undefined ? {} : { runId: requestedRunId }),
-      ...(durableStatus === undefined ? {} : { status: durableStatus }),
+      taskId: params.taskId,
+      status: result.status,
+      outputBytes: result.outputBytes,
+      chunks: result.chunks.map((chunk) => ({ sequence: chunk.sequence, text: chunk.text })),
+      ...(result.nextAfterSequence === undefined ? {} : { nextAfterSequence: result.nextAfterSequence }),
     }
   }
 
-  private requireClientAction(action: string): void {
-    if (this.context.clientKind !== "mobile") return
-    const denied = new Set([
-      "fork",
-      "delete",
-      "rewind",
-      "shell",
-      "executeShell",
-      "executeUserShell",
-      "execute_user_shell",
-      "setPermissionMode",
-      "setPermissionRules",
-      "addDirectory",
-      "set_permission_mode",
-      "set_permission_rules",
-      "add_additional_directory",
-    ])
-    if (denied.has(action)) throw new RpcApplicationError("capability_denied", `The mobile client does not support action: ${action}`)
+  /** Remote shell admission (contract §11.8): reuses the background task
+   * lifecycle — the admitted task is the identity progress, output and
+   * cancellation ride; there is no foreground shell_result path here. The
+   * `shell:execute` scope is the whole authorization; shell admission never
+   * takes the composer lease, which §14 reserves for submit-level work. */
+  async executeShell(value: unknown): Promise<SessionExecuteShellResult> {
+    const params = parseSessionExecuteShellParams(value)
+    this.context.requireScope("shell:execute")
+    const id = sessionId(params.sessionId)
+    await this.context.requireExistingSession(id)
+    const command = await this.shellAdmissionCommand(id, params.commandId, {
+      taskType: "shell",
+      title: shellTaskTitle(params.argv.join(" ")),
+      argv: [...params.argv],
+      cwdRelative: params.cwdRelative,
+      timeoutMs: params.timeoutMs,
+    })
+    return this.admitShellTask(id, params.commandId, command)
   }
 
-  /**
-   * ADR §3: a remote client may not operate a full-access session. The guard
-   * keys on the produced command type — it is applied to the command every
-   * construction route returns — so no route can tunnel a guarded command
-   * past it; selecting one of manual|accept-edits|plan stays open as the
-   * escape hatch.
-   */
-  private async denyFullAccessOperation(id: SessionId, command: SessionCommand): Promise<void> {
-    if (!FULL_ACCESS_OPERATION_COMMANDS.has(command.type)) return
-    const snapshot = await this.context.readSnapshot(id)
-    if (snapshot.permissionMode === "full-access") {
-      throw new RpcApplicationError("capability_denied", "a full-access session cannot be operated from a remote client")
-    }
+  async executeUserShell(value: unknown): Promise<SessionExecuteUserShellResult> {
+    const params = parseSessionExecuteUserShellParams(value)
+    this.context.requireScope("shell:execute")
+    const id = sessionId(params.sessionId)
+    const command = await this.shellAdmissionCommand(id, params.commandId, {
+      taskType: "user_shell",
+      title: shellTaskTitle(params.command),
+      command: params.command,
+      cwdRelative: params.cwdRelative,
+      timeoutMs: params.timeoutMs,
+    })
+    return this.admitShellTask(id, params.commandId, command)
   }
 
-  private async runInBackground(
+  private async shellAdmissionCommand(
     id: SessionId,
     commandId: string,
-    intent: "prompt" | "mention" | "shell",
-    command: import("@ag2cli/protocol/session-command.js").SessionCommand,
-    operation: AppServerOperation,
-  ): Promise<void> {
-    try {
-      await this.context.sessionServer.execute(id, command, { signal: operation.signal })
-    } catch (error) {
-      const code =
-        error instanceof CommandIdempotencyConflictError
-          ? "command_idempotency_conflict"
-          : error instanceof SessionExecutionReservationConflictError
-            ? "reservation_conflict"
-            : error instanceof SessionWriterConflictError
-              ? "reservation_conflict"
-              : error instanceof SessionRevisionConflictError
-                ? "revision_conflict"
-                : error instanceof SessionPolicyRevisionConflictError
-                  ? "policy_revision_conflict"
-                  : this.context.isWorkspaceUnavailableError(error)
-                    ? "workspace_unavailable"
-                    : undefined
-      this.context.emit("session.operation.failed", {
+    input: {
+      readonly taskType: "shell" | "user_shell"
+      readonly title: string
+      readonly argv?: readonly string[]
+      readonly command?: string
+      readonly cwdRelative?: string
+      readonly timeoutMs?: number
+    },
+  ): Promise<SessionCommand> {
+    const cwd =
+      input.cwdRelative === undefined
+        ? undefined
+        : resolvePath((await resolveSessionWorkspace(this.context, id.toString())).root, input.cwdRelative)
+    return createTaskCommand({
+      commandId,
+      taskType: input.taskType,
+      title: input.title,
+      ...(input.argv === undefined ? {} : { argv: input.argv }),
+      ...(input.command === undefined ? {} : { command: input.command }),
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
+    })
+  }
+
+  private async admitShellTask(id: SessionId, commandId: string, command: SessionCommand): Promise<SessionExecuteShellResult> {
+    const project = (result: SessionCommandResult): SessionExecuteShellResult => {
+      if (result.type !== "task_created") throw new RpcApplicationError("invalid_host_result", "Host did not return task_created")
+      return {
+        accepted: true,
         sessionId: id,
         commandId,
-        intent,
-        message: error instanceof Error ? error.message : String(error),
-        ...(code === undefined ? {} : { code }),
-      })
+        taskId: result.task.id,
+        queued: result.task.status === "queued",
+      }
+    }
+    let operation: AppServerOperation
+    try {
+      operation = this.context.operationRegistry.begin(appServerOperationKey(id.toString(), commandId))
+    } catch {
+      // A retry joins the in-flight command: per-session serialization makes
+      // this execute a read-back of the first attempt's durable result.
+      const replay = await this.context.sessionServer.execute(id, command)
+      return project(replay)
+    }
+    try {
+      return project(await this.context.sessionServer.execute(id, command, { signal: operation.signal }))
     } finally {
       operation.release()
     }
   }
 
-  private async commandForIntent(
+  private async runInBackground(
     id: SessionId,
-    commandId: string,
-    intent: ReturnType<typeof parseInputIntent>,
-    params: SessionSubmitParams,
-  ): Promise<import("@ag2cli/protocol/session-command.js").SessionCommand> {
-    switch (intent.kind) {
-      case "prompt":
-        return startRunCommand({
-          commandId,
-          goal: intent.text,
-          ...(params.context === undefined ? {} : { context: params.context }),
-          ...(intent.fileReferences ? { fileReferences: intent.fileReferences } : {}),
-          ...(params.fileReferences === undefined ? {} : { fileReferences: params.fileReferences }),
-          ...(params.workspace === undefined ? {} : { workspace: params.workspace }),
-        })
-      case "mention":
-        return startRunCommand({
-          commandId,
-          goal: intent.text,
-          ...(params.context === undefined ? {} : { context: params.context }),
-          fileReferences: params.fileReferences ?? intent.references,
-          ...(params.workspace === undefined ? {} : { workspace: params.workspace }),
-        })
-      case "shell":
-        return executeUserShellCommand({ commandId, command: intent.command })
-      case "slash":
-        return this.commandForSlash(id, commandId, intent.name, intent.args)
-    }
-    throw new RpcApplicationError("invalid_intent", "Unknown input intent")
-  }
-
-  private async commandForSlash(
-    id: SessionId,
-    commandId: string,
-    name: string,
-    args: readonly string[],
-  ): Promise<import("@ag2cli/protocol/session-command.js").SessionCommand> {
-    switch (name) {
-      case "compact":
-        return compactSessionCommand({
-          commandId,
-          ...(args.length === 0 ? {} : { instructions: args.join(" ") }),
-        })
-      case "set-context-window": {
-        if (args.length !== 1) throw new RpcApplicationError("invalid_slash_args", "usage: /set-context-window <tokens>")
-        const tokens = parsePositiveInteger(args[0], "tokens")
-        return setContextWindowCommand({ commandId, contextWindow: tokens })
-      }
-      case "clear-context-window":
-        if (args.length !== 0) throw new RpcApplicationError("invalid_slash_args", "usage: /clear-context-window")
-        return clearContextWindowCommand({ commandId })
-      case "permissions": {
-        // Three grammars: direct mode set, rule upsert, and rule removal.
-        // Rules ride
-        // the full-set setPermissionRules command with the snapshot's
-        // policyRevision baked in — a lost race surfaces as the host's
-        // stale_policy, and a retry after an unknown outcome
-        // replays idempotently (a retry after a visible success re-reads
-        // the bumped revision and is rejected as a stale race instead of
-        // double-applying).
-        const usage =
-          "usage: /permissions <manual|accept-edits|plan> | /permissions rules add <tool> <allow|ask|deny> | /permissions rules remove <tool>"
-        if (args.length === 0) throw new RpcApplicationError("invalid_slash_args", usage)
-        if (args[0] === "rules") {
-          const rulesUsage = "usage: /permissions rules add <tool> <allow|ask|deny> | /permissions rules remove <tool>"
-          if (args[1] === "add") {
-            const tool = args[2]
-            const behavior = args[3]
-            if (args.length !== 4 || tool === undefined || behavior === undefined || !isPermissionRuleBehavior(behavior)) {
-              throw new RpcApplicationError("invalid_slash_args", rulesUsage)
-            }
-            // Trim-bound exactly as the core ingest asserts it, so a
-            // whitespace-only name is a validation error here rather than
-            // a deep host rejection.
-            const name = tool.trim()
-            if (name.length === 0 || name.length > 128) {
-              throw new RpcApplicationError("invalid_slash_args", "tool name must be 1-128 characters")
-            }
-            const snapshot = await this.context.readSnapshot(id)
-            // Upsert: read the snapshot's rules, replace the one entry for
-            // the tool (or append), and set the full list back.
-            const others = snapshot.permissionRules.filter((rule) => rule.name !== name)
-            return setPermissionRulesCommand({
-              commandId,
-              rules: [...others, { name, behavior }],
-              expectedPolicyRevision: snapshot.policyRevision,
-            })
-          }
-          if (args[1] === "remove") {
-            const tool = args[2]
-            if (args.length !== 3 || tool === undefined) {
-              throw new RpcApplicationError("invalid_slash_args", rulesUsage)
-            }
-            const name = tool.trim()
-            if (name.length === 0 || name.length > 128) {
-              throw new RpcApplicationError("invalid_slash_args", "tool name must be 1-128 characters")
-            }
-            const snapshot = await this.context.readSnapshot(id)
-            if (!snapshot.permissionRules.some((rule) => rule.name === name)) {
-              throw new RpcApplicationError("invalid_slash_args", `no permission rule for tool: ${name}`)
-            }
-            return setPermissionRulesCommand({
-              commandId,
-              rules: snapshot.permissionRules.filter((rule) => rule.name !== name),
-              expectedPolicyRevision: snapshot.policyRevision,
-            })
-          }
-          throw new RpcApplicationError("invalid_slash_args", rulesUsage)
-        }
-        const mode = args.length === 1 ? args[0] : undefined
-        if (mode === undefined || !isAppServerPermissionMode(mode)) {
-          throw new RpcApplicationError("invalid_slash_args", usage)
-        }
-        // Same selection rule as the setPermissionMode action: full-access
-        // never enters from a remote client, slash route included.
-        if (mode === "full-access") {
-          throw new RpcApplicationError("capability_denied", "full-access cannot be selected from a remote client")
-        }
-        const snapshot = await this.context.readSnapshot(id)
-        return setPermissionModeCommand({
-          commandId,
-          mode,
-          expectedPolicyRevision: snapshot.policyRevision,
-        })
-      }
-      case "goal":
-        return goalCommand(commandId, args)
-      default:
-        throw new RpcApplicationError("slash_not_available", `This App Server does not provide /${name}`)
+    command: import("@ag2cli/session-protocol/session-command.js").SessionCommand,
+    operation: AppServerOperation,
+  ): Promise<void> {
+    try {
+      await this.context.sessionServer.execute(id, command, { signal: operation.signal })
+    } catch {
+      // Admitted work reports failure as canonical input.failed /
+      // run.updated facts the Host records; the retired v0 notification is
+      // gone. The catch contains the rejection of this floating promise so
+      // it cannot surface as an unhandled process-level crash.
+    } finally {
+      operation.release()
     }
   }
 }
 
-type SessionCommandActionType = SessionCommandParams["action"]["type"]
-
-export const APP_SERVER_SESSION_COMMAND_POLICIES: Readonly<
-  Record<SessionCommandActionType, { readonly rpcScope: AppServerScope; readonly interactionScope: InteractionLeaseScope | "none" }>
-> = {
-  addDirectory: { rpcScope: "session:write", interactionScope: "composer" },
-  setPermissionMode: { rpcScope: "session:write", interactionScope: "session-control" },
-  setPermissionRules: { rpcScope: "session:write", interactionScope: "session-control" },
-  compact: { rpcScope: "session:write", interactionScope: "composer" },
-  setContextWindow: { rpcScope: "session:write", interactionScope: "composer" },
-  clearContextWindow: { rpcScope: "session:write", interactionScope: "composer" },
-  setAgent: { rpcScope: "session:write", interactionScope: "composer" },
-  updateGoal: { rpcScope: "session:write", interactionScope: "composer" },
-  createTask: { rpcScope: "session:write", interactionScope: "composer" },
-  listTasks: { rpcScope: "session:read", interactionScope: "none" },
-  cancelTask: { rpcScope: "session:write", interactionScope: "none" },
-  listCheckpoints: { rpcScope: "session:read", interactionScope: "none" },
-  previewRewind: { rpcScope: "session:write", interactionScope: "session-control" },
-  rewind: { rpcScope: "session:write", interactionScope: "session-control" },
-  steer: { rpcScope: "session:write", interactionScope: "composer" },
-  cancelInput: { rpcScope: "session:write", interactionScope: "none" },
-  executeShell: { rpcScope: "shell:execute", interactionScope: "composer" },
-  executeUserShell: { rpcScope: "shell:execute", interactionScope: "composer" },
-}
-
-function sessionCommandPolicy(action: SessionCommandActionType): (typeof APP_SERVER_SESSION_COMMAND_POLICIES)[SessionCommandActionType] {
-  const policy = APP_SERVER_SESSION_COMMAND_POLICIES[action]
-  if (policy === undefined) {
-    throw new RpcApplicationError(
-      "interaction_scope_unclassified",
-      `Action is not classified in the session.command policy: ${String(action)}`,
-    )
-  }
-  return policy
-}
-
-/**
- * RPC write-vs-read permission (one of two independent matrices — the other
- * being {@link requiredInteractionScopeFor}'s interaction-lease scope).
- * Whether an action needs `session:write` and whether it needs an
- * interaction lease are independent questions (e.g. `cancelTask` needs
- * `session:write` but no lease; `previewRewind` needs both).
- */
-function requiredRpcScopeFor(action: SessionCommandActionType): AppServerScope {
-  return sessionCommandPolicy(action).rpcScope
-}
-
-/**
- * Interaction lease scope (the second of the two independent matrices, see
- * {@link requiredRpcScopeFor}). `"none"` means the action is not protected by
- * an interaction lease at all — either genuinely read-only, or deliberately
- * excluded, e.g. `cancelTask` is a convergent, always-safe cancellation and
- * lease protection would only get in the way of escaping a runaway operation.
- */
-function requiredInteractionScopeFor(action: SessionCommandActionType): InteractionLeaseScope | "none" {
-  return sessionCommandPolicy(action).interactionScope
-}
-
-/**
- * `session.submit` only knows its target scope after parsing the raw text
- * into an {@link InputIntent}; `/permissions` is the
- * one server-backed slash that requires `session-control`, everything else
- * (prompt/mention/shell and the remaining server-backed slashes) is `composer`.
- */
-function requiredInteractionScopeForIntent(intent: ReturnType<typeof parseInputIntent>): InteractionLeaseScope {
-  return interactionLeaseScopeForIntent(intent)
-}
-
-function isAsyncIntent(
-  intent: ReturnType<typeof parseInputIntent>,
-): intent is Extract<ReturnType<typeof parseInputIntent>, { readonly kind: "prompt" | "mention" | "shell" }> {
-  return intent.kind === "prompt" || intent.kind === "mention" || intent.kind === "shell"
-}
-
-function parsePositiveInteger(value: string | undefined, name: string): number {
-  const parsed = Number(value)
-  if (!value || !Number.isSafeInteger(parsed) || parsed < 1)
-    throw new RpcApplicationError("invalid_slash_args", `${name} must be a positive integer`)
-  return parsed
-}
-
-function goalCommand(commandId: string, args: readonly string[]): import("@ag2cli/protocol/session-command.js").SessionCommand {
-  if (args.length === 0 || args[0] === "status")
-    throw new RpcApplicationError("slash_not_available", "/goal status requires reading the dedicated goal projection")
-  const action = args[0]
-  if (action === "clear" || action === "pause" || action === "resume") {
-    if (args.length !== 1) throw new RpcApplicationError("invalid_slash_args", `usage: /goal ${action}`)
-    return updateGoalCommand({ commandId, update: { action } })
-  }
-  return updateGoalCommand({ commandId, update: { action: "set", text: args.join(" ") } })
-}
-
-function commandForAction(params: SessionCommandParams): import("@ag2cli/protocol/session-command.js").SessionCommand {
-  const action = params.action
-  switch (action.type) {
-    case "addDirectory":
-      return addAdditionalDirectoryCommand({
-        commandId: params.commandId,
-        directory: action.directory,
-        ...(action.workspaceRoot === undefined ? {} : { workspaceRoot: action.workspaceRoot }),
-        ...(action.expectedScopeRevision === undefined ? {} : { expectedScopeRevision: action.expectedScopeRevision }),
-      })
-    case "setPermissionMode":
-      // ADR §3: remote selection covers manual|accept-edits|plan only;
-      // full-access never enters through session.command.
-      if (action.mode === "full-access") {
-        throw new RpcApplicationError("capability_denied", "full-access cannot be selected from a remote client")
-      }
-      return setPermissionModeCommand({
-        commandId: params.commandId,
-        mode: action.mode,
-        ...(action.expectedPolicyRevision === undefined ? {} : { expectedPolicyRevision: action.expectedPolicyRevision }),
-      })
-    case "setPermissionRules":
-      return setPermissionRulesCommand({
-        commandId: params.commandId,
-        rules: action.rules,
-        ...(action.expectedPolicyRevision === undefined ? {} : { expectedPolicyRevision: action.expectedPolicyRevision }),
-      })
-    case "compact":
-      return compactSessionCommand({
-        commandId: params.commandId,
-        ...(action.instructions === undefined ? {} : { instructions: action.instructions }),
-      })
-    case "setContextWindow":
-      return setContextWindowCommand({ commandId: params.commandId, contextWindow: action.contextWindow })
-    case "clearContextWindow":
-      return clearContextWindowCommand({ commandId: params.commandId })
-    case "setAgent":
-      return setAgentCommand({ commandId: params.commandId, ...(action.agentName === undefined ? {} : { agentName: action.agentName }) })
-    case "updateGoal":
-      return updateGoalCommand({ commandId: params.commandId, update: action.update })
-    case "createTask":
-      return createTaskCommand({
-        commandId: params.commandId,
-        taskType: action.taskType,
-        title: action.title,
-        ...(action.prompt === undefined ? {} : { prompt: action.prompt }),
-        ...(action.argv === undefined ? {} : { argv: action.argv }),
-        ...(action.intervalMs === undefined ? {} : { intervalMs: action.intervalMs }),
-        ...(action.maxRuns === undefined ? {} : { maxRuns: action.maxRuns }),
-        ...(action.workspace === undefined ? {} : { workspace: action.workspace }),
-        ...(action.parentRunId === undefined ? {} : { parentRunId: runId(action.parentRunId) }),
-      })
-    case "listTasks":
-      return listTasksCommand()
-    case "cancelTask":
-      return cancelTaskCommand({
-        taskId: taskId(action.taskId),
-        ...(action.reason === undefined ? {} : { reason: action.reason }),
-      })
-    case "listCheckpoints":
-      return listCheckpointsCommand()
-    case "previewRewind":
-      return previewRewindCommand({
-        checkpointId: action.checkpointId,
-        ...(params.expectedRevision === undefined ? {} : { expectedRevision: params.expectedRevision }),
-      })
-    case "rewind":
-      return rewindCommand({
-        commandId: params.commandId,
-        checkpointId: action.checkpointId,
-        ...(params.expectedRevision === undefined ? {} : { expectedRevision: params.expectedRevision }),
-      })
-    case "steer":
-      return steerCommand({
-        commandId: params.commandId,
-        runId: runId(action.runId),
-        text: action.text,
-      })
-    case "cancelInput":
-      return cancelInputCommand({
-        commandId: params.commandId,
-        inputId: action.inputId,
-        ...(action.reason === undefined ? {} : { reason: action.reason }),
-      })
-    case "executeShell":
-      return executeShellCommand({
-        commandId: params.commandId,
-        argv: action.argv,
-        ...(action.cwd === undefined ? {} : { cwd: action.cwd }),
-        ...(action.timeoutMs === undefined ? {} : { timeoutMs: action.timeoutMs }),
-      })
-    case "executeUserShell":
-      return executeUserShellCommand({
-        commandId: params.commandId,
-        command: action.command,
-        ...(action.cwd === undefined ? {} : { cwd: action.cwd }),
-        ...(action.timeoutMs === undefined ? {} : { timeoutMs: action.timeoutMs }),
-      })
+/** Internal task snapshot to the public summary: the wire carries no
+ * createdAt/startedAt split, so `updatedAt` collapses to the latest known
+ * timestamp; loop tasks masquerade as agent exactly like the live projection
+ * (public listings filter them out before this mapping). */
+function publicTaskSummaryOf(task: TaskSnapshot): PublicTaskSummary {
+  return {
+    taskId: task.id,
+    kind: task.type === "loop" ? "agent" : task.type,
+    title: task.title,
+    status: task.status,
+    updatedAt: task.completedAt ?? task.startedAt ?? task.createdAt,
   }
 }
 
-function commandResult(id: SessionId, commandId: string, result: SessionCommandResult): JsonValue {
-  switch (result.type) {
-    case "additional_directory_added":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "directoryAdded",
-        result: toJson({
-          changed: result.changed,
-          directory: result.directory,
-          additionalDirectories: result.additionalDirectories,
-          scopeRevision: result.scopeRevision,
-          ...(result.scopeDigest === undefined ? {} : { scopeDigest: result.scopeDigest }),
-        }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "permission_updated":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "permissionUpdated",
-        result: toJson({ changed: result.changed }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "compacted":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "compacted",
-        result: toJson({
-          changed: result.changed,
-          inputMessageCount: result.inputMessageCount,
-          outputMessageCount: result.outputMessageCount,
-          ...(result.inputTokens === undefined ? {} : { inputTokens: result.inputTokens }),
-        }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "context_window_updated":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "contextWindowUpdated",
-        result: toJson({
-          changed: result.changed,
-          ...(result.contextWindowOverride === undefined ? {} : { contextWindowOverride: result.contextWindowOverride }),
-        }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "agent_updated":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "agentUpdated",
-        result: toJson({ changed: result.changed, ...(result.agentName === undefined ? {} : { agentName: result.agentName }) }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "goal_updated":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "goalUpdated",
-        result: toJson({ changed: result.changed, goal: result.goal }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "task_created":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "taskCreated",
-        result: toJson({ task: result.task }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "tasks":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "tasksListed",
-        result: toJson({ tasks: result.tasks }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "task_cancelled":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "taskCancelled",
-        result: toJson({ task: result.task }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "checkpoints":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "checkpointsListed",
-        result: toJson({ checkpoints: result.checkpoints }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "rewind_preview":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "rewindPreviewed",
-        result: toJson({ preview: result.preview }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "rewind_result":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "rewound",
-        result: toJson({ result: result.result }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "shell_result":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "shellResult",
-        result: toJson({ runId: result.runId, result: result.result }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "input_accepted":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "inputAccepted",
-        result: toJson({ inputId: result.inputId }),
-        snapshot: toJson(result.snapshot),
-      }
-    case "input_cancelled":
-      return {
-        accepted: true,
-        sessionId: id,
-        commandId,
-        action: "inputCancelled",
-        result: toJson({ inputId: result.inputId, status: result.status }),
-        snapshot: toJson(result.snapshot),
-      }
-    default:
-      throw new RpcApplicationError("invalid_host_result", `Host did not return a public session.command result: ${result.type}`)
+function taskCreatedResult(id: SessionId, commandId: string, result: SessionCommandResult): SessionCreateTaskResult {
+  if (result.type !== "task_created") throw new RpcApplicationError("invalid_host_result", "Host did not return task_created")
+  return {
+    accepted: true,
+    sessionId: id,
+    commandId,
+    task: publicTaskSummaryOf(result.task),
+    queued: result.task.status === "queued",
   }
 }
 
-function resultWithSnapshot(value: SessionCommandResult): value is Extract<SessionCommandResult, { readonly snapshot: unknown }> {
-  return "snapshot" in value
-}
-
-function resultWithResult(value: SessionCommandResult): value is Extract<SessionCommandResult, { readonly result: unknown }> {
-  return "result" in value
-}
-
-function resultWithRunId(value: SessionCommandResult): value is Extract<SessionCommandResult, { readonly runId: unknown }> {
-  return "runId" in value
+/** Shell task titles derive from the command line, bounded to the task title
+ * limit; a whitespace-only join (empty argv entries only) falls back rather
+ * than violating the non-empty title constraint. */
+function shellTaskTitle(candidate: string): string {
+  const title = candidate.slice(0, MAX_TASK_TITLE_LENGTH)
+  return title.trim().length > 0 ? title : "shell task"
 }

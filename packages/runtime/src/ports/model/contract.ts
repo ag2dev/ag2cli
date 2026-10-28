@@ -38,8 +38,6 @@ export interface ModelClient {
   readonly protocol: "anthropic" | "openai"
   /** Configured model identifier, for client status surfaces. */
   readonly model?: string
-  /** Explicit provider/model context window; unknown for generic endpoints. */
-  readonly contextWindow?: number
   /** Optional live model selection for interactive clients. */
   readonly setModel?: (model: string) => void
   readonly setEffort?: (effort: "low" | "medium" | "high") => void

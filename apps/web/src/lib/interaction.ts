@@ -4,11 +4,11 @@ import {
   type AppServerInteractionLeases,
   type InteractionLeaseScope,
 } from "@ag2cli/app-server-protocol/types.js"
-import { type JsonRpcAppServerClient } from "@ag2cli/app-server-client/client.js"
+import type { AppServerRpcClient } from "@ag2cli/app-server-client/client.js"
 import { requestInteractionLease } from "@ag2cli/app-server-client/interaction.js"
 
 export interface BrowserInteractionConnection {
-  readonly rpc: JsonRpcAppServerClient
+  readonly rpc: AppServerRpcClient
   readonly connectionId: string
 }
 
@@ -31,11 +31,18 @@ export interface BrowserInteractionLeaseAcquireOptions {
 interface ScopedLeaseState {
   lease: AppServerInteractionLease
   epoch: number
+  /** Locally tracked self-ownership: the holder wire shape carries no connection identity. */
+  mine?: { readonly key: string; readonly generation: number }
   pendingAcquire?: {
     readonly key: string
     readonly promise: Promise<number | undefined>
   }
   readonly desired: Set<string>
+  // Deliberately hand-rolled: release dedupe mixes disciplines a shared
+  // once-guard does not offer — wait-for-existing before reacquire,
+  // identity-checked delete on settle, and wholesale clear on epoch
+  // reset — and the web client stays free of the runtime package owning
+  // the shared primitives.
   readonly pendingReleases: Map<string, Promise<void>>
 }
 
@@ -74,6 +81,7 @@ export class BrowserInteractionLeaseController {
       if (scope !== "composer" && scope !== "session-control") continue
       state.epoch += 1
       state.desired.clear()
+      state.mine = undefined
       state.pendingAcquire = undefined
       state.pendingReleases.clear()
       this.publish(currentSessionId, scope, state, availableLease(), true)
@@ -87,7 +95,8 @@ export class BrowserInteractionLeaseController {
   currentGeneration(sessionId: string, scope: InteractionLeaseScope, connectionId?: string): number | undefined {
     const lease = this.currentLease(sessionId, scope)
     if (lease.status !== "held") return undefined
-    if (connectionId !== undefined && lease.holder?.connectionId !== connectionId) return undefined
+    if (connectionId !== undefined && !this.heldBySelf(this.stateFor(sessionId, scope), `${sessionId}:${connectionId}`, lease))
+      return undefined
     return lease.generation
   }
 
@@ -108,7 +117,7 @@ export class BrowserInteractionLeaseController {
       if (!this.options.isCurrent(sessionId, connection) || !state.desired.has(key)) return undefined
     }
     const current = state.lease
-    if (current.status === "held" && current.holder?.connectionId !== connection.connectionId) {
+    if (current.status === "held" && !this.heldBySelf(state, key, current)) {
       throwIfAborted(options.signal)
       return undefined
     }
@@ -118,12 +127,10 @@ export class BrowserInteractionLeaseController {
     const promise = requestInteractionLease(connection.rpc, "interaction.acquire", sessionId, scope, {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     }).then(async (next) => {
+      // A successful acquire result can only be held by this connection.
+      if (next.status === "held") state.mine = { key, generation: next.generation }
       if (state.epoch !== epoch) {
-        if (
-          this.options.isCurrent(sessionId, connection) &&
-          next.status === "held" &&
-          next.holder?.connectionId === connection.connectionId
-        ) {
+        if (this.options.isCurrent(sessionId, connection) && next.status === "held") {
           await this.release(sessionId, scope, connection, next.generation)
         }
         return undefined
@@ -132,12 +139,12 @@ export class BrowserInteractionLeaseController {
       if (next.generation < state.lease.generation) return undefined
       this.publish(sessionId, scope, state, next)
       if (!state.desired.has(key)) {
-        if (next.status === "held" && next.holder?.connectionId === connection.connectionId) {
+        if (next.status === "held") {
           await this.release(sessionId, scope, connection, next.generation)
         }
         return undefined
       }
-      return next.status === "held" && next.holder?.connectionId === connection.connectionId ? next.generation : undefined
+      return next.status === "held" ? next.generation : undefined
     })
     state.pendingAcquire = { key, promise }
     void promise.then(
@@ -151,7 +158,7 @@ export class BrowserInteractionLeaseController {
     if (!this.options.isCurrent(sessionId, connection)) return
     const state = this.stateFor(sessionId, scope)
     const current = state.lease
-    if (current.status !== "held" || current.holder?.connectionId !== connection.connectionId) return
+    if (current.status !== "held" || !this.heldBySelf(state, interactionKey(sessionId, connection), current)) return
     const generation = current.generation
     const epoch = state.epoch
     const next = await requestInteractionLease(connection.rpc, "interaction.renew", sessionId, scope, {
@@ -188,7 +195,7 @@ export class BrowserInteractionLeaseController {
           state.epoch === epoch &&
           this.options.isCurrent(sessionId, connection) &&
           current.status === "held" &&
-          current.holder?.connectionId === connection.connectionId &&
+          this.heldBySelf(state, key, current) &&
           current.generation === generation
         ) {
           this.publish(sessionId, scope, state, availableLease(generation))
@@ -218,7 +225,7 @@ export class BrowserInteractionLeaseController {
       return
     }
     const current = state.lease
-    if (current.status === "held" && current.holder?.connectionId === connection.connectionId) {
+    if (current.status === "held" && this.heldBySelf(state, key, current)) {
       await this.release(sessionId, scope, connection, current.generation)
     }
   }
@@ -235,12 +242,14 @@ export class BrowserInteractionLeaseController {
     const next = await requestInteractionLease(connection.rpc, "interaction.takeover", sessionId, scope)
     const isCurrent = this.options.isCurrent(sessionId, connection)
     if (state.epoch !== epoch || !isCurrent) {
-      if (state.epoch !== epoch && isCurrent && next.status === "held" && next.holder?.connectionId === connection.connectionId) {
+      if (state.epoch !== epoch && isCurrent && next.status === "held") {
         await this.release(sessionId, scope, connection, next.generation)
       }
       return this.currentLease(sessionId, scope)
     }
     if (next.generation < state.lease.generation) return state.lease
+    // A successful takeover result can only be held by this connection.
+    if (next.status === "held") state.mine = { key: interactionKey(sessionId, connection), generation: next.generation }
     this.publish(sessionId, scope, state, next)
     return next
   }
@@ -284,6 +293,10 @@ export class BrowserInteractionLeaseController {
   ): void {
     if (!force && lease.generation < state.lease.generation) return
     state.lease = lease
+    // Any accepted transition other than our recorded generation means we no longer hold the lease.
+    if (state.mine !== undefined && (lease.status !== "held" || lease.generation !== state.mine.generation)) {
+      state.mine = undefined
+    }
     const update = { sessionId, scope, lease }
     try {
       this.options.onLease?.(update)
@@ -301,6 +314,11 @@ export class BrowserInteractionLeaseController {
 
   private clearPendingAcquire(state: ScopedLeaseState, promise: Promise<number | undefined>): void {
     if (state.pendingAcquire?.promise === promise) state.pendingAcquire = undefined
+  }
+
+  /** Generations never repeat within a scope, so a matching generation proves self-ownership. */
+  private heldBySelf(state: ScopedLeaseState, key: string, lease: AppServerInteractionLease): boolean {
+    return lease.status === "held" && state.mine?.key === key && state.mine.generation === lease.generation
   }
 }
 

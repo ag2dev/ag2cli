@@ -1,12 +1,14 @@
 import { taskId, type SessionId } from "@ag2cli/core/ids.js"
+import type { AgentEvent } from "@ag2cli/core/events/event.js"
 import type { EventStore } from "@ag2cli/runtime/ports/event-store.js"
 import type { TraceStore } from "@ag2cli/runtime/ports/trace-sink.js"
 import type { ObservabilityPolicy } from "@ag2cli/runtime/ports/observability.js"
 import type { ApprovalResolutionResolver } from "@ag2cli/runtime/application/session/approval-resolution.js"
+import type { AskResolutionResolver } from "@ag2cli/runtime/application/session/ask-resolution.js"
 import type { SessionCatalog } from "@ag2cli/runtime/ports/session-catalog.js"
 import { projectModelCalls } from "@ag2cli/core/events/model-calls.js"
-import type { SessionCommand, SessionCommandResult } from "@ag2cli/protocol/session-command.js"
-import { SESSION_PROTOCOL_VERSION } from "@ag2cli/protocol/session-command.js"
+import type { SessionCommand, SessionCommandResult } from "@ag2cli/session-protocol/session-command.js"
+import { SESSION_PROTOCOL_VERSION } from "@ag2cli/session-protocol/session-command.js"
 import type { SessionExecuteOptions } from "@ag2cli/runtime/application/session/session-execution.js"
 import type { CreatePlanUseCase } from "@ag2cli/runtime/application/plan/create-plan.js"
 import type { RunAgentUseCase } from "@ag2cli/runtime/application/execution/run-agent.js"
@@ -36,6 +38,7 @@ export interface SessionCommandRouterDependencies {
   readonly agent: UpdateSessionAgentUseCase
   readonly taskManager: BackgroundTaskManager
   readonly approvalResolution?: ApprovalResolutionResolver
+  readonly askResolution?: AskResolutionResolver
   readonly traceSink?: TraceStore
   readonly observability?: ObservabilityPolicy
   /** Runtime-configured default; an explicit command value takes precedence. */
@@ -222,6 +225,22 @@ export class SessionCommandRouter {
           snapshot: await this.deps.snapshotFor(sessionId),
         }
       }
+      case "cancel_run": {
+        if (!this.deps.run) throw new Error("Execution runtime is not enabled on this Session server")
+        const result = await this.deps.run.cancelRun({
+          sessionId,
+          commandId: command.commandId,
+          runId: command.runId,
+          ...(command.reason === undefined ? {} : { reason: command.reason }),
+        })
+        return {
+          protocolVersion: SESSION_PROTOCOL_VERSION,
+          type: "run_cancellation",
+          runId: result.runId,
+          status: result.status,
+          snapshot: await this.deps.snapshotFor(sessionId),
+        }
+      }
       case "execute_shell":
       case "execute_user_shell": {
         if (!this.deps.shell) throw new Error("Execution runtime is not enabled on this Session server")
@@ -315,6 +334,9 @@ export class SessionCommandRouter {
           title: command.title,
           ...(command.prompt === undefined ? {} : { prompt: command.prompt }),
           ...(command.argv === undefined ? {} : { argv: command.argv }),
+          ...(command.command === undefined ? {} : { command: command.command }),
+          ...(command.cwd === undefined ? {} : { cwd: command.cwd }),
+          ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
           ...(command.intervalMs === undefined ? {} : { intervalMs: command.intervalMs }),
           ...(command.maxRuns === undefined ? {} : { maxRuns: command.maxRuns }),
           ...(command.workspace === undefined ? {} : { workspace: command.workspace }),
@@ -385,6 +407,42 @@ export class SessionCommandRouter {
         })
         return { protocolVersion: SESSION_PROTOCOL_VERSION, type: "snapshot", snapshot: await this.deps.snapshotFor(sessionId) }
       }
+      case "resolve_ask": {
+        if (!this.deps.askResolution) {
+          throw new Error("Remote ask resolution is not enabled on this Session server")
+        }
+        await this.deps.askResolution.resolve({
+          sessionId,
+          runId: command.runId,
+          turn: command.turn,
+          toolUseId: command.toolUseId,
+          outcome: command.outcome,
+          ...(command.answers === undefined
+            ? {}
+            : {
+                answers: command.answers.map((row) => ({
+                  header: row.header,
+                  selected: [...row.selected],
+                  ...(row.freeText === undefined ? {} : { freeText: row.freeText }),
+                })),
+              }),
+          ...(command.contextAnswers === undefined
+            ? {}
+            : {
+                contextAnswers: command.contextAnswers.map((row) => ({
+                  questionIndex: row.questionIndex,
+                  header: row.header,
+                  selected: [...row.selected],
+                  ...(row.freeText === undefined ? {} : { freeText: row.freeText }),
+                })),
+              }),
+        })
+        return {
+          protocolVersion: SESSION_PROTOCOL_VERSION,
+          type: "snapshot",
+          snapshot: await this.deps.snapshotFor(sessionId),
+        }
+      }
       case "get_snapshot":
         return { protocolVersion: SESSION_PROTOCOL_VERSION, type: "snapshot", snapshot: await this.deps.snapshotFor(sessionId) }
       case "read_events":
@@ -405,6 +463,32 @@ export class SessionCommandRouter {
           }),
         }
       }
+      case "read_task_logs": {
+        const task = await this.deps.taskManager.get(sessionId, command.taskId)
+        if (!task) throw new Error(`background task not found: ${command.taskId}`)
+        const events = await this.deps.eventStore.read(sessionId)
+        const all = events
+          .filter(
+            (event): event is Extract<AgentEvent, { type: "BackgroundTaskOutputAppended" }> =>
+              event.type === "BackgroundTaskOutputAppended" && event.payload.taskId === command.taskId,
+          )
+          .map((event) => ({ sequence: event.payload.sequence, text: event.payload.chunk }))
+          .sort((left, right) => left.sequence - right.sequence)
+          // The first page starts at sequence 0; a cursor is an exclusive
+          // lower bound for continuations only.
+          .filter((chunk) => command.afterSequence === undefined || chunk.sequence > command.afterSequence)
+        const page = command.limit === undefined ? all.slice(0, 500) : all.slice(0, command.limit)
+        const last = page.at(-1)
+        return {
+          protocolVersion: SESSION_PROTOCOL_VERSION,
+          type: "task_logs",
+          taskId: command.taskId,
+          status: task.status,
+          outputBytes: task.outputBytes,
+          chunks: page,
+          ...(page.length < all.length && last !== undefined ? { nextAfterSequence: last.sequence } : {}),
+        }
+      }
     }
   }
 }
@@ -418,9 +502,11 @@ function isWriteCommand(command: SessionCommand): boolean {
     command.type === "start_run" ||
     command.type === "steer" ||
     command.type === "cancel_input" ||
+    command.type === "cancel_run" ||
     command.type === "execute_shell" ||
     command.type === "execute_user_shell" ||
     command.type === "resolve_approval" ||
+    command.type === "resolve_ask" ||
     command.type === "compact" ||
     command.type === "set_context_window" ||
     command.type === "clear_context_window" ||

@@ -3,6 +3,7 @@ import type { SessionId } from "@ag2cli/core/ids.js"
 import type { AgentEvent, EventTrace } from "@ag2cli/core/events/event.js"
 import { DEFAULT_SESSION_PERMISSION_MODE } from "@ag2cli/core/session/session-security.js"
 import type { EventStore } from "../../ports/event-store.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import type { PlanProvider } from "../../ports/model-provider.js"
 import { noopTraceSink, type TraceSink } from "../../ports/trace-sink.js"
 import type { ObservabilityPolicy } from "../../ports/observability.js"
@@ -74,13 +75,13 @@ export interface CreatePlanDependencies {
   readonly executionReservation?: SessionExecutionReservation
   readonly reservationOwnerId?: string
   /** Notify a live transport after a durable batch has been appended. */
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 /** One complete plan use case: provider output becomes a durable domain event. */
 export class CreatePlanUseCase {
   private readonly planService: PlanService
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
   private readonly authority: SessionAuthority
 
   constructor(private readonly deps: CreatePlanDependencies) {
@@ -88,9 +89,8 @@ export class CreatePlanUseCase {
     this.authority = deps.authority ?? new SessionAuthority(deps.eventStore)
   }
 
-  async execute(input: CreatePlanInput): Promise<Plan> {
-    const previous = this.pending.get(input.sessionId)
-    const operation = (previous ?? Promise.resolve()).then(async () => {
+  execute(input: CreatePlanInput): Promise<Plan> {
+    return this.lane.run(input.sessionId, async () => {
       if (this.deps.executionReservation === undefined) return this.executeNow(input)
       const events = await this.deps.eventStore.read(input.sessionId)
       const idempotency = resolveCommandIdempotency(CREATE_PLAN_FAMILY, events, {
@@ -118,16 +118,6 @@ export class CreatePlanUseCase {
         await lease.release(input.signal?.aborted ? "aborted" : "released").catch(() => {})
       }
     })
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(input.sessionId, tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(input.sessionId) === tracked) this.pending.delete(input.sessionId)
-    }
   }
 
   private async executeNow(input: CreatePlanInput): Promise<Plan> {

@@ -19,6 +19,7 @@ export type TextBlockKind = "user" | "assistant" | "status" | "shell" | "error"
 
 /** Tool lifecycle statuses; done/error/denied are terminal. */
 export type ToolStatus = "streaming" | "running" | "waiting" | "approved" | "denied" | "done" | "error"
+export type PublicToolStatus = "requested" | "awaiting_approval" | "running" | "completed" | "failed" | "denied"
 
 /** Diff line kinds (TUI-local view of a structured patch; mirrors core's vocabulary without importing it). */
 export type ToolDiffLineKind = "context" | "added" | "removed"
@@ -43,6 +44,8 @@ export interface ToolDiff {
   readonly removedLines: number
   readonly sites: number
   readonly truncated?: boolean
+  /** False when the received unified preview could not be parsed; counts remain factual. */
+  readonly previewAvailable?: boolean
 }
 
 /** Text transcript block (user/assistant/system/shell/error rows). */
@@ -52,6 +55,8 @@ export interface TranscriptTextBlock {
   readonly body: string
   /** Canonical input identity carried by user rows. */
   readonly inputId?: string
+  /** Canonical acceptance instant carried by user rows. */
+  readonly acceptedAt?: string
   /**
    * Stable TUI-local identity minted by the projection: it survives
    * streaming→final reconciliation, in-place tool merges, shell results,
@@ -81,6 +86,8 @@ export interface ToolBlock {
   /** Display title derived from a string `description` input at merge time; absent when the input carries none. */
   readonly title?: string
   readonly status: ToolStatus
+  /** Canonical public tool-call lifecycle status, retained alongside the renderer status. */
+  readonly toolStatus?: PublicToolStatus
   readonly result?: string
   readonly partialInput?: string
   readonly collapsed: boolean
@@ -120,6 +127,7 @@ export type LiveTailBlock =
       readonly input: unknown
       readonly title?: string
       readonly status: ToolStatus
+      readonly toolStatus?: PublicToolStatus
       readonly result?: string
       readonly partialInput?: string
       readonly durationMs?: number

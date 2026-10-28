@@ -3,6 +3,7 @@ import type { SessionId } from "@ag2cli/core/ids.js"
 import { updateSessionGoal, type SessionGoal, type SessionGoalUpdate } from "@ag2cli/core/session/session-goal.js"
 import { replaySession } from "@ag2cli/core/session/session-snapshot.js"
 import type { EventStore } from "../../ports/event-store.js"
+import { OrderedLane } from "../../concurrency/ordered-lane.js"
 import { commandIdempotencyConflictError, resolveCommandIdempotency, type CommandIdempotencyFamily } from "./command-idempotency.js"
 import { appendSessionEventsIfRevision } from "./revision-conflict.js"
 import type { SessionAuthority } from "./session-authority.js"
@@ -46,29 +47,18 @@ export interface UpdateSessionGoalDependencies {
     nextEventId(): string
     now(): string
   }
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }
 
 /** Persist the user-owned session goal in the same event stream as all session state. */
 export class UpdateSessionGoalUseCase {
-  private readonly pending = new Map<string, Promise<void>>()
+  private readonly lane = new OrderedLane<string>()
 
   constructor(private readonly deps: UpdateSessionGoalDependencies) {}
 
   async execute(input: UpdateSessionGoalInput): Promise<UpdateSessionGoalResult> {
     validateCommandId(input.commandId)
-    const previous = this.pending.get(input.sessionId.toString())
-    const operation = (previous ?? Promise.resolve()).then(() => this.executeNow(input))
-    const tracked = operation.then(
-      () => undefined,
-      () => undefined,
-    )
-    this.pending.set(input.sessionId.toString(), tracked)
-    try {
-      return await operation
-    } finally {
-      if (this.pending.get(input.sessionId.toString()) === tracked) this.pending.delete(input.sessionId.toString())
-    }
+    return this.lane.run(input.sessionId.toString(), () => this.executeNow(input))
   }
 
   private async executeNow(input: UpdateSessionGoalInput): Promise<UpdateSessionGoalResult> {

@@ -5,7 +5,6 @@ import { createAcpPlanAgent, createAcpRunAgent } from "../public/acp.js"
 import { connectEphemeralAppServer } from "../composition/acp-app-server.js"
 import { loadRuntimeConfig } from "../config/runtime.js"
 import { parseConfigPathArgs } from "../config/config-file.js"
-import { APP_SERVER_PROTOCOL_VERSION } from "@ag2cli/app-server-protocol/types.js"
 import { resolve } from "node:path"
 import { workspaceIdForRoot } from "../capabilities/security/workspace.js"
 import { cleanupScratchRoots } from "../capabilities/security/scratch.js"
@@ -46,8 +45,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
   // adapter's lifetime.
   const appServer = await connectEphemeralAppServer(config)
   try {
-    const initialize = await appServer.client.initialize({
-      appServerProtocolVersion: APP_SERVER_PROTOCOL_VERSION,
+    const initialize = await appServer.initializeLocal({
       client: { clientId: "acp-edge", clientKind: "acp", name: "ag2cli-acp", version: "1" },
     })
     const workspaceIdForAcpRoot = (workspaceRoot: string): string | undefined => {

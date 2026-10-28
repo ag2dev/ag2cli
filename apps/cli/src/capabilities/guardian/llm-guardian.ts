@@ -13,7 +13,6 @@ export const GUARDIAN_REVIEW_PAYLOAD_MAX_CHARS = 32_768
 /** The run goal is review context, not an action fact: it truncates with a marker. */
 export const GUARDIAN_REVIEW_GOAL_MAX_CHARS = 8_192
 const DEFAULT_REVIEW_TIMEOUT_MS = 15_000
-const DEFAULT_REVIEW_MAX_OUTPUT_TOKENS = 1_024
 
 /** Review-call tuning only; client construction is composition's concern. */
 export interface LlmGuardianConfig {
@@ -198,7 +197,7 @@ export function createLlmGuardian(config: LlmGuardianConfig, deps: LlmGuardianDe
           client.call({
             messages: [{ type: "user", message: { role: "user", content: payload } }],
             systemPrompt: GUARDIAN_SYSTEM_PROMPT,
-            maxTokens: config.maxOutputTokens ?? DEFAULT_REVIEW_MAX_OUTPUT_TOKENS,
+            ...(config.maxOutputTokens === undefined ? {} : { maxTokens: config.maxOutputTokens }),
             signal: controller.signal,
           }),
           deadline.expired.then(() => {

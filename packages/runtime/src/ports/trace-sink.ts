@@ -30,6 +30,7 @@ const SAFE_STRING_ATTRIBUTE_KEYS = new Set([
   "toolName",
   "hookEvent",
   "hookType",
+  "notes",
   "outcome",
 ])
 

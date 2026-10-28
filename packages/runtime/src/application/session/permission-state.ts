@@ -87,7 +87,7 @@ export class UpdateSessionPermissionUseCase {
       readonly identity: { nextEventId(): string; now(): string }
       /** Serializes the read-judge-append window against tool dispatch on one session. */
       readonly serialPoint: PolicySerialPoint
-      readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+      readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
     },
   ) {}
 

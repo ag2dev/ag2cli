@@ -1,7 +1,6 @@
 /**
- * Assembly root for the Ink frame: composes the screen deep module,
- * the framework-free state
- * store and the React/Ink view tree into one lifecycle. Ink's terminal
+ * Assembly root for the Ink frame: composes the screen deep module, the
+ * kernel and the React/Ink view tree into one lifecycle. Ink's terminal
  * reach is narrowed to a frame-only stdout proxy — every byte it writes
  * funnels through screen.frame(), raw mode and buffer switching stay
  * with the screen module (Ink's own alternateScreen/exitOnCtrlC/
@@ -14,31 +13,23 @@
  * caller (input, resize, the first frame) rethrow after that
  * synchronous teardown; faults with none (a frame write inside Ink's
  * own commit, a bare timer) defer the unmount to the next loop turn and
- * surface through flush(). Keys enter as
- * store key-intents; their effects (submissions and global key
- * requests) leave through one host seam, and the confirmation-window
- * expiry is scheduled off the store's own commits while the frame is
- * live.
+ * surface through flush(). Keys enter as kernel key-intents; the view
+ * subscribes to the kernel directly, and the frame's own subscription
+ * is the write-certification loop: a settled render's revision is
+ * reported written so the barrier can certify what truly painted.
  */
 import { createElement } from "react"
 import type { ReactNode } from "react"
 import { render } from "ink"
 import { createInputDecoder, intentFor } from "../keys/index.js"
-import {
-  createTuiStateStore,
-  SUPPORT_FLOOR,
-  type TuiCompletionSources,
-  type TuiStateEffect,
-  type TuiStateStore,
-  type TuiStateStoreOptions,
-} from "../state/index.js"
+import type { TuiKernel } from "../kernel/index.js"
 import type { ScreenPreparation, TerminalScreen, TerminalSize } from "../screen/index.js"
 import type { ThemeId } from "../text/index.js"
-import { TuiRoot } from "../view/index.js"
+import { TuiKernelRoot, type TuiIntroSource } from "../view/index.js"
 
 // The bootstrap is the entrypoint's only legal window onto the TUI
 // tree, so the floor constant rides this seam for its pre-flight check.
-export { SUPPORT_FLOOR } from "../state/index.js"
+export { SUPPORT_FLOOR } from "../text/index.js"
 
 const ESCAPE_AMBIGUITY_WINDOW_MS = 35
 const INK_EXIT_TIMEOUT_MS = 1_000
@@ -72,8 +63,8 @@ function waitBounded(promise: Promise<unknown>, timeoutMs: number): Promise<Boun
 }
 
 export interface InkTuiFrame {
-  /** Store the host application dispatches session content into. */
-  readonly store: TuiStateStore
+  /** Kernel the host application dispatches inputs into. */
+  readonly kernel: TuiKernel
   /**
    * Capability gate, then activation and the first frame: refuses
    * terminals that cannot prove alternate-screen support before a single
@@ -92,7 +83,7 @@ export interface InkTuiFrame {
    * Resolves once pending render output has been written; a stop() or
    * signal landing while a flush is pending resolves it instead of
    * awaiting a dead renderer. A fatal frame fault — a frame write or
-   * the window-expiry pipeline — is rethrown here, after the teardown
+   * the certification pipeline — is rethrown here, after the teardown
    * the fault itself already scheduled, because rethrowing
    * synchronously from inside Ink's own commit leaves the
    * process-global React dispatcher poisoned for every later render
@@ -112,20 +103,10 @@ export interface InkTuiFrameOptions {
   readonly screen: TerminalScreen
   /** Let an enclosing application owner stop its controllers before Ink unmounts. */
   readonly autoStopOnTermination?: boolean
-  readonly store?: TuiStateStore
-  /**
-   * Completion sources for the frame-built store: mention candidates for
-   * @ tokens and command candidates for / tokens. Ignored when a store
-   * is injected — sources are store-construction state.
-   */
-  readonly completion?: TuiCompletionSources
-  /**
-   * Resting-screen key policy wiring for the frame-built store: the
-   * clock the confirmation windows live on and the permission rotation
-   * the Shift+Tab hint mirrors. Ignored when a store is injected — the
-   * injected store's own clock then drives the expiry scheduling.
-   */
-  readonly keys?: TuiStateStoreOptions
+  /** The kernel whose snapshot the tree renders and whose inputs the frame routes. */
+  readonly kernel: TuiKernel
+  /** Startup brand lines; the view evaluates the builder per render so a resize recomputes. */
+  readonly intro?: TuiIntroSource
   readonly theme?: ThemeId
   /**
    * Ink render entry, overridable so lifecycle tests can substitute a
@@ -134,14 +115,7 @@ export interface InkTuiFrameOptions {
    */
   readonly render?: typeof render
   /**
-   * Every outbound store effect — composer submissions plus the global
-   * key requests the resting-screen policy produces (interrupt, exit,
-   * rewind, permission rotation). Unset keeps them inert — the test
-   * frame's default.
-   */
-  readonly onEffect?: (effect: TuiStateEffect) => void
-  /**
-   * A fatal frame fault (a frame write or the window-expiry pipeline)
+   * A fatal frame fault (a frame write or the certification pipeline)
    * the frame could not surface to a caller synchronously: the terminal
    * is already restored by the fault path itself, so this notification
    * is the production host's cue to exit the process. Fires at most
@@ -152,19 +126,14 @@ export interface InkTuiFrameOptions {
 
 export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   const screen = options.screen
+  const kernel = options.kernel
   const renderFrame = options.render ?? render
-  const store = options.store ?? createTuiStateStore(options.completion, options.keys)
-  // The expiry timer must measure deadlines on the store's own clock:
-  // an injected store may carry a non-wall clock, and mixing the two
-  // turns every deadline into an immediate 0ms re-arm.
-  const clock = options.store?.now ?? options.keys?.now ?? Date.now
   let theme = options.theme ?? "dark"
   const decoder = createInputDecoder()
   const resizeListeners = new Set<() => void>()
-  const viewListeners = new Set<() => void>()
   let renderer: ReturnType<typeof render> | undefined
   let started: ScreenPreparation | undefined
-  // The first fatal frame fault (a frame write or the window-expiry
+  // The first fatal frame fault (a frame write or the certification
   // pipeline), held for the next flush() to rethrow: a synchronous
   // rethrow from inside Ink's commit poisons the process-global React
   // dispatcher for every later render, and a rethrow from a bare timer
@@ -172,15 +141,11 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   // fault and record it here instead.
   let writeFault: unknown
   let renderBlocked = false
-  let viewDirty = false
   let resizeDirty = false
   let themeDirty = false
-  let coalescingView = false
   let drainWaiters: (() => void)[] = []
-  let expiryTimer: ReturnType<typeof setTimeout> | undefined
   let escapeTimer: ReturnType<typeof setTimeout> | undefined
-  let expiryUnsubscribe: (() => void) | undefined
-  let viewStoreUnsubscribe: (() => void) | undefined
+  let kernelUnsubscribe: (() => void) | undefined
   let detachBackpressure: (() => void) | undefined
   let detachWriteFault: (() => void) | undefined
   let detachTerminationRequest: (() => void) | undefined
@@ -190,30 +155,6 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
     stopStartedResolve = resolve
   })
   let fatalNotified = false
-
-  const notifyViewListeners = (): void => {
-    for (const listener of [...viewListeners]) listener()
-  }
-
-  const viewStore: TuiStateStore = {
-    subscribe(listener) {
-      viewListeners.add(listener)
-      return () => viewListeners.delete(listener)
-    },
-    getSnapshot: () => store.getSnapshot(),
-    themeCardVisible: () => store.themeCardVisible(),
-    dispatch: (input) => store.dispatch(input),
-    windowDeadline: () => store.windowDeadline(),
-    now: () => store.now(),
-  }
-
-  viewStoreUnsubscribe = store.subscribe(() => {
-    if (renderBlocked || coalescingView) {
-      viewDirty = true
-      return
-    }
-    notifyViewListeners()
-  })
 
   const wakeDrainWaiters = (): void => {
     const waiters = drainWaiters
@@ -226,65 +167,53 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
     escapeTimer = undefined
   }
 
-  /** Timer plumbing for the store's confirmation windows: expiry is host work. */
-  const scheduleWindowExpiry = (): void => {
-    if (expiryTimer !== undefined) clearTimeout(expiryTimer)
-    expiryTimer = undefined
-    const deadline = store.windowDeadline()
-    if (deadline === null) return
-    expiryTimer = setTimeout(
-      () => {
-        expiryTimer = undefined
-        try {
-          store.dispatch({ kind: "expire-windows" })
-          // Re-arm unconditionally: an expiry whose commit the hint could
-          // not express (a second window still live) must still find the
-          // next deadline, and an armed-nothing read schedules nothing.
-          scheduleWindowExpiry()
-        } catch (fault) {
-          // The timer runs bare in the event loop: a rethrow here is an
-          // uncaught exception, so the expiry fault follows the
-          // frame-fault path — complete shutdown first, then flush() rethrows.
-          failFrame(fault, "tui window expiry fault", `fatal: tui window expiry fault: ${String(fault)}\r\n`)
-        }
-      },
-      Math.max(0, deadline - clock()),
-    )
-    // An armed window must not hold the process open: the timer dies
-    // with the loop instead of delaying exit by its own deadline.
-    expiryTimer.unref?.()
-  }
-
   /**
-   * Track the windows off the store's own commits: any dispatch path
-   * that arms, re-arms or disarms a window — keys, host inputs, the
-   * expiry itself — lands a committed revision, and the commit is the
-   * one signal every one of them shares. Bound while the frame is
-   * live; a stopped frame leaves no subscription or timer behind.
+   * The production write-certification loop: every commit notification
+   * records its revision, and one cycle per notification wave yields a
+   * tick (the update commits first), awaits that render's flush and
+   * reports the maximum revision observed at settlement — reporting a
+   * stale capture would forge certification for a frame that never
+   * wrote. A superseding notification aborts the older cycle silently;
+   * stop and write-fault paths invalidate every in-flight cycle, and
+   * the first frame joins through the post-start cycle.
    */
-  const bindWindowExpiry = (): void => {
-    expiryUnsubscribe?.()
-    expiryUnsubscribe = store.subscribe(scheduleWindowExpiry)
-    scheduleWindowExpiry()
+  let notifiedRevision = -1
+  let certifyCycle = 0
+
+  const runCertification = (): void => {
+    const cycle = ++certifyCycle
+    if (renderer === undefined || stopPromise !== undefined || writeFault !== undefined) return
+    void (async (): Promise<void> => {
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        if (cycle !== certifyCycle || renderer === undefined) return
+        const current = renderer
+        await current.waitUntilRenderFlush()
+        if (cycle !== certifyCycle || renderer !== current) return
+        kernel.written(notifiedRevision)
+      } catch {
+        // Flush-barrier faults surface through the write-fault path;
+        // an aborted certification simply stops reporting.
+      }
+    })()
   }
 
-  const clearWindowExpiry = (): void => {
-    expiryUnsubscribe?.()
-    expiryUnsubscribe = undefined
-    if (expiryTimer !== undefined) clearTimeout(expiryTimer)
-    expiryTimer = undefined
-  }
+  kernelUnsubscribe = kernel.subscribe((snapshot) => {
+    if (snapshot.revision > notifiedRevision) notifiedRevision = snapshot.revision
+    runCertification()
+  })
 
   const routeInputEvents = (events: ReturnType<typeof decoder.decode>): void => {
     for (const event of events) {
-      if (renderer === undefined) break
+      // Input predates the first start() by design — keys typed while
+      // the frame was merely created still reach the kernel — but a
+      // frame that stopped or faulted mid-batch owns the remaining
+      // events no longer: they must not mutate its dead kernel.
+      if (stopPromise !== undefined || writeFault !== undefined) break
       const intent = intentFor(event)
-      const size = frameSize()
-      const tooSmall = size.columns < SUPPORT_FLOOR.columns || size.rows < SUPPORT_FLOOR.rows
-      // Keep the host's two-step Ctrl+C exit available on the diagnostic
-      // screen; hidden composer/card actions must not mutate the draft.
-      if (tooSmall && intent.kind !== "interrupt") continue
-      for (const effect of store.dispatch({ kind: "key-intent", intent })) options.onEffect?.(effect)
+      // Below the support floor the kernel's adjudication routes every
+      // key back to the composer fallback, so the frame filters nothing.
+      kernel.dispatch({ kind: "key-intent", intent })
     }
   }
 
@@ -338,7 +267,9 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   const stopFrames = (stopOptions?: { readonly diagnostics?: string }, defer = false): Promise<void> => {
     if (stopPromise !== undefined) return stopPromise
     // Publish the shared promise before calling renderer code: unmount may
-    // synchronously report another write fault that re-enters this path.
+    // synchronously report another write fault that re-enters this path — a
+    // run-once guard that stores its entry only after start() returns would
+    // miss that re-entry and double-stop.
     let resolveStop!: () => void
     let rejectStop!: (fault: unknown) => void
     stopPromise = new Promise<void>((resolve, reject) => {
@@ -348,15 +279,18 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
     stopStartedResolve()
     const finishStop = (): void => {
       const asError = (fault: unknown): Error => (fault instanceof Error ? fault : new Error(String(fault)))
-      clearWindowExpiry()
+      // Invalidate every in-flight certification cycle before the
+      // renderer goes away: a stop must never report a dying frame
+      // as written.
+      certifyCycle += 1
+      kernelUnsubscribe?.()
+      kernelUnsubscribe = undefined
       clearEscapeTimer()
       renderBlocked = true
       wakeDrainWaiters()
       started = undefined
       const current = renderer
       renderer = undefined
-      viewStoreUnsubscribe?.()
-      viewStoreUnsubscribe = undefined
       detachBackpressure?.()
       detachBackpressure = undefined
       detachWriteFault?.()
@@ -419,12 +353,12 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   }
 
   // Keys flow through the screen (the terminal's only owner) and the
-  // decoder into the store's one key pipeline; whatever leaves as an
-  // effect is the host's to execute. A fault anywhere in that pipeline
-  // must not strand the host terminal in raw mode on the alternate
-  // buffer: the frame fences work and restores the terminal in this
-  // stack, then the original fault rethrows through the seam that fed
-  // the bytes — the input caller crashes with the terminal restored.
+  // decoder into the kernel's one key pipeline. A fault anywhere in
+  // that pipeline must not strand the host terminal in raw mode on the
+  // alternate buffer: the frame fences work and restores the terminal
+  // in this stack, then the original fault rethrows through the seam
+  // that fed the bytes — the input caller crashes with the terminal
+  // restored.
   screen.onInput((bytes) => {
     clearEscapeTimer()
     try {
@@ -440,8 +374,8 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   // Ink 8 uses empty writes with callbacks as render/unmount barriers; route
   // those barriers through the screen's ordered writable flush.
   // The screen's resize notifications are forwarded so Ink re-renders with
-  // fresh stdout geometry; the tree itself reads the size from the store
-  // snapshot the resize's layout dispatch commits.
+  // fresh stdout geometry; the tree itself reads the size from the kernel
+  // snapshot the resize's host-event dispatch commits.
   const stdout = {
     write(bytes: string | Uint8Array, callback?: (error?: Error | null) => void): boolean {
       const content = typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes)
@@ -492,7 +426,7 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   // finite floor the tree's geometry assumes: a port that ever reports
   // NaN lands on the too-small diagnostic instead of poisoning every
   // width computation downstream (the comparisons in the tree cannot
-  // catch NaN themselves). The store clamps its layout input the same
+  // catch NaN themselves). The kernel clamps its layout input the same
   // way at its own boundary.
   const frameSize = (): TerminalSize => {
     const size = screen.size()
@@ -503,50 +437,35 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   }
 
   const rootElement = (): ReactNode => {
-    return createElement(TuiRoot, { store: viewStore, theme })
+    return createElement(TuiKernelRoot, { kernel, theme, ...(options.intro === undefined ? {} : { intro: options.intro }) })
   }
 
-  // The screen's size is the store's single geometry authority: every
+  // The screen's size is the kernel's single geometry authority: every
   // frame the terminal lays out is preceded by the layout it derives
-  // the transcript window and the card grants against.
+  // the transcript window and the decision grants against.
   const dispatchLayout = (): void => {
     const size = frameSize()
-    store.dispatch({ kind: "layout", columns: size.columns, rows: size.rows })
+    kernel.dispatch({ kind: "host-event", event: { type: "resize", columns: size.columns, rows: size.rows } })
   }
 
   /**
-   * Render only the latest snapshot once output backpressure clears.
-   * Faults propagate to the caller: the seams with a caller (resize,
-   * the first frame) restore the terminal and rethrow; bare callbacks
-   * (the drain notification) take the frame-fault path instead.
+   * Repaint only once output backpressure clears. Faults propagate to
+   * the caller: the seams with a caller (resize, the first frame)
+   * restore the terminal and rethrow; bare callbacks (the drain
+   * notification) take the frame-fault path instead. View updates
+   * need no scheduling here — the tree subscribes to the kernel
+   * directly — so only theme rerenders and the resize notification
+   * ride this drain.
    */
   const flushPendingView = (): void => {
     if (renderBlocked) return
     const pendingResize = resizeDirty
     const pendingTheme = themeDirty
-    const shouldRender = viewDirty || pendingResize || pendingTheme
-    if (!shouldRender) return
-
+    if (!pendingResize && !pendingTheme) return
     resizeDirty = false
-    viewDirty = false
     themeDirty = false
-    if (pendingResize) {
-      coalescingView = true
-      try {
-        dispatchLayout()
-      } finally {
-        coalescingView = false
-      }
-    }
-
-    const changedView = viewDirty
-    viewDirty = false
-    // Store listeners render session/layout changes. A theme is root
-    // configuration, so it uses Ink's explicit rerender seam. This keeps
-    // a resize from committing once through the store and again through a
-    // redundant renderer.rerender call.
+    if (pendingResize) dispatchLayout()
     if (pendingTheme && renderer !== undefined) renderer.rerender(rootElement())
-    else if (changedView) notifyViewListeners()
     if (pendingResize) {
       if (renderBlocked) {
         // Ink's resize bookkeeping must run after its current frame can
@@ -589,7 +508,6 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   screen.onResize(() => {
     if (renderBlocked) {
       resizeDirty = true
-      viewDirty = true
       return
     }
     resizeDirty = true
@@ -610,7 +528,7 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
   }
 
   return {
-    store,
+    kernel,
     start() {
       if (stopPromise !== undefined) {
         const previous = screen.prepare()
@@ -654,8 +572,10 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
       // the render call above: bind nothing on a dead frame — flush()
       // is holding the fault for the host.
       if (writeFault === undefined) {
-        bindWindowExpiry()
         started = preparation
+        // The first frame joins the certification cycle: whatever the
+        // activation-time layout committed is settled by this render.
+        runCertification()
       }
       return preparation
     },
@@ -681,13 +601,14 @@ export function createInkTuiFrame(options: InkTuiFrameOptions): InkTuiFrame {
         if (writeFault !== undefined) throw writeFault
         return
       }
-      // Store notifications schedule the re-render asynchronously; yield
+      // Kernel notifications schedule the re-render asynchronously; yield
       // one tick so the update commits before waiting on Ink's flush.
       await new Promise((resolve) => setTimeout(resolve, 0))
       if (renderer !== current) {
         if (writeFault !== undefined) throw writeFault
         return
       }
+      // eslint-disable-next-line no-unmodified-loop-condition -- renderer is swapped by start/stop outside this loop; re-checking it fences concurrent stops
       while (renderer === current) {
         const renderFlush = current.waitUntilRenderFlush().then(
           () => ({ kind: "flushed" as const }),

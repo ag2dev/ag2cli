@@ -11,8 +11,9 @@
  *  - A trust record is keyed by canonical realpath + workspace identity (Git remote/root identity).
  *    If a path is reused for another repository and the identity changes, request trust again.
  *
- * Even after a workspace is trusted, treat loaded content as untrusted context data. The runtime system prompt
- * explicitly says that tool output and project content are data and their instructions must not be executed.
+ * Workspace trust permits loading project content; it does not make that content authoritative.
+ * Loaded skills may guide the user's task, but cannot grant permissions, expand user authorization,
+ * or override system instructions and runtime policy.
  *
  * This file provides only pure logic: identity calculation, trust-store reads/writes, and trust checks. The entry point (CLI) handles interactive confirmation.
  */

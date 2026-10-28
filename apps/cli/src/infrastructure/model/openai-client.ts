@@ -19,13 +19,15 @@ import OpenAI from "openai"
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions/completions.js"
 import type { AssistantMessage, ContentBlock, Message } from "@ag2cli/core/message.js"
 import { type ModelClient, type CallModelInput } from "@ag2cli/runtime/ports/model/contract.js"
-import { type LlmConfig } from "../../config/model-config.js"
 import { joinSystemPrompt } from "@ag2cli/runtime/ports/model/prompt.js"
 import { loadRuntimeConfig } from "../../config/runtime.js"
 import { withModelRetry, withModelStreamRetry } from "./retry/controller.js"
 import { classifyModelResponse } from "./retry/failure.js"
-import { buildOpenAICompletionParams } from "./compatibility/request.js"
-import { resolveOpenAICompatibility } from "./compatibility/resolver.js"
+import { buildOpenAICompletionParams, estimateRequestTokens } from "./compatibility/request.js"
+import { deriveFamily, resolveOpenAICompatibility } from "./compatibility/resolver.js"
+import { resolveRequestMaxTokens } from "./request-cap.js"
+import { resolveModel } from "@ag2cli/model-catalog/resolve.js"
+import type { ModelOverrides } from "@ag2cli/model-catalog/types.js"
 import {
   contentParts,
   makeAssistantMessage,
@@ -46,6 +48,8 @@ export interface OpenAIConfig {
   thinking?: OpenAIThinkingMode
   reasoningEffort?: OpenAIReasoningEffort
   maxTokens?: number
+  /** Invoked once per unknown model; provider is the derived endpoint family, if any. */
+  onModelMiss?: (miss: { protocol: "openai"; provider?: string; modelId: string }) => void
 }
 
 /** Read OpenAI settings from the environment (separate variables avoid conflicts with Anthropic's AG2CLI_* settings). */
@@ -88,17 +92,24 @@ function mapFinishReason(reason: string | null | undefined): string | undefined 
 export class OpenAIModelClient implements ModelClient {
   readonly protocol = "openai" as const
   model: string
-  readonly contextWindow?: number
   private reasoningEffort?: OpenAIReasoningEffort
   private readonly baseURL: string
   private readonly compatibility?: OpenAICompatibilityName
   private readonly configuredThinking: OpenAIThinkingMode
   private readonly configuredReasoningEffort: OpenAIReasoningEffort
-  private readonly configuredMaxTokens?: number
+  private readonly family: string | undefined
+  private readonly catalogOverrides: ModelOverrides
+  private readonly onModelMiss?: (miss: { protocol: "openai"; provider?: string; modelId: string }) => void
+  private readonly reportedMisses = new Set<string>()
   private client: OpenAI
 
-  constructor(config?: OpenAIConfig | LlmConfig) {
+  constructor(config?: OpenAIConfig) {
     const cfg = config ?? loadOpenAIConfig()
+    // Surface an unusable explicit endpoint at construction time instead of
+    // at the first request.
+    if (!URL.canParse(cfg.baseURL)) {
+      throw new Error(`Invalid OpenAI endpoint: ${cfg.baseURL}`)
+    }
     this.client = new OpenAI({
       baseURL: cfg.baseURL,
       apiKey: cfg.apiKey,
@@ -106,17 +117,32 @@ export class OpenAIModelClient implements ModelClient {
     })
     this.baseURL = cfg.baseURL
     this.model = cfg.model
-    this.contextWindow = cfg.contextWindow
     this.compatibility = cfg.compatibility
+    // Family depends only on (endpoint, compatibility), never on the model,
+    // so it is derived once and reused for every per-call resolution.
+    this.family = deriveFamily(cfg.baseURL, cfg.compatibility)
+    this.catalogOverrides = {
+      ...(cfg.contextWindow === undefined ? {} : { contextWindow: cfg.contextWindow }),
+      ...(cfg.maxTokens === undefined ? {} : { maxOutputTokens: cfg.maxTokens }),
+    }
+    this.onModelMiss = cfg.onModelMiss
     this.configuredThinking = cfg.thinking ?? "auto"
     this.configuredReasoningEffort = cfg.reasoningEffort ?? "auto"
-    this.configuredMaxTokens = cfg.maxTokens
   }
 
   setModel(model: string): void {
     const value = model.trim()
     if (!value) throw new Error("Model name must not be empty")
     this.model = value
+  }
+
+  /** Misses dedupe per instance on (family ?? protocol, modelId); the callback fires once per key. */
+  private reportModelMiss(modelId: string): void {
+    if (this.onModelMiss === undefined) return
+    const key = `${this.family ?? "openai"}:${modelId}`
+    if (this.reportedMisses.has(key)) return
+    this.reportedMisses.add(key)
+    this.onModelMiss({ protocol: "openai", ...(this.family === undefined ? {} : { provider: this.family }), modelId })
   }
 
   setEffort(effort: "low" | "medium" | "high"): void {
@@ -236,10 +262,10 @@ export class OpenAIModelClient implements ModelClient {
       if (thinking) content.push({ type: "thinking", thinking })
       if (text) content.push({ type: "text", text })
       for (const toolCall of [...toolCalls.values()]) {
-        const input = parseToolInput(toolCall.inputText)
+        const toolInput = parseToolInput(toolCall.inputText)
         if (!toolCall.started) yield { type: "tool_call_start", id: toolCall.id, name: toolCall.name }
-        yield { type: "tool_call_end", id: toolCall.id, input }
-        content.push({ type: "tool_use", id: toolCall.id, name: toolCall.name, input })
+        yield { type: "tool_call_end", id: toolCall.id, input: toolInput }
+        content.push({ type: "tool_use", id: toolCall.id, name: toolCall.name, input: toolInput })
       }
       const stopReason = mapFinishReason(finishReason)
       yield {
@@ -313,6 +339,14 @@ export class OpenAIModelClient implements ModelClient {
     resolved: ReturnType<typeof resolveOpenAICompatibility>,
     stream: boolean,
   ): Record<string, unknown> {
+    const model = input.model ?? this.model
+    const resolvedFacts = resolveModel({
+      protocol: "openai",
+      ...(this.family === undefined ? {} : { provider: this.family }),
+      modelId: model,
+      overrides: this.catalogOverrides,
+    })
+    if (!resolvedFacts.matched) this.reportModelMiss(model)
     const params = buildOpenAICompletionParams({
       descriptor: resolved.descriptor,
       input: {
@@ -320,11 +354,16 @@ export class OpenAIModelClient implements ModelClient {
         thinking: input.thinking ?? this.configuredThinking,
         reasoningEffort: input.reasoningEffort ?? this.reasoningEffort ?? this.configuredReasoningEffort,
       },
-      configuredMaxTokens: this.configuredMaxTokens,
-      contextWindow: this.contextWindow,
+      maxTokens: resolveRequestMaxTokens(
+        {
+          ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens }),
+          estimatedInputTokens: estimateRequestTokens(input),
+        },
+        resolvedFacts,
+      ),
     })
     const request: Record<string, unknown> = {
-      model: input.model ?? this.model,
+      model,
       messages: toOpenAIMessages(input, resolved.descriptor),
       ...params,
       ...(stream ? { stream: true } : {}),

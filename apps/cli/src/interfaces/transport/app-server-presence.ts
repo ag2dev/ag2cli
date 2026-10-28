@@ -151,7 +151,8 @@ export class AppServerPresenceRegistry {
   }
 
   private publish(sessionId: string): void {
-    const presenceParams = { sessionId, clients: [...this.presence(sessionId)] }
+    // PublicPresence carries both scopes' lease state alongside the client list.
+    const presenceParams = { sessionId, clients: [...this.presence(sessionId)], leases: this.leases(sessionId) }
     const leaseParams = { sessionId, leases: this.leases(sessionId) }
     for (const connection of this.connections.values()) {
       if (!connection.sessions.has(sessionId)) continue
@@ -169,8 +170,6 @@ export class AppServerPresenceRegistry {
 
   private toClient(connection: ConnectionPresence): AppServerPresenceClient {
     return {
-      connectionId: connection.connectionId,
-      deviceId: connection.deviceId,
       clientId: connection.client.clientId,
       clientKind: connection.client.clientKind,
       name: connection.client.name,

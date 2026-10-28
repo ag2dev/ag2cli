@@ -26,7 +26,7 @@ export async function appendSessionEventsIfRevision(input: {
   readonly sessionId: SessionId
   readonly expectedRevision: number
   readonly events: readonly AgentEvent[]
-  readonly onEventsAppended?: (events: readonly AgentEvent[]) => Promise<void> | void
+  readonly onEventsAppended?: (events: readonly AgentEvent[], replayed: boolean) => Promise<void> | void
 }): Promise<void> {
   const authority = input.authority ?? new SessionAuthority(input.eventStore)
   try {

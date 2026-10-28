@@ -7,15 +7,49 @@ import type {
 
 export function resolveOpenAICompatibility(endpoint: string, override?: OpenAICompatibilityOverride): ResolvedOpenAICompatibility {
   const normalizedEndpoint = normalizeEndpoint(endpoint)
-  const overrideDescriptor = override?.name === undefined ? undefined : descriptorByName(override.name)
-  const endpointDescriptor = OPENAI_ENDPOINT_DESCRIPTORS.find((descriptor) => matchesEndpoint(normalizedEndpoint, descriptor))
-  const base = overrideDescriptor ?? endpointDescriptor ?? GENERIC_OPENAI_DESCRIPTOR
-  const descriptor = applyOverride(base, override)
+  const resolved = resolveFamilyDescriptor(new URL(normalizedEndpoint), override?.name)
+  const descriptor = applyOverride(resolved.descriptor, override)
   return {
     endpoint: normalizedEndpoint,
     descriptor,
-    source: overrideDescriptor ? "override" : endpointDescriptor ? "endpoint" : "generic",
+    source: resolved.source,
   }
+}
+
+export function deriveFamily(endpoint: string | undefined, compatibilityOverride?: string): string | undefined {
+  if (compatibilityOverride !== undefined) {
+    const overrideDescriptor = descriptorByName(compatibilityOverride)
+    if (overrideDescriptor !== undefined) return overrideDescriptor.name
+  }
+  const trimmed = endpoint?.trim()
+  if (!trimmed) return undefined
+  let url: URL
+  try {
+    url = new URL(trimmed)
+  } catch {
+    return undefined
+  }
+  return resolveFamilyDescriptor(url, undefined).family
+}
+
+interface FamilyResolution {
+  readonly family: string | undefined
+  readonly descriptor: OpenAIEndpointDescriptor
+  readonly source: "override" | "endpoint" | "generic"
+}
+
+function resolveFamilyDescriptor(url: URL, overrideName: string | undefined): FamilyResolution {
+  if (overrideName !== undefined) {
+    const overrideDescriptor = descriptorByName(overrideName)
+    if (overrideDescriptor !== undefined) {
+      return { family: overrideDescriptor.name, descriptor: overrideDescriptor, source: "override" }
+    }
+  }
+  const endpointDescriptor = OPENAI_ENDPOINT_DESCRIPTORS.find((descriptor) => matchesEndpoint(url, descriptor))
+  if (endpointDescriptor !== undefined) {
+    return { family: endpointDescriptor.name, descriptor: endpointDescriptor, source: "endpoint" }
+  }
+  return { family: undefined, descriptor: GENERIC_OPENAI_DESCRIPTOR, source: "generic" }
 }
 
 function applyOverride(descriptor: OpenAIEndpointDescriptor, override?: OpenAICompatibilityOverride): OpenAIEndpointDescriptor {
@@ -44,8 +78,7 @@ function normalizeEndpoint(value: string): string {
   }
 }
 
-function matchesEndpoint(endpoint: string, descriptor: OpenAIEndpointDescriptor): boolean {
-  const url = new URL(endpoint)
+function matchesEndpoint(url: URL, descriptor: OpenAIEndpointDescriptor): boolean {
   return descriptor.matchers.some((matcher) => {
     if (matcher.kind === "hostname") return url.hostname === matcher.value
     if (matcher.kind === "hostname-suffix") return url.hostname.endsWith(matcher.value)
